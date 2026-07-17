@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>掼蛋 · 1v3 AI 训练场</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <h1>掼蛋</h1>
+        <span class="tag">1 真人 + 队友 AI  vs  2 对手 AI</span>
+        <span class="tag local-tag">本机版 · 127.0.0.1</span>
+      </div>
+      <div class="level-board">
+        <div class="side mine">
+          我方级数 <span class="lv" id="levelMine">2</span>
+        </div>
+        <div class="side">
+          对方级数 <span class="lv" id="levelOpp">2</span>
+        </div>
+        <div class="current" id="currentLevel">当前打 2</div>
+        <div class="current" id="roundNum">未开始</div>
+      </div>
+      <div class="top-actions">
+        <label class="setting-inline" title="AI 难度">
+          难度
+          <select id="selDifficulty" aria-label="AI难度">
+            <option value="easy">简单</option>
+            <option value="normal" selected>普通</option>
+            <option value="hard">困难</option>
+          </select>
+        </label>
+        <label class="setting-inline" title="AI 出牌速度">
+          速度
+          <select id="selSpeed" aria-label="AI速度">
+            <option value="slow">慢</option>
+            <option value="normal" selected>中</option>
+            <option value="fast">快</option>
+          </select>
+        </label>
+        <label class="setting-inline coach-toggle" title="显示教练建议">
+          <input type="checkbox" id="chkCoach" /> 教练
+        </label>
+        <label class="setting-inline coach-toggle" title="放大文字">
+          <input type="checkbox" id="chkLargeText" /> 大字
+        </label>
+        <label class="setting-inline coach-toggle" title="减少动画">
+          <input type="checkbox" id="chkReducedMotion" /> 少动画
+        </label>
+        <button type="button" class="secondary" id="btnStats">牌技统计</button>
+        <button type="button" class="secondary" id="btnReplay">复盘</button>
+        <button type="button" class="secondary" id="btnRules">规则说明</button>
+        <button type="button" class="secondary" id="btnNew">新开一局</button>
+      </div>
+    </header>
+
+    <div class="table-wrap">
+      <!-- 左侧日志 -->
+      <aside class="panel log-panel" id="logPanel" aria-label="牌局动态">
+        <h2>牌局动态</h2>
+        <div class="log" id="logBox"></div>
+      </aside>
+
+      <!-- 牌桌 + 手牌坞（手牌在桌外，避免挡住对家） -->
+      <div class="stage">
+        <main class="table" aria-label="四人掼蛋牌桌">
+          <!-- 北：对家队友 -->
+          <div class="seat north" id="seatNorth">
+            <div class="seat-info">
+              <div class="avatar partner">对</div>
+              <span class="name">对家</span>
+              <span class="role">队友</span>
+              <span class="count">27张</span>
+            </div>
+            <div class="opp-backs"></div>
+            <div class="played-area" data-seat="2"></div>
+          </div>
+
+          <!-- 西：上家 -->
+          <div class="seat west" id="seatWest">
+            <div class="seat-info">
+              <div class="avatar">上</div>
+              <span class="name">上家</span>
+              <span class="role">对方</span>
+              <span class="count">27张</span>
+            </div>
+            <div class="opp-backs"></div>
+            <div class="played-area" data-seat="3"></div>
+          </div>
+
+          <!-- 东：下家 -->
+          <div class="seat east" id="seatEast">
+            <div class="seat-info">
+              <div class="avatar">下</div>
+              <span class="name">下家</span>
+              <span class="role">对方</span>
+              <span class="count">27张</span>
+            </div>
+            <div class="opp-backs"></div>
+            <div class="played-area" data-seat="1"></div>
+          </div>
+
+          <!-- 桌面中央：当前圈信息 + 上手牌型放大 -->
+          <div class="table-center">
+            <div class="center-info">
+              <div class="phase" id="phaseText" role="status" aria-live="polite">点击开始游戏</div>
+              <div class="last" id="lastText"></div>
+            </div>
+            <div class="trick-spotlight" id="trickSpotlight"></div>
+          </div>
+
+          <!-- 南：仅显示「你」的出牌区，手牌在桌下 -->
+          <div class="seat south" id="seatSouth">
+            <div class="played-area" data-seat="0"></div>
+            <div class="seat-info">
+              <div class="avatar human">你</div>
+              <span class="name">你</span>
+              <span class="role">我方</span>
+              <span class="count">27张</span>
+            </div>
+          </div>
+        </main>
+
+        <section class="player-dock" id="playerDock">
+          <div class="selection-bar" id="selectionBar">
+            <div class="sel-status" id="selStatus">点击手牌选牌 · “全选”选择同点牌 · 点数标题循环张数</div>
+            <div class="sel-preview" id="selPreview"></div>
+            <div class="declaration-chips" id="declarationChips" aria-label="自定义牌型声明"></div>
+            <div class="combo-chips" id="comboChips"></div>
+          </div>
+          <div class="actions" id="actionBar" aria-label="出牌操作"></div>
+          <section class="end-hands hidden" id="endHands" aria-label="终局余牌"></section>
+          <div class="hand-board" id="playerHand" role="group" aria-label="你的手牌"></div>
+          <div class="hint-bar" id="hintBar"></div>
+        </section>
+      </div>
+
+      <!-- 右侧评价 -->
+      <aside class="panel eval-panel" id="evalPanel" aria-label="出牌评价与牌技助手">
+        <h2>出牌评价 · 牌技助手</h2>
+        <div id="coachBox" class="coach-box hidden"></div>
+        <div class="eval-score">
+          <div class="num" id="evalScore" role="status" aria-live="polite">--</div>
+          <div class="meta">
+            <div class="grade" id="evalGrade">出牌后显示评价</div>
+            <div class="stars" id="evalStars"></div>
+            <div id="evalSummary" style="font-size:0.78rem;color:var(--muted);margin-top:4px"></div>
+          </div>
+        </div>
+        <div id="evalAlt" class="alt-play hidden"></div>
+        <ul class="eval-tips" id="evalTips"></ul>
+        <div class="session-stats" id="sessionStats"></div>
+        <div id="endAdvice" class="hidden"></div>
+        <h2 style="margin-top:8px">牌面结构</h2>
+        <ul class="eval-tips" id="structTips">
+          <li>开始游戏后可点「牌面分析」</li>
+        </ul>
+        <p class="hotkeys-hint">选牌：单击切换 · “全选”选择同点牌 · 点数标题循环张数 · Shift+连选<br/>快捷键：Enter 出牌/确认还贡 · Space 过 · Esc 取消 · H 提示 · C 查看教练</p>
+      </aside>
+    </div>
+
+    <p class="footer-note">
+      标准训练规则 · 本机地址 127.0.0.1:20801 · 多难度 AI · 出牌评价与逐手复盘
+    </p>
+  </div>
+
+  <div id="toast" class="overlay hidden" role="status" aria-live="assertive" aria-atomic="true" style="background:transparent;place-items:end center;padding-bottom:80px;pointer-events:none">
+    <div style="pointer-events:auto;background:#102820;border:1px solid rgba(232,195,106,.35);padding:12px 18px;border-radius:12px;color:#f2f5f3;max-width:90%;box-shadow:0 8px 30px rgba(0,0,0,.4)"></div>
+  </div>
+
+  <div id="rulesModal" class="overlay hidden">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="rulesTitle" tabindex="-1">
+      <h3 id="rulesTitle">掼蛋规则摘要</h3>
+      <div class="rules-body">
+        <h4>基本设置</h4>
+        <ul>
+          <li>两副牌 108 张，4 人，对家为队友（你 + 对家 AI 为一方）。</li>
+          <li>每人 27 张，先出完为头游，最后为末游。</li>
+          <li>从 2 打到 A，先打过 A 的一方获胜。</li>
+        </ul>
+        <h4>级牌与逢人配</h4>
+        <ul>
+          <li>当前级数对应的牌为级牌，单张/对子等比 A 大、比王小。</li>
+          <li>两张<strong>红桃级牌</strong>为「逢人配」，可当任意非王牌使用。</li>
+        </ul>
+        <h4>牌型（第一类互压须同型）</h4>
+        <ul>
+          <li>单张、对子、三同张、三带二、顺子（5 张）、三连对、钢板（二连三）。</li>
+          <li>A 在顺子/连对/钢板中可作 1 或接 K。</li>
+        </ul>
+        <h4>炸弹类（可压任意第一类）</h4>
+        <ul>
+          <li>天王炸（两大两小）&gt; 六张及以上炸弹 &gt; 同花顺 &gt; 五炸 &gt; 四炸。</li>
+          <li>同张数炸弹比点数；同花顺之间比点数。</li>
+        </ul>
+        <h4>出牌与借风</h4>
+        <ul>
+          <li>领出任意牌型，其余用更大同型接，或用炸弹类压制；都可过牌。</li>
+          <li>其余在局者都过后，最后出牌者领出下一圈。</li>
+          <li>出完后若无人再压，由<strong>对家借风</strong>领出。</li>
+        </ul>
+        <h4>升级（头游方）</h4>
+        <ul>
+          <li><strong>头游 + 二游（双上）→ 升 3 级</strong></li>
+          <li><strong>头游 + 三游 → 升 2 级</strong></li>
+          <li><strong>头游 + 末游 → 升 1 级</strong></li>
+          <li>败方不升级；级数从 2 打到 A，升到 A 后争夺过 A。</li>
+          <li>打 A：双上或头三可过 A 获胜；头末不过 A。连续三次不过 A 打回 2 级。</li>
+        </ul>
+        <h4>进贡 / 还贡 / 抗贡</h4>
+        <ul>
+          <li>第二副起：末游（或双下两人）向赢家进贡最大牌（逢人配除外）。</li>
+          <li>赢家还一张：有不大于 10 的非级牌时必须从中选择，否则还当前最小牌；进贡方先出。两张大王可抗贡，由头游先出。</li>
+        </ul>
+        <h4>训练功能</h4>
+        <ul>
+          <li><strong>难度</strong>：简单 / 普通 / 困难（影响 AI 配合、留炸与随机性）。</li>
+          <li><strong>教练模式</strong>：轮到你时给出推荐出法（按困难 AI 思路）。</li>
+          <li><strong>出牌评价</strong>：每次操作打分；副末复盘；历史牌技统计。</li>
+          <li><strong>复盘</strong>：查看最近对局出牌流水与评分。</li>
+        </ul>
+      </div>
+      <div class="actions">
+        <button type="button" id="btnCloseRules">知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="statsModal" class="overlay hidden">
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="statsTitle" tabindex="-1">
+      <h3 id="statsTitle">牌技统计</h3>
+      <div id="statsBody" class="rules-body"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="btnExportStats">导出数据</button>
+        <button type="button" class="secondary" id="btnImportStats">导入数据</button>
+        <input type="file" id="fileImportStats" accept="application/json,.json" hidden />
+        <button type="button" class="secondary" id="btnClearStats">清空统计</button>
+        <button type="button" id="btnCloseStats">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="replayModal" class="overlay hidden">
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="replayTitle" tabindex="-1">
+      <h3 id="replayTitle">逐手对局复盘</h3>
+      <div class="replay-tabs" id="replayList"></div>
+      <div id="replayBody" class="rules-body replay-body"></div>
+      <div class="actions">
+        <button type="button" id="btnCloseReplay">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/ui.js"></script>
+</body>
+</html>

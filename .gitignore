@@ -1,0 +1,19 @@
+# Local/runtime files
+*.log
+*.tmp
+*.local
+*.local.*
+active-match.json
+stats.json
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Tooling/build output
+node_modules/
+coverage/
+dist/
+.DS_Store
+Thumbs.db
