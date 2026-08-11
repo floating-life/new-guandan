@@ -8,7 +8,8 @@ import {
   generateLegalPlays, HandType, formatHand, parseHand, handSignature,
 } from './rules.js';
 import {
-  evaluateStrategicPlay, strategicCandidateScore, wholeHandPlay,
+  countDisjointStraights, countPotentialBombs, createStrategicMemo, downstreamEnemyNeedsBlock,
+  evaluateStrategicPlay, selectEmergencyBlock, strategicCandidateScore, wholeHandPlay,
 } from './strategy-core.js';
 
 const GRADE = [
@@ -44,6 +45,9 @@ export function evaluatePlay(ctx) {
     handCounts = [99, 99, 99, 99],
     finishOrder = [],
     playedCards = [],
+    publicHistory = [],
+    tributeContext = null,
+    difficulty = 'master',
     leadAfterOwnBomb = false,
   } = ctx;
 
@@ -61,8 +65,8 @@ export function evaluatePlay(ctx) {
 
   if (action === 'pass') {
     return evaluatePass({
-      legal, lastHand, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
-      finishOrder, assessment,
+      legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
+      finishOrder, assessment, level, playedCards, publicHistory, difficulty,
     });
   }
 
@@ -93,20 +97,21 @@ export function evaluatePlay(ctx) {
     handCounts,
     finishOrder,
     playedCards,
+    publicHistory,
+    tributeContext,
+    difficulty,
+    policyProfile: 'expert',
+    strategyWeight: 1,
     leadAfterOwnBomb,
+    strategyMemo: createStrategicMemo(handBefore, level),
   };
   const sharedStrategy = evaluateStrategicPlay({ cards, hand: parsed }, strategyCtx);
   const createsTwoStepFinish = sharedStrategy.createsTwoStepFinish;
   score += applyEvents(assessment, tips, sharedStrategy.events);
 
-  // 是否在合法集合中
-  const parsedSignature = handSignature(parsed);
-  const match = legal.find((p) => sameCards(p.cards, cards)
-    && handSignature(p.hand) === parsedSignature);
-  if (!match && lastHand) {
-    // 可能生成器未覆盖，再用 canBeat 逻辑
-    apply('structure', -5, null, null);
-  }
+  // The parser/game legality check is authoritative. The candidate generator
+  // is intentionally heuristic, so a legal edge-case play missing from its
+  // shortlist must not receive a silent structure penalty.
 
   // 1) 能一次出完却没出完
   const finishOpts = legal.filter((p) => p.cards.length === handBefore.length);
@@ -131,12 +136,23 @@ export function evaluatePlay(ctx) {
 
   // 3) 压队友
   if (isTeammateLead && lastHand) {
+    const urgentBlock = downstreamEnemyNeedsBlock(lastHand, {
+      seat, teams, handCounts, finishOrder,
+    });
     if (cards.length === handBefore.length) {
       apply(
         'endgame',
         12,
         null,
         '虽然接了队友的牌，但本手可以直接出完；此时争取名次更重要。',
+      );
+    } else if (urgentBlock) {
+      const downstream = (seat + 1) % 4;
+      apply(
+        'defense',
+        10,
+        null,
+        `下家只剩 ${handCounts[downstream]} 张，及时抬高对家的牌可阻止对手直接走完。`,
       );
     } else {
       apply(
@@ -206,7 +222,7 @@ export function evaluatePlay(ctx) {
   }
 
   // 6) 拆牌结构
-  const struct = evalStructure(handBefore, cards, level);
+  const struct = evalStructure(handBefore, cards, level, parsed, sharedStrategy);
   score += applyEvents(assessment, tips, struct.events);
 
   // 7) 领出策略
@@ -309,8 +325,8 @@ export function evaluatePlay(ctx) {
 }
 
 function evaluatePass({
-  legal, lastHand, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
-  finishOrder, assessment,
+  legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
+  finishOrder, assessment, level, playedCards = [], publicHistory = [], difficulty = 'master',
 }) {
   const setScore = (target, dimension, tag, message) => {
     const delta = target - score;
@@ -325,6 +341,37 @@ function evaluatePass({
 
   // 队友牌：过是好的
   if (isTeammateLead) {
+    const urgentBlock = downstreamEnemyNeedsBlock(lastHand, {
+      seat, teams, handCounts, finishOrder,
+    });
+    if (urgentBlock && legal.length) {
+      const downstream = (seat + 1) % 4;
+      setScore(
+        30,
+        'defense',
+        'weak_defense',
+        `下家只剩 ${handCounts[downstream]} 张且可能按当前牌型直接走完，应抬高对家的牌实施拦截。`,
+      );
+      const best = selectEmergencyBlock(legal, {
+        hand: handBefore,
+        level,
+        mode: 'beat',
+        lastHand,
+        seat,
+        teams,
+        handCounts,
+        finishOrder,
+      });
+      return {
+        ...makeResult(score, tips, '错失紧急拦截', assessment),
+        betterAlternative: {
+          cards: best.cards,
+          hand: best.hand,
+          label: formatHand(best.hand),
+        },
+      };
+    }
+
     const finish = legal.filter((p) => p.cards.length === handBefore.length);
     if (finish.length) {
       const strongFinish = finish.find((p) => isBombType(p.hand));
@@ -432,6 +479,77 @@ function evaluatePass({
         label: formatHand(finish[0].hand),
       },
     };
+  }
+
+  // 当普通牌无法承接，唯一办法是交出炸弹/同花顺时，
+  // 用与 AI 相同的策略核心判断这个强控制是否应该保留。
+  const strategyMemo = createStrategicMemo(handBefore, level);
+  const assessedResponses = legal.map((play) => ({
+      play,
+      strategy: evaluateStrategicPlay(play, {
+        hand: handBefore,
+        level,
+        mode: 'beat',
+        lastHand,
+        lastSeat,
+        seat,
+        teams,
+        handCounts,
+        finishOrder,
+        playedCards,
+        publicHistory,
+        difficulty,
+        policyProfile: 'expert',
+        strategyWeight: 1,
+        strategyMemo,
+      }),
+    }));
+  const ordinaryResponses = assessedResponses
+    .filter(({ play }) => !isBombType(play.hand));
+  const ordinaryResponsesCostly = ordinaryResponses.length > 0
+    && ordinaryResponses.every(({ strategy }) => strategy.score <= -100
+      && strategy.tags.some((tag) => ['split_straight', 'split_bomb'].includes(tag)));
+  const strategicReserve = !enemyAboutToWin && (mustBomb || ordinaryResponsesCostly)
+    ? assessedResponses.find(({ play, strategy }) => strategy.tags.includes('survival_preserve_control')
+      || (handBefore.length <= 12
+        && play.hand.type === HandType.FLUSH_STRAIGHT
+        && strategy.tags.includes('preserve_strong_control')))
+    : null;
+  if (strategicReserve) {
+    const survival = strategicReserve.strategy.tags.includes('survival_preserve_control');
+    setScore(
+      survival ? 88 : 82,
+      survival ? 'endgame' : 'resources',
+      null,
+      survival
+        ? `对家已头游，保留${formatHand(strategicReserve.play.hand)}去压另一名对手，有利于保住三游、避免末游。`
+        : `当前接牌需要交出${formatHand(strategicReserve.play.hand)}或拆散关键结构，而对手尚未进入紧急收官；保留同花顺等强控制等待更高收益，战略过牌合理。`,
+    );
+    return makeResult(score, tips, survival ? '保三游控制' : '保留强控制', assessment);
+  }
+
+  const catastrophicOrdinaryResponses = ordinaryResponses.length > 0
+    && ordinaryResponses.every(({ strategy }) => (
+      strategy.tags.some((tag) => [
+        'preserve_wild', 'wild_simple_use', 'wild_as_single',
+      ].includes(tag))
+      || (strategy.score <= -500
+        && strategy.tags.some((tag) => [
+          'split_bomb', 'split_straight', 'split_group', 'split_pair',
+        ].includes(tag)))
+    ));
+  const activeEnemyMin = Math.min(...handCounts.map((count, index) => (
+    index !== seat && teams[index] !== teams[seat] && !finishOrder.includes(index)
+      ? count : 99
+  )));
+  if (catastrophicOrdinaryResponses && activeEnemyMin > 5) {
+    setScore(
+      86,
+      'resources',
+      null,
+      '所有普通接法都会消耗逢人配或同时拆散多组关键结构；对手尚未进入五张内残局，保存牌型过牌更合理。',
+    );
+    return makeResult(score, tips, '保存结构过牌', assessment);
   }
 
   // 对手要出完
@@ -554,15 +672,19 @@ function evalBombTiming(
   return { events, better };
 }
 
-function evalStructure(handBefore, cards, level) {
+function evalStructure(handBefore, cards, level, playedHand = null, sharedStrategy = null) {
   const events = [];
   const remain = removeCards(handBefore, cards);
+  const actualHand = playedHand || parseHand(cards, level);
+  const productiveRestructure = sharedStrategy?.tags?.includes('productive_restructure');
 
   const straightLoss = Math.max(
     0,
-    countPotentialStraights(handBefore, level) - countPotentialStraights(remain, level),
+    countDisjointStraights(handBefore, level) - countDisjointStraights(remain, level),
   );
-  if (straightLoss > 0) {
+  if (straightLoss > 0
+    && !productiveRestructure
+    && ![HandType.STRAIGHT, HandType.FLUSH_STRAIGHT].includes(actualHand?.type)) {
     events.push({
       dimension: 'structure',
       delta: -Math.min(15, 5 + straightLoss * 5),
@@ -574,12 +696,14 @@ function evalStructure(handBefore, cards, level) {
   // 是否拆了炸弹
   const beforeBombs = countPotentialBombs(handBefore, level);
   const afterBombs = countPotentialBombs(remain, level);
-  if (afterBombs < beforeBombs && cards.length < 4) {
+  if (afterBombs < beforeBombs && !isBombType(actualHand) && !productiveRestructure) {
     events.push({
       dimension: 'structure',
       delta: -15,
       tag: 'split_bomb',
-      message: '此出牌拆散了潜在炸弹，损失中长期牌力。',
+      message: beforeBombs - afterBombs > 1
+        ? `此出牌同时拆散了 ${beforeBombs - afterBombs} 个潜在炸弹，结构损失很大。`
+        : '此出牌拆散了潜在炸弹，损失中长期牌力。',
     });
   }
 
@@ -683,48 +807,6 @@ function evalLead(parsed, cards, handBefore, level, legal) {
   }
 
   return { events, better };
-}
-
-function countPotentialBombs(hand, level) {
-  const m = new Map();
-  let w = 0;
-  for (const c of hand) {
-    if (isWild(c, level)) {
-      w++;
-      continue;
-    }
-    if (isJoker(c)) continue;
-    m.set(c.rank, (m.get(c.rank) || 0) + 1);
-  }
-  let n = 0;
-  for (const cnt of m.values()) {
-    if (cnt + w >= 4) n++;
-  }
-  const sj = hand.filter((c) => c.rank === 16).length;
-  const bj = hand.filter((c) => c.rank === 17).length;
-  if (sj >= 2 && bj >= 2) n++;
-  return n;
-}
-
-/** 统计手牌当前可组成的五张顺子序列，用于识别唯一关键点数。 */
-function countPotentialStraights(hand, level) {
-  const ranks = new Set();
-  let wildCount = 0;
-  for (const card of hand) {
-    if (isWild(card, level)) {
-      wildCount++;
-    } else if (!isJoker(card)) {
-      ranks.add(card.rank);
-    }
-  }
-
-  const sequences = [[14, 2, 3, 4, 5]];
-  for (let start = 2; start <= 10; start++) {
-    sequences.push([start, start + 1, start + 2, start + 3, start + 4]);
-  }
-  return sequences.filter((sequence) => (
-    sequence.filter((rank) => !ranks.has(rank)).length <= wildCount
-  )).length;
 }
 
 function countGroups(hand, level) {
@@ -853,7 +935,9 @@ export function summarizeSession(history) {
     if (Array.isArray(item.mistakeTags)) return tags.some((tag) => item.mistakeTags.includes(tag));
     return (item.tips || []).some((tip) => tip.includes(legacyWord));
   };
-  const lowWild = history.filter((item) => hasMistake(item, ['waste_wild'], '逢人配'));
+  const lowWild = history.filter((item) => hasMistake(item, [
+    'waste_wild', 'preserve_wild', 'wild_simple_use', 'wild_as_single',
+  ], '逢人配'));
   const bombWaste = history.filter((item) => hasMistake(item, ['waste_bomb', 'split_bomb'], '炸弹'));
   const teammate = history.filter((item) => hasMistake(item, ['over_teammate'], '队友'));
 

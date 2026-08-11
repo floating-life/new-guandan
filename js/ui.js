@@ -8,7 +8,7 @@ import {
   getLegalHints, getHandAnalysis, getReturnCandidates, PHASE, seatName,
   applySettings, refreshCoach, getSkillStats, humanSelectSet, humanSelectAllOfRank,
   humanSelectRankCycle, getSelectedCards, getCombosFromSelection, restoreMatch,
-  resumeMatch, persistMatch, AI_DIFFICULTY_LABEL,
+  resumeMatch, resetLLMFallback, markLLMFallback, AI_DIFFICULTY_LABEL,
 } from './game.js';
 import {
   SUIT_SYMBOL, SUIT_COLOR, RANK_LABEL, isJoker, isWild, isLevelCard,
@@ -20,10 +20,16 @@ import {
 import {
   loadReplays, clearStats, loadSettings, exportTrainingData, importTrainingData,
 } from './stats.js';
+import {
+  checkLLMHealth, getLLMHealth, getLLMConfig, updateLLMConfig, LLM_POLICY_MODE,
+} from './llm.js';
 
 const restoredState = restoreMatch();
 const state = restoredState || createMatch();
 const $ = (sel) => document.querySelector(sel);
+let llmHealth = getLLMHealth();
+let llmHealthEpoch = 0;
+let llmConfig = { apiUrl: '', model: '', configured: false, apiKeyConfigured: false };
 
 /** 用于 shift 连选 */
 let lastClickedId = null;
@@ -179,6 +185,108 @@ function renderEndHands() {
   }
 }
 
+function llmModeLabel(mode) {
+  if (mode === LLM_POLICY_MODE.CLOUD) return '云端增强';
+  if (mode === LLM_POLICY_MODE.AUTO) return '智能增强';
+  return '本地 AI';
+}
+
+function llmStatusView() {
+  const mode = state.settings?.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
+  if (mode === LLM_POLICY_MODE.LOCAL) {
+    return { text: '本地 AI', className: 'local', title: '当前整局只使用本地 AI，不发送牌面到云端' };
+  }
+  if (state.aiThinking) {
+    return { text: 'AI 分析中…', className: 'checking', title: '正在生成本手候选并等待决策' };
+  }
+  if (state.llmFallbackActive) {
+    return {
+      text: 'API 故障 → 本地 AI',
+      className: 'error',
+      title: state.llmLastError || '云端 API 配置或协议故障，已使用全场景本地 AI',
+    };
+  }
+  if (state.llmStatus === 'retry_wait') {
+    const seconds = Math.max(0, Math.ceil(((state.llmCircuit?.retryAt || 0) - Date.now()) / 1000));
+    return {
+      text: seconds ? `API 临时故障 · ${seconds}秒后可重试` : 'API 待下一关键回合重试',
+      className: 'warn',
+      title: state.llmLastError || '本手已使用本地 AI；退避结束后会在下一关键回合重试云端',
+    };
+  }
+  if (state.llmStatus === 'online') {
+    return {
+      text: `API 在线${Number.isFinite(state.llmLastLatencyMs) ? ` · ${state.llmLastLatencyMs}ms` : ''}`,
+      className: 'online',
+      title: '最近一次云端决策已通过本地候选与规则校验',
+    };
+  }
+  if (llmHealth.state === 'online' && llmHealth.providerOk) {
+    return {
+      text: `API 在线${llmHealth.model ? ` · ${llmHealth.model}` : ''}`,
+      className: 'online',
+      title: llmHealth.message || '云端 API 正常',
+    };
+  }
+  if (llmHealth.state === 'not_configured') {
+    return { text: 'API 未配置 → 本地 AI', className: 'warn', title: llmHealth.message };
+  }
+  if (llmHealth.state === 'unverified') {
+    return {
+      text: 'API 已配置 · 待首手验证',
+      className: 'warn',
+      title: llmHealth.message || '健康端点不受支持，将由第一次真实决策验证',
+    };
+  }
+  if (llmHealth.state === 'checking') {
+    return { text: 'API 检测中…', className: 'checking', title: '正在检测本机 API 网关与云端服务' };
+  }
+  return {
+    text: 'API 异常 → 本地 AI',
+    className: 'error',
+    title: llmHealth.message || 'API 异常；临时故障会退避后自动重试，配置故障使用本地 AI',
+  };
+}
+
+async function refreshLLMHealth({ silent = false, recover = false, deep = false } = {}) {
+  const requestEpoch = ++llmHealthEpoch;
+  const status = $('#llmStatus');
+  llmHealth = { ...llmHealth, state: 'checking', message: '正在检测 API…' };
+  if (status) {
+    status.textContent = 'API 检测中…';
+    status.className = 'llm-status checking';
+  }
+  const checkedHealth = await checkLLMHealth({ deep });
+  if (requestEpoch !== llmHealthEpoch) return llmHealth;
+  llmHealth = checkedHealth;
+  const failure = ['not_configured', 'offline', 'error', 'unavailable'].includes(llmHealth.state);
+  const permanentFailure = llmHealth.state === 'not_configured'
+    || llmHealth.retryable === false
+    || llmHealth.failureClass === 'configuration';
+  if (failure && permanentFailure
+    && (state.settings?.llmPolicyMode || LLM_POLICY_MODE.LOCAL) !== LLM_POLICY_MODE.LOCAL) {
+    markLLMFallback(state, llmHealth.message || '云端 API 不可用');
+  }
+  const canRecoverWithUnverifiedHealth = llmHealth.state === 'unverified'
+    && llmHealth.configured === true;
+  if (recover && (llmHealth.providerOk || canRecoverWithUnverifiedHealth)) {
+    resetLLMFallback(state);
+    if (!silent) {
+      flash(llmHealth.providerOk
+        ? 'API 已恢复，云端增强重新可用'
+        : 'API 已配置，已解除旧回退；将在第一次真实决策时验证');
+    }
+  } else if (!silent && failure) {
+    flash(permanentFailure
+      ? `${llmHealth.message || 'API 配置异常'}；当前使用本地 AI`
+      : `${llmHealth.message || 'API 临时异常'}；本地 AI 接管，后续会自动重试`);
+  } else if (!silent && llmHealth.state === 'unverified') {
+    flash('API 已配置；健康端点不受支持，将在第一次云端决策时验证');
+  }
+  render();
+  return llmHealth;
+}
+
 function renderTop() {
   const cur = LEVEL_LABEL[state.currentLevel] || state.currentLevel;
   $('#levelMine').textContent = LEVEL_LABEL[state.levels[0]];
@@ -192,13 +300,33 @@ function renderTop() {
   const c = $('#chkCoach');
   const large = $('#chkLargeText');
   const reduced = $('#chkReducedMotion');
+  const llmMode = $('#selLLMMode');
+  const llmStatus = $('#llmStatus');
+  const llmPrompt = $('#llmPrompt');
   if (d && d.value !== s.difficulty) d.value = s.difficulty || 'normal';
   if (sp && sp.value !== s.aiSpeed) sp.value = s.aiSpeed || 'normal';
+  if (llmMode && llmMode.value !== (s.llmPolicyMode || LLM_POLICY_MODE.LOCAL)) {
+    llmMode.value = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
+  }
   if (c && c.checked !== !!s.coachMode) c.checked = !!s.coachMode;
   if (large && large.checked !== !!s.largeText) large.checked = !!s.largeText;
   if (reduced && reduced.checked !== !!s.reducedMotion) reduced.checked = !!s.reducedMotion;
   document.body.classList.toggle('large-text', !!s.largeText);
   document.body.classList.toggle('reduced-motion', !!s.reducedMotion);
+  if (llmStatus) {
+    const view = llmStatusView();
+    llmStatus.textContent = view.text;
+    llmStatus.className = `llm-status ${view.className}`;
+    llmStatus.title = view.title || '';
+  }
+  if (llmPrompt) {
+    const mode = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
+    llmPrompt.textContent = mode === LLM_POLICY_MODE.LOCAL
+      ? '默认不调用云端 API'
+      : state.llmFallbackActive
+        ? '配置/协议故障：全场景本地 AI'
+        : `${llmModeLabel(mode)}：提交当前CPU手牌、合法候选和公开牌史`;
+  }
 }
 
 function renderSeats() {
@@ -274,7 +402,9 @@ function renderCenter() {
     [PHASE.DEALING]: '发牌中…',
     [PHASE.TRIBUTE]: '进贡阶段',
     [PHASE.RETURN]: '还贡阶段 — 选一张牌后点「确认还贡」',
-    [PHASE.PLAYING]: state.currentSeat === 0 ? '轮到你出牌' : `等待 ${seatName(state.currentSeat)}…`,
+    [PHASE.PLAYING]: state.aiThinking
+      ? `AI 分析中…（${seatName(state.currentSeat)}）`
+      : state.currentSeat === 0 ? '轮到你出牌' : `等待 ${seatName(state.currentSeat)}…`,
     [PHASE.ROUND_END]: '本副结束',
     [PHASE.MATCH_END]: '比赛结束',
   };
@@ -834,7 +964,7 @@ function renderEval() {
     if (s) {
       endTips.innerHTML = `<h2>本副复盘</h2><ul class="eval-tips">${
         s.advice.map((a) => `<li>${escapeHtml(a)}</li>`).join('')
-      }</ul>`;
+      }</ul>${llmReportHtml(state.llmReport, '本副云端 API 报告', state.llmFallbackActive)}`;
       endTips.classList.remove('hidden');
     }
   } else {
@@ -870,6 +1000,89 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
+function llmReportHtml(report, title = '云端 API 调用报告', fallbackActive = false) {
+  if (!report) return '';
+  const calls = Number(report.cloudCalls) || 0;
+  const successes = Number(report.successes) || 0;
+  const failures = Number(report.failures) || 0;
+  const skipped = Number(report.skipped) || 0;
+  const localTurns = Number(report.localTurns) || 0;
+  const eligibleTurns = Number(report.cloudEligibleTurns) || 0;
+  const backoffSkips = Number(report.backoffSkips) || 0;
+  const mode = report.mode || 'local';
+  const modeLabel = mode === 'cloud' ? '云端增强' : mode === 'auto' ? '智能增强' : '本地 AI';
+  const roundFallback = fallbackActive || report.fallbackActive === true;
+  const promptTokens = Number(report.promptTokens) || 0;
+  const completionTokens = Number(report.completionTokens) || 0;
+  const totalTokens = Number(report.totalTokens) || 0;
+  const avg = Number.isFinite(Number(report.avgLatencyMs))
+    ? Number(report.avgLatencyMs)
+    : (calls ? Math.round((Number(report.totalLatencyMs) || 0) / calls) : null);
+  const p95 = Number.isFinite(Number(report.p95LatencyMs))
+    ? Number(report.p95LatencyMs)
+    : (Array.isArray(report.latencies) && report.latencies.length
+      ? report.latencies.slice().sort((a, b) => a - b)[Math.min(report.latencies.length - 1, Math.ceil(report.latencies.length * 0.95) - 1)]
+      : null);
+  const successRate = calls ? `${Math.round((successes / calls) * 100)}%` : '--';
+  const status = !calls
+    ? (mode === 'local'
+      ? `${title.includes('累计') ? '累计' : '本副'}为本地 AI 模式，未发送云端请求`
+      : roundFallback || Number(report.fallbacks) > 0
+        ? `${title.includes('累计') ? '累计' : '本副'}的云端配置异常，由本地 AI 接管`
+        : backoffSkips > 0
+          ? `${title.includes('累计') ? '累计' : '本副'}处于临时退避，尚未发起真实调用；将在下一关键回合重试`
+          : mode === 'auto' && eligibleTurns === 0
+          ? '智能增强本副未触发关键/有歧义回合'
+          : `${title.includes('累计') ? '累计' : '本副'}未进入云端调用分支`)
+    : failures
+      ? `部分失败，${Number(report.fallbacks) || 0} 手由本地 AI 安全接管`
+      : '调用链路正常';
+  const statusClass = !calls
+    ? (roundFallback || Number(report.fallbacks) > 0 ? 'error' : 'warn')
+    : failures ? 'error' : 'online';
+  const recent = Array.isArray(report.records) ? report.records.slice(-6).reverse() : [];
+  const recordText = recent.length
+    ? `<ul>${recent.map((item) => {
+      const latency = item.latencyMs == null ? '' : ` · ${item.latencyMs}ms`;
+      const label = item.status === 'success' ? (item.cloudChangedDecision ? '成功·云端改选' : '成功·与本地一致')
+        : item.status === 'fallback' ? '失败→本地'
+          : item.status === 'skipped' ? '跳过'
+            : item.status;
+      const route = item.localCandidateId || item.cloudCandidateId
+        ? ` · 本地 ${escapeHtml(item.localCandidateId || '-')} → 云端 ${escapeHtml(item.cloudCandidateId || '-')} → 执行 ${escapeHtml(item.executedCandidateId || '-')}`
+        : '';
+      const errorCode = item.errorCode ? ` [${escapeHtml(item.errorCode)}]` : '';
+      return `<li>第${item.turn || '-'}手 · 座位${item.seat == null ? '-' : item.seat}${latency} · ${escapeHtml(label)}${route}${errorCode}${item.error ? ` · ${escapeHtml(item.error)}` : ''}</li>`;
+    }).join('')}</ul>`
+    : '<p class="muted">暂无逐次调用记录</p>';
+  return `<section class="llm-report"><h4>${escapeHtml(title)}</h4>
+    <p><span class="llm-report-status ${statusClass}">${escapeHtml(status)}</span></p>
+    <div class="stats-grid">
+      <div class="cell">策略模式<b>${escapeHtml(modeLabel)}</b></div>
+      <div class="cell">云端资格回合<b>${eligibleTurns}</b></div>
+      <div class="cell">本地回合<b>${localTurns}</b></div>
+      <div class="cell">实际调用<b>${calls}</b></div>
+      <div class="cell">成功率<b>${successRate}</b></div>
+      <div class="cell">失败/回退<b>${failures} / ${Number(report.fallbacks) || 0}</b></div>
+      <div class="cell">跳过调用<b>${skipped}</b></div>
+      <div class="cell">云端改选<b>${Number(report.cloudOverrides) || 0}</b></div>
+      <div class="cell">与本地一致<b>${Number(report.cloudAgreements) || 0}</b></div>
+      <div class="cell">低置信已拒绝<b>${Number(report.rejectedCloudChoices) || 0}</b></div>
+      <div class="cell">临时/输出/配置故障<b>${Number(report.transientFailures) || 0} / ${Number(report.modelOutputFailures) || 0} / ${Number(report.permanentFailures) || 0}</b></div>
+      <div class="cell">退避跳过<b>${backoffSkips}</b></div>
+      <div class="cell">平均延迟<b>${avg == null ? '--' : `${avg}ms`}</b></div>
+      <div class="cell">P95 延迟<b>${p95 == null ? '--' : `${p95}ms`}</b></div>
+      <div class="cell">输入 Tokens<b>${promptTokens || '--'}</b></div>
+      <div class="cell">输出 Tokens<b>${completionTokens || '--'}</b></div>
+      <div class="cell">总 Tokens<b>${totalTokens || '--'}</b></div>
+      <div class="cell">估算次数<b>${Number(report.estimatedTokenCalls) || 0}</b></div>
+    </div>${report.lastProvider || report.lastModel ? `<p class="muted">最近服务：${escapeHtml(report.lastProvider || '-')} · ${escapeHtml(report.lastModel || '-')}</p>` : ''}
+    ${report.lastError ? `<p class="muted">最近错误：${escapeHtml(report.lastError)}</p>` : ''}
+    <p class="muted">Token 来源：${!calls ? '无云端调用' : Number(report.estimatedTokenCalls) ? '部分或全部为估算值' : '供应商 usage 字段'}</p>
+    ${recordText}
+  </section>`;
+}
+
 function openStats() {
   const s = getSkillStats();
   const places = ['头游', '二游', '三游', '末游'];
@@ -883,6 +1096,7 @@ function openStats() {
   const body = $('#statsBody');
   const recent = (s.scoreTrend || []).slice(-8).reverse();
   body.innerHTML = `
+    ${llmReportHtml(s.llm, '云端 API 累计报告')}
     <div class="stats-grid">
       <div class="cell">累计副数<b>${s.totalRounds}</b></div>
       <div class="cell">综合均分<b>${s.avg || '--'}</b></div>
@@ -946,6 +1160,7 @@ function openReplay(preferId) {
         html += `<ul>${r.roundSummary.advice.map((a) => `<li>${escapeHtml(a)}</li>`).join('')}</ul>`;
       }
     }
+    if (r.llmReport) html += llmReportHtml(r.llmReport, '本副云端 API 报告');
     html += `<div class="replay-stepper">
       <button type="button" class="secondary" id="replayPrev" ${activeStep <= 0 ? 'disabled' : ''}>上一手</button>
       <span>第 ${lines.length ? activeStep + 1 : 0} / ${lines.length} 手</span>
@@ -1021,7 +1236,7 @@ function closeModal(selector) {
 }
 
 function visibleModal() {
-  return ['#rulesModal', '#statsModal', '#replayModal']
+  return ['#rulesModal', '#statsModal', '#replayModal', '#llmConfigModal']
     .map((selector) => ({ selector, overlay: $(selector) }))
     .find(({ overlay }) => overlay && !overlay.classList.contains('hidden')) || null;
 }
@@ -1053,6 +1268,52 @@ function downloadTrainingData() {
   anchor.download = `掼蛋训练数据_${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function openLLMConfig(event) {
+  const status = $('#llmConfigStatus');
+  const urlInput = $('#llmApiUrl');
+  const modelInput = $('#llmModel');
+  const keyInput = $('#llmApiKey');
+  openModal('#llmConfigModal', event?.currentTarget || $('#btnLLMConfig'));
+  if (status) status.textContent = '正在读取本机配置…';
+  try {
+    llmConfig = await getLLMConfig();
+    if (urlInput) urlInput.value = llmConfig.apiUrl || '';
+    if (modelInput) modelInput.value = llmConfig.model || '';
+    if (keyInput) keyInput.value = '';
+    if (status) status.textContent = llmConfig.apiKeyConfigured
+      ? `当前已有密钥；留空表示保留${llmConfig.persisted ? '（已用 Windows DPAPI 加密保存）' : ''}${llmConfig.environmentOverride ? '；注意：服务重启时 PowerShell 环境变量优先' : ''}`
+      : '当前未配置密钥，请输入后保存';
+  } catch (error) {
+    if (status) status.textContent = error.message || '无法读取本机配置';
+  }
+}
+
+async function submitLLMConfig() {
+  const saveButton = $('#btnSaveLLMConfig');
+  const status = $('#llmConfigStatus');
+  const apiUrl = $('#llmApiUrl')?.value.trim();
+  const model = $('#llmModel')?.value.trim();
+  const apiKey = $('#llmApiKey')?.value || '';
+  if (!apiUrl || !model) {
+    if (status) status.textContent = 'API 地址和模型名称不能为空';
+    return;
+  }
+  if (saveButton) saveButton.disabled = true;
+  if (status) status.textContent = '正在保存并验证配置…';
+  try {
+    llmConfig = await updateLLMConfig({ apiUrl, model, apiKey });
+    if ($('#llmApiKey')) $('#llmApiKey').value = '';
+    closeModal('#llmConfigModal');
+    flash('API 配置已更新；正在检测云端服务');
+    await refreshLLMHealth({ silent: false, recover: true, deep: true });
+  } catch (error) {
+    if (status) status.textContent = error.message || 'API 配置保存失败';
+    flash(error.message || 'API 配置保存失败');
+  } finally {
+    if (saveButton) saveButton.disabled = false;
+  }
 }
 
 function setupChrome() {
@@ -1110,6 +1371,27 @@ function setupChrome() {
   $('#selSpeed').onchange = (e) => {
     applySettings(state, { aiSpeed: e.target.value });
   };
+  $('#selLLMMode').onchange = async (e) => {
+    const mode = e.target.value || LLM_POLICY_MODE.LOCAL;
+    applySettings(state, { llmPolicyMode: mode });
+    if (mode === LLM_POLICY_MODE.LOCAL) {
+      flash('已切换本地 AI：不调用云端 API');
+      render();
+      return;
+    }
+    flash(`${llmModeLabel(mode)}已启用；只在关键/有歧义回合调用，临时故障会自动重试`);
+    // 重新选择云端模式也应视为一次“恢复请求”。上一局若曾因超时/异常
+    // 进入配置/协议故障回退，单纯切回相同模式不会触发 modeChanged，必须在
+    // 深度验证成功后清掉持久化的 llmFallbackActive 标记。
+    await refreshLLMHealth({ silent: false, recover: true, deep: true });
+  };
+  $('#btnLLMCheck').onclick = () => refreshLLMHealth({ silent: false, recover: true, deep: true });
+  $('#btnLLMConfig').onclick = openLLMConfig;
+  $('#btnCloseLLMConfig').onclick = () => closeModal('#llmConfigModal');
+  $('#btnSaveLLMConfig').onclick = submitLLMConfig;
+  $('#llmConfigModal').addEventListener('click', (e) => {
+    if (e.target.id === 'llmConfigModal') closeModal('#llmConfigModal');
+  });
   $('#chkCoach').onchange = (e) => {
     applySettings(state, { coachMode: e.target.checked });
     if (e.target.checked && state.phase === PHASE.PLAYING && state.currentSeat === 0) {
@@ -1176,12 +1458,17 @@ function setupChrome() {
 }
 
 setUpdateCallback(() => {
-  persistMatch(state);
   render();
 });
 
 setupChrome();
 render();
+if ((state.settings?.llmPolicyMode || LLM_POLICY_MODE.LOCAL) !== LLM_POLICY_MODE.LOCAL) {
+  // 仅在已存在“本局回退”标记时做一次深度探针并自动恢复；普通启动仍只做浅检测，
+  // 本地 AI 启动完全不访问云端。
+  const recoverFallback = !!state.llmFallbackActive;
+  void refreshLLMHealth({ silent: true, recover: recoverFallback, deep: recoverFallback });
+}
 if (restoredState && restoredState.phase !== PHASE.IDLE) {
   flash('已恢复上次未完成的牌局');
   resumeMatch(state);

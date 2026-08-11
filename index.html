@@ -31,6 +31,7 @@
             <option value="easy">简单</option>
             <option value="normal" selected>普通</option>
             <option value="hard">困难</option>
+            <option value="master">大师</option>
           </select>
         </label>
         <label class="setting-inline" title="AI 出牌速度">
@@ -41,6 +42,18 @@
             <option value="fast">快</option>
           </select>
         </label>
+        <label class="setting-inline" title="云端只重排本地安全候选；临时故障当手回退并自动重试">
+          AI策略
+          <select id="selLLMMode" aria-label="AI策略模式">
+            <option value="local" selected>本地 AI</option>
+            <option value="auto">智能增强</option>
+            <option value="cloud">云端增强</option>
+          </select>
+        </label>
+        <span id="llmStatus" class="llm-status local" role="status" aria-live="polite">本地 AI</span>
+        <button type="button" class="secondary" id="btnLLMCheck" title="检测本机网关，并实际验证一次云端聊天接口；成功后解除本局本地回退">检测/恢复 API</button>
+        <button type="button" class="secondary" id="btnLLMConfig" title="更换云端 API 地址、模型或密钥">API 设置</button>
+        <span id="llmPrompt" class="llm-prompt">默认不调用云端 API</span>
         <label class="setting-inline coach-toggle" title="显示教练建议">
           <input type="checkbox" id="chkCoach" /> 教练
         </label>
@@ -217,7 +230,9 @@
         </ul>
         <h4>训练功能</h4>
         <ul>
-          <li><strong>难度</strong>：简单 / 普通 / 困难（影响 AI 配合、留炸与随机性）。</li>
+          <li><strong>难度</strong>：简单 / 普通 / 困难 / 大师。大师模式强化公开牌史记忆、牌型规划、搭档配合与残局控制，不读取其他玩家未公开手牌。</li>
+          <li><strong>AI策略</strong>：本地 AI 默认离线；智能增强仅在关键/有歧义回合请求云端。超时、429、5xx 和网络波动只回退当前手并自动重试；密钥、模型或协议错误才转为全场景本地 AI。</li>
+          <li><strong>云端隐私</strong>：每次仅发送当前电脑玩家自己的手牌、合法候选和公开牌史，不发送其他玩家暗牌；但整局多次调用可能让第三方服务累计看到多名电脑玩家手牌，请同时遵守所选 API 服务商的数据保留政策。</li>
           <li><strong>教练模式</strong>：轮到你时给出推荐出法（按困难 AI 思路）。</li>
           <li><strong>出牌评价</strong>：每次操作打分；副末复盘；历史牌技统计。</li>
           <li><strong>复盘</strong>：查看最近对局出牌流水与评分。</li>
@@ -239,6 +254,26 @@
         <input type="file" id="fileImportStats" accept="application/json,.json" hidden />
         <button type="button" class="secondary" id="btnClearStats">清空统计</button>
         <button type="button" id="btnCloseStats">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="llmConfigModal" class="overlay hidden">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="llmConfigTitle" tabindex="-1">
+      <h3 id="llmConfigTitle">云端 API 设置</h3>
+      <div class="config-form">
+        <label for="llmApiUrl">API 地址（Base URL 或完整 Chat Completions 地址）</label>
+        <input id="llmApiUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://ark.cn-beijing.volces.com/api/coding/v3" />
+        <label for="llmModel">模型名称</label>
+        <input id="llmModel" type="text" autocomplete="off" spellcheck="false" placeholder="deepseek-v4-flash" />
+        <label for="llmApiKey">API Key</label>
+        <input id="llmApiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空表示保留当前密钥" />
+        <p class="config-note">密钥只发送到本机 <code>127.0.0.1:20801</code>，不会写入浏览器存储；保存后由 Windows 当前用户的 DPAPI 加密保存在本机，重启服务仍可使用。留空表示保留同一服务商的当前密钥，更换服务商时必须填写对应新密钥；保存后会立即重新检测。</p>
+        <p id="llmConfigStatus" class="config-status" role="status" aria-live="polite">正在读取本机配置…</p>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" id="btnCloseLLMConfig">取消</button>
+        <button type="button" class="accent" id="btnSaveLLMConfig">保存并检测</button>
       </div>
     </div>
   </div>

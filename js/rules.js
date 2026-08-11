@@ -48,6 +48,10 @@ const STRAIGHT_SEQUENCES = [
     return [start, start + 1, start + 2, start + 3, start + 4];
   }),
 ];
+const STRAIGHT_RANK_MASKS = STRAIGHT_SEQUENCES.map((sequence) => (
+  sequence.reduce((mask, rank) => mask | (1 << ((rank === 1 ? 14 : rank) - 2)), 0)
+));
+const SUIT_INDEX = Object.freeze({ S: 0, H: 1, D: 2, C: 3 });
 const TRIPLE_PAIR_SEQUENCES = [
   [1, 2, 3],
   ...Array.from({ length: 11 }, (_, i) => {
@@ -244,31 +248,40 @@ function addSameRankVariants(cards, level, type, required, add) {
 
 function addFullHouseVariants(cards, level, normals, wilds, add) {
   const groups = groupByRank(normals);
-  for (const tripleRank of NATURAL_RANKS) {
-    for (const pairRank of NATURAL_RANKS) {
-      if (tripleRank === pairRank) continue;
-      let valid = true;
-      for (const [rank, group] of groups) {
-        const limit = rank === tripleRank ? 3 : rank === pairRank ? 2 : 0;
-        if (group.length > limit) {
-          valid = false;
-          break;
-        }
-      }
-      if (!valid) continue;
-      const tripleHave = groups.get(tripleRank)?.length || 0;
-      const pairHave = groups.get(pairRank)?.length || 0;
-      if ((3 - tripleHave) + (2 - pairHave) !== wilds.length) continue;
-      add(HandType.FULLHOUSE, tripleRank, rankPowerForCompare(tripleRank, level), {
-        pairRank,
-        ...(wilds.length ? {
-          wildAs: [
-            ...Array(3 - tripleHave).fill(tripleRank),
-            ...Array(2 - pairHave).fill(pairRank),
-          ],
-        } : {}),
-      });
+  const observed = [...groups.keys()];
+  if (observed.length > 2) return;
+
+  const assignments = [];
+  if (observed.length === 2) {
+    assignments.push([observed[0], observed[1]], [observed[1], observed[0]]);
+  } else if (observed.length === 1) {
+    const rank = observed[0];
+    for (const other of NATURAL_RANKS) {
+      if (other === rank) continue;
+      assignments.push([rank, other], [other, rank]);
     }
+  } else {
+    for (const tripleRank of NATURAL_RANKS) {
+      for (const pairRank of NATURAL_RANKS) {
+        if (tripleRank !== pairRank) assignments.push([tripleRank, pairRank]);
+      }
+    }
+  }
+
+  for (const [tripleRank, pairRank] of assignments) {
+    const tripleHave = groups.get(tripleRank)?.length || 0;
+    const pairHave = groups.get(pairRank)?.length || 0;
+    if (tripleHave > 3 || pairHave > 2) continue;
+    if ((3 - tripleHave) + (2 - pairHave) !== wilds.length) continue;
+    add(HandType.FULLHOUSE, tripleRank, rankPowerForCompare(tripleRank, level), {
+      pairRank,
+      ...(wilds.length ? {
+        wildAs: [
+          ...Array(3 - tripleHave).fill(tripleRank),
+          ...Array(2 - pairHave).fill(pairRank),
+        ],
+      } : {}),
+    });
   }
 }
 
@@ -402,7 +415,8 @@ export function isLegalPlay(cards, level, lastHand, declaration = null) {
   }
 
   if (!lastHand) {
-    return { ok: true, hand: candidates[0], variants };
+    const leading = candidates.slice().sort((a, b) => compareLeadingVariants(a, b, level));
+    return { ok: true, hand: leading[0], variants };
   }
 
   const beating = candidates
@@ -426,6 +440,13 @@ function compareBeatingVariants(a, b, lastHand) {
   return handSignature(a).localeCompare(handSignature(b));
 }
 
+function compareLeadingVariants(a, b, level) {
+  const aStrictlyStronger = canBeat(a, b, level) && !canBeat(b, a, level);
+  const bStrictlyStronger = canBeat(b, a, level) && !canBeat(a, b, level);
+  if (aStrictlyStronger !== bStrictlyStronger) return aStrictlyStronger ? -1 : 1;
+  return compareDefaultVariants(a, b);
+}
+
 /**
  * 生成手牌所有合法出牌（用于 AI 与提示）
  * 采用启发式枚举，控制组合爆炸
@@ -433,31 +454,156 @@ function compareBeatingVariants(a, b, lastHand) {
 export function generateLegalPlays(hand, level, lastHand) {
   const plays = [];
   const seen = new Set();
+  const parsedByPhysicalCards = new Map();
+  const selectRankCards = createStructuralRankSelector(hand, level);
 
   const add = (cards) => {
     if (!cards.length) return;
-    const physicalKey = cards.map((c) => c.id).sort().join(',');
-    for (const parsed of parseHandVariants(cards, level)) {
+    const physicalKey = cards.map((c) => String(c.id)).sort().join(',');
+    let variants = parsedByPhysicalCards.get(physicalKey);
+    if (!variants) {
+      variants = parseHandVariants(cards, level);
+      parsedByPhysicalCards.set(physicalKey, variants);
+    }
+    for (const parsed of variants) {
       if (lastHand && !canBeat(parsed, lastHand, level)) continue;
-      const key = `${physicalKey}::${handSignature(parsed)}`;
+      const signature = handSignature(parsed);
+      const key = `${physicalKey}::${signature}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      plays.push({ cards: cards.slice(), hand: parsed, signature: handSignature(parsed) });
+      plays.push({ cards: cards.slice(), hand: parsed, signature });
     }
   };
 
   // 领出：生成各类基础组合
   if (!lastHand) {
-    generateFreePlays(hand, level, add);
+    generateFreePlays(hand, level, add, selectRankCards);
     return plays;
   }
 
   // 接牌：同型更大，或炸弹/同花顺/天王
-  generateBeatPlays(hand, level, lastHand, add);
+  generateBeatPlays(hand, level, lastHand, add, selectRankCards);
   return plays;
 }
 
-function generateFreePlays(hand, level, add) {
+/**
+ * Same-rank physical cards are equivalent for rank rules but not for a
+ * straight-flush. Keep a small representative set that includes a choice
+ * preserving each suit, instead of either one arbitrary slice or every
+ * physical combination from two decks.
+ */
+function structuralRankSelections(cards, take) {
+  if (take === 0) return [[]];
+  if (take < 0 || take > cards.length) return [];
+  if (take === cards.length) return [cards.slice()];
+  const result = [];
+  const seen = new Set();
+  const add = (selection) => {
+    const key = selection.map((card) => String(card.id)).sort().join(',');
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push(selection);
+  };
+  // 两副牌中同一点数最多八张；同花同点的两张实体对后续结构等价，
+  // 因此只枚举“各花色取几张”的代表，而不是 C(8,n) 个物理组合。
+  // 这也能覆盖第三张非关键花色（如 ♥3）同时保留黑桃、方块两套同花顺，
+  // 是单纯“逐花色避开一张”无法生成的安全选择。
+  const suitOrder = [...new Set(['S', 'H', 'D', 'C', ...cards.map((card) => card.suit)])];
+  const groups = suitOrder
+    .map((suit) => cards
+      .filter((card) => card.suit === suit)
+      .slice()
+      .sort((left, right) => String(left.id).localeCompare(String(right.id))))
+    .filter((group) => group.length);
+  const suffixAvailable = new Array(groups.length + 1).fill(0);
+  for (let index = groups.length - 1; index >= 0; index--) {
+    suffixAvailable[index] = suffixAvailable[index + 1] + groups[index].length;
+  }
+  const visit = (index, remaining, selection) => {
+    if (index === groups.length) {
+      if (remaining === 0) add(selection);
+      return;
+    }
+    const availableLater = suffixAvailable[index + 1];
+    const minimum = Math.max(0, remaining - availableLater);
+    const maximum = Math.min(remaining, groups[index].length);
+    for (let count = minimum; count <= maximum; count++) {
+      visit(index + 1, remaining - count, [
+        ...selection,
+        ...groups[index].slice(0, count),
+      ]);
+    }
+  };
+  visit(0, take, []);
+  return result;
+}
+
+function flushStraightMask(cards, level) {
+  let wilds = 0;
+  const suitMasks = [0, 0, 0, 0];
+  for (const card of cards) {
+    if (isWild(card, level)) wilds += 1;
+    else if (!isJoker(card) && SUIT_INDEX[card.suit] != null) {
+      suitMasks[SUIT_INDEX[card.suit]] |= 1 << (card.rank - 2);
+    }
+  }
+  let mask = 0n;
+  for (let suitIndex = 0; suitIndex < suitMasks.length; suitIndex++) {
+    for (let sequenceIndex = 0; sequenceIndex < STRAIGHT_RANK_MASKS.length; sequenceIndex++) {
+      const missing = 5 - popcount13(suitMasks[suitIndex] & STRAIGHT_RANK_MASKS[sequenceIndex]);
+      if (missing <= wilds) {
+        mask |= 1n << BigInt(suitIndex * STRAIGHT_RANK_MASKS.length + sequenceIndex);
+      }
+    }
+  }
+  return mask;
+}
+
+function popcount13(value) {
+  let count = 0;
+  let remaining = value;
+  while (remaining) {
+    remaining &= remaining - 1;
+    count += 1;
+  }
+  return count;
+}
+
+function createStructuralRankSelector(hand, level) {
+  const maskCache = new Map();
+  const resultCache = new Map();
+  return (cards, take) => {
+    const resultKey = `${take}|${cards.map((card) => String(card.id)).sort().join(',')}`;
+    if (resultCache.has(resultKey)) return resultCache.get(resultKey);
+    const variants = structuralRankSelections(cards, take);
+    if (variants.length <= 1) {
+      resultCache.set(resultKey, variants);
+      return variants;
+    }
+    const byMask = new Map();
+    for (const selection of variants) {
+      const used = new Set(selection.map((card) => String(card.id)));
+      const usedKey = [...used].sort().join(',');
+      let mask = maskCache.get(usedKey);
+      if (mask == null) {
+        mask = flushStraightMask(
+          hand.filter((card) => !used.has(String(card.id))),
+          level,
+        );
+        maskCache.set(usedKey, mask);
+      }
+      if (!byMask.has(mask)) byMask.set(mask, selection);
+    }
+    const entries = [...byMask.entries()];
+    const result = entries.filter(([mask], index) => !entries.some(([other], otherIndex) => (
+      otherIndex !== index && other !== mask && (mask | other) === other
+    ))).map(([, selection]) => selection);
+    resultCache.set(resultKey, result);
+    return result;
+  };
+}
+
+function generateFreePlays(hand, level, add, selectRankCards) {
   // 单张
   for (const c of hand) add([c]);
 
@@ -469,13 +615,15 @@ function generateFreePlays(hand, level, add) {
   // 对子、三张、炸弹
   for (const [rank, cards] of groups) {
     for (let n = 2; n <= cards.length; n++) {
-      add(cards.slice(0, n));
+      for (const selection of selectRankCards(cards, n)) add(selection);
     }
     // 用 wild 补
     for (let w = 1; w <= wilds.length; w++) {
       for (let n = 1; n <= cards.length; n++) {
         if (n + w >= 2 && n + w <= 10) {
-          add([...cards.slice(0, n), ...wilds.slice(0, w)]);
+          for (const selection of selectRankCards(cards, n)) {
+            add([...selection, ...wilds.slice(0, w)]);
+          }
         }
       }
     }
@@ -495,24 +643,24 @@ function generateFreePlays(hand, level, add) {
   }
 
   // 三带二
-  generateFullHouses(hand, level, groups, wilds, add);
+  generateFullHouses(hand, level, groups, wilds, add, selectRankCards);
 
   // 顺子 / 同花顺
-  generateStraights(hand, level, wilds, add);
+  generateStraights(hand, level, wilds, add, selectRankCards);
 
   // 三连对 / 钢板
-  generateTriplePairs(hand, level, wilds, add);
-  generatePlates(hand, level, wilds, add);
+  generateTriplePairs(hand, level, wilds, add, selectRankCards);
+  generatePlates(hand, level, wilds, add, selectRankCards);
 }
 
-function generateBeatPlays(hand, level, lastHand, add) {
+function generateBeatPlays(hand, level, lastHand, add, selectRankCards) {
   const wilds = hand.filter((c) => isWild(c, level));
   const nonWild = hand.filter((c) => !isWild(c, level));
   const groups = groupByRank(nonWild);
 
   // 炸弹、同花顺、天王（可压普通或更小炸弹）
-  generateBombs(hand, level, groups, wilds, add);
-  generateStraights(hand, level, wilds, add); // includes flush check via parse
+  generateBombs(hand, level, groups, wilds, add, selectRankCards);
+  generateStraights(hand, level, wilds, add, selectRankCards); // includes flush check via parse
   const smallJ = hand.filter((c) => c.rank === 16);
   const bigJ = hand.filter((c) => c.rank === 17);
   if (smallJ.length >= 2 && bigJ.length >= 2) {
@@ -526,8 +674,12 @@ function generateBeatPlays(hand, level, lastHand, add) {
         break;
       case HandType.PAIR:
         for (const [rank, cards] of groups) {
-          if (cards.length >= 2) add(cards.slice(0, 2));
-          if (cards.length >= 1 && wilds.length >= 1) add([cards[0], wilds[0]]);
+          if (cards.length >= 2) {
+            for (const selection of selectRankCards(cards, 2)) add(selection);
+          }
+          if (cards.length >= 1 && wilds.length >= 1) {
+            for (const selection of selectRankCards(cards, 1)) add([selection[0], wilds[0]]);
+          }
         }
         if (wilds.length >= 2) add(wilds.slice(0, 2));
         {
@@ -539,22 +691,32 @@ function generateBeatPlays(hand, level, lastHand, add) {
         break;
       case HandType.TRIPLE:
         for (const [rank, cards] of groups) {
-          if (cards.length >= 3) add(cards.slice(0, 3));
-          if (cards.length >= 2 && wilds.length >= 1) add([...cards.slice(0, 2), wilds[0]]);
-          if (cards.length >= 1 && wilds.length >= 2) add([cards[0], ...wilds.slice(0, 2)]);
+          if (cards.length >= 3) {
+            for (const selection of selectRankCards(cards, 3)) add(selection);
+          }
+          if (cards.length >= 2 && wilds.length >= 1) {
+            for (const selection of selectRankCards(cards, 2)) {
+              add([...selection, wilds[0]]);
+            }
+          }
+          if (cards.length >= 1 && wilds.length >= 2) {
+            for (const selection of selectRankCards(cards, 1)) {
+              add([selection[0], ...wilds.slice(0, 2)]);
+            }
+          }
         }
         break;
       case HandType.FULLHOUSE:
-        generateFullHouses(hand, level, groups, wilds, add);
+        generateFullHouses(hand, level, groups, wilds, add, selectRankCards);
         break;
       case HandType.STRAIGHT:
-        generateStraights(hand, level, wilds, add);
+        generateStraights(hand, level, wilds, add, selectRankCards);
         break;
       case HandType.TRIPLE_PAIR:
-        generateTriplePairs(hand, level, wilds, add);
+        generateTriplePairs(hand, level, wilds, add, selectRankCards);
         break;
       case HandType.PLATE:
-        generatePlates(hand, level, wilds, add);
+        generatePlates(hand, level, wilds, add, selectRankCards);
         break;
       default:
         break;
@@ -565,17 +727,21 @@ function generateBeatPlays(hand, level, lastHand, add) {
   }
 }
 
-function generateBombs(hand, level, groups, wilds, add) {
+function generateBombs(hand, level, groups, wilds, add, selectRankCards) {
   for (const [rank, cards] of groups) {
     for (let n = 4; n <= cards.length; n++) {
-      add(cards.slice(0, n));
+      for (const selection of selectRankCards(cards, n)) add(selection);
     }
     for (let w = 1; w <= wilds.length; w++) {
       const total = cards.length + w;
       if (total >= 4) {
         // 取 cards 全部 + w wild，或 cards 部分
         for (let take = Math.max(1, 4 - w); take <= cards.length; take++) {
-          if (take + w >= 4) add([...cards.slice(0, take), ...wilds.slice(0, w)]);
+          if (take + w >= 4) {
+            for (const selection of selectRankCards(cards, take)) {
+              add([...selection, ...wilds.slice(0, w)]);
+            }
+          }
         }
       }
     }
@@ -585,7 +751,7 @@ function generateBombs(hand, level, groups, wilds, add) {
   }
 }
 
-function generateFullHouses(hand, level, groups, wilds, add) {
+function generateFullHouses(hand, level, groups, wilds, add, selectRankCards) {
   const ranks = [...groups.keys()];
   for (let i = 0; i < ranks.length; i++) {
     for (let j = 0; j < ranks.length; j++) {
@@ -602,7 +768,11 @@ function generateFullHouses(hand, level, groups, wilds, add) {
           if (tc > tCards.length || pc > pCards.length) continue;
           if (tc + tw !== 3 || pc + pw !== 2) continue;
           const usedWilds = wilds.slice(0, tw + pw);
-          add([...tCards.slice(0, tc), ...pCards.slice(0, pc), ...usedWilds]);
+          for (const tripleCards of selectRankCards(tCards, tc)) {
+            for (const pairCards of selectRankCards(pCards, pc)) {
+              add([...tripleCards, ...pairCards, ...usedWilds]);
+            }
+          }
         }
       }
     }
@@ -610,47 +780,40 @@ function generateFullHouses(hand, level, groups, wilds, add) {
   // triple + wild pair
   for (const [tr, tCards] of groups) {
     if (tCards.length >= 3 && wilds.length >= 2) {
-      add([...tCards.slice(0, 3), ...wilds.slice(0, 2)]);
+      for (const tripleCards of selectRankCards(tCards, 3)) {
+        add([...tripleCards, ...wilds.slice(0, 2)]);
+      }
     }
     if (tCards.length >= 2 && wilds.length >= 3) {
-      add([...tCards.slice(0, 2), ...wilds.slice(0, 3)]);
+      for (const tripleCards of selectRankCards(tCards, 2)) {
+        add([...tripleCards, ...wilds.slice(0, 3)]);
+      }
     }
   }
 }
 
-function generateStraights(hand, level, wilds, add) {
+function generateStraights(hand, level, wilds, add, selectRankCards) {
   const nonJoker = hand.filter((c) => !isJoker(c));
-  const sequences = [[1, 2, 3, 4, 5]];
-  for (let s = 2; s <= 10; s++) sequences.push([s, s + 1, s + 2, s + 3, s + 4]);
-
-  for (const seq of sequences) {
-    const picks = pickSequence(nonJoker, wilds, seq, 1, level);
+  for (const seq of STRAIGHT_SEQUENCES) {
+    const picks = pickSequence(nonJoker, wilds, seq, 1, level, selectRankCards);
     for (const p of picks) add(p);
   }
 }
 
-function generateTriplePairs(hand, level, wilds, add) {
+function generateTriplePairs(hand, level, wilds, add, selectRankCards) {
   const nonJoker = hand.filter((c) => !isJoker(c) && !isWild(c, level));
   const wildList = hand.filter((c) => isWild(c, level));
-  const sequences = [[1, 2, 3]];
-  for (let s = 2; s <= 12; s++) {
-    if (s + 2 <= 14) sequences.push([s, s + 1, s + 2]);
-  }
-  for (const seq of sequences) {
-    const picks = pickSequence(nonJoker, wildList, seq, 2, level);
+  for (const seq of TRIPLE_PAIR_SEQUENCES) {
+    const picks = pickSequence(nonJoker, wildList, seq, 2, level, selectRankCards);
     for (const p of picks) add(p);
   }
 }
 
-function generatePlates(hand, level, wilds, add) {
+function generatePlates(hand, level, wilds, add, selectRankCards) {
   const nonJoker = hand.filter((c) => !isJoker(c) && !isWild(c, level));
   const wildList = hand.filter((c) => isWild(c, level));
-  const sequences = [[1, 2]];
-  for (let s = 2; s <= 13; s++) {
-    if (s + 1 <= 14) sequences.push([s, s + 1]);
-  }
-  for (const seq of sequences) {
-    const picks = pickSequence(nonJoker, wildList, seq, 3, level);
+  for (const seq of PLATE_SEQUENCES) {
+    const picks = pickSequence(nonJoker, wildList, seq, 3, level, selectRankCards);
     for (const p of picks) add(p);
   }
 }
@@ -659,31 +822,44 @@ function generatePlates(hand, level, wilds, add) {
  * 从手牌中为序列每点取 needPer 张（可用 wild）
  * 返回最多若干种取法
  */
-function pickSequence(nonWildCards, wilds, seq, needPer, level) {
-  // 简化：贪心取每种 rank 的牌
-  // 重新：nonWildCards 可能仍含 wild 如果传入的是 nonJoker
+function pickSequence(nonWildCards, wilds, seq, needPer, level, selectRankCards) {
   const real = nonWildCards.filter((c) => !isWild(c, level));
   const g = groupByRank(real);
-  let wildLeft = wilds.length;
-  const chosen = [];
-  const wildUsed = [];
-
-  for (const r of seq) {
-    const actual = r === 1 ? 14 : r;
-    const pool = (g.get(actual) || []).slice();
-    const take = Math.min(needPer, pool.length);
-    chosen.push(...pool.slice(0, take));
-    const need = needPer - take;
-    if (need > wildLeft) return [];
-    for (let i = 0; i < need; i++) {
-      wildUsed.push(wilds[wilds.length - wildLeft]);
-      wildLeft--;
+  const result = [];
+  const seen = new Set();
+  const addResult = (cards) => {
+    const key = cards.map((card) => String(card.id)).sort().join(',');
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push(cards);
+  };
+  const buildLane = (preserveSuit = null) => {
+    const chosen = [];
+    let wildIndex = 0;
+    for (const r of seq) {
+      const actual = r === 1 ? 14 : r;
+      const pool = (g.get(actual) || []).slice();
+      const take = Math.min(needPer, pool.length);
+      const variants = selectRankCards(pool, take);
+      const selection = preserveSuit
+        ? variants.slice().sort((left, right) => (
+          left.filter((card) => card.suit === preserveSuit).length
+          - right.filter((card) => card.suit === preserveSuit).length
+        ))[0] || []
+        : variants[0] || [];
+      chosen.push(...selection);
+      const need = needPer - take;
+      if (wildIndex + need > wilds.length) return null;
+      chosen.push(...wilds.slice(wildIndex, wildIndex + need));
+      wildIndex += need;
     }
-  }
+    return chosen;
+  };
 
-  // 检查没有用到的实体牌问题：OK 我们只取需要的
-  // 但同花顺需要同花：额外尝试
-  const result = [[...chosen, ...wildUsed]];
+  for (const preserveSuit of [null, 'S', 'H', 'D', 'C']) {
+    const lane = buildLane(preserveSuit);
+    if (lane) addResult(lane);
+  }
 
   // 尝试同花：按花色筛选
   if (needPer === 1 && seq.length === 5) {
@@ -708,7 +884,7 @@ function pickSequence(nonWildCards, wilds, seq, needPer, level) {
         }
       }
       if (ok && ch.length + wu.length === 5) {
-        result.push([...ch, ...wu]);
+        addResult([...ch, ...wu]);
       }
     }
   }

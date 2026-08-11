@@ -8,6 +8,7 @@ const SETTINGS_KEY = 'guandan_settings_v1';
 const REPLAY_KEY = 'guandan_replays_v1';
 const ACTIVE_MATCH_KEY = 'guandan_active_match_v2';
 const DATA_VERSION = 2;
+const REPLAY_LIMIT = 100;
 
 /** 浏览器 localStorage；Node 下用内存 mock，避免测试崩溃 */
 const memoryStore = new Map();
@@ -44,6 +45,34 @@ const emptyDifficulty = () => ({
   easy: { rounds: 0, evalCount: 0, evalSum: 0 },
   normal: { rounds: 0, evalCount: 0, evalSum: 0 },
   hard: { rounds: 0, evalCount: 0, evalSum: 0 },
+  master: { rounds: 0, evalCount: 0, evalSum: 0 },
+});
+
+const emptyLLMStats = () => ({
+  rounds: 0,
+  eligibleTurns: 0,
+  localTurns: 0,
+  cloudCalls: 0,
+  successes: 0,
+  failures: 0,
+  fallbacks: 0,
+  skipped: 0,
+  totalLatencyMs: 0,
+  minLatencyMs: null,
+  maxLatencyMs: null,
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  estimatedTokenCalls: 0,
+  cloudAgreements: 0,
+  cloudOverrides: 0,
+  rejectedCloudChoices: 0,
+  transientFailures: 0,
+  modelOutputFailures: 0,
+  permanentFailures: 0,
+  backoffSkips: 0,
+  budgetSkips: 0,
+  strategicSkips: 0,
 });
 
 const defaultStats = () => ({
@@ -62,6 +91,7 @@ const defaultStats = () => ({
   gradeCounts: { 神来之笔: 0, 优秀: 0, 良好: 0, 一般: 0, 待改进: 0 },
   mistakeCounts: {},
   difficulty: emptyDifficulty(),
+  llm: emptyLLMStats(),
   scoreTrend: [],
   matchWins: 0,
   matchLosses: 0,
@@ -83,6 +113,7 @@ function mergeStats(raw) {
     gradeCounts: { ...base.gradeCounts, ...(parsed.gradeCounts || {}) },
     mistakeCounts: { ...(parsed.mistakeCounts || {}) },
     difficulty,
+    llm: { ...base.llm, ...(parsed.llm || {}) },
     scoreTrend: Array.isArray(parsed.scoreTrend) ? parsed.scoreTrend.slice(-100) : [],
   };
 }
@@ -111,6 +142,7 @@ export function recordRoundResult({
   matchEnded,
   matchWon,
   difficulty = 'normal',
+  llmReport = null,
 }) {
   const s = loadStats();
   s.totalRounds += 1;
@@ -153,6 +185,44 @@ export function recordRoundResult({
     else s.matchLosses += 1;
   }
 
+  const report = llmReport && typeof llmReport === 'object' ? llmReport : null;
+  const llm = s.llm || emptyLLMStats();
+  if (report) {
+    llm.rounds += 1;
+    llm.eligibleTurns += Number(report.cloudEligibleTurns) || 0;
+    llm.localTurns += Number(report.localTurns) || 0;
+    llm.cloudCalls += Number(report.cloudCalls) || 0;
+    llm.successes += Number(report.successes) || 0;
+    llm.failures += Number(report.failures) || 0;
+    llm.fallbacks += Number(report.fallbacks) || 0;
+    llm.skipped += Number(report.skipped) || 0;
+    llm.totalLatencyMs += Number(report.totalLatencyMs) || 0;
+    llm.promptTokens += Number(report.promptTokens) || 0;
+    llm.completionTokens += Number(report.completionTokens) || 0;
+    llm.totalTokens += Number(report.totalTokens) || 0;
+    llm.estimatedTokenCalls += Number(report.estimatedTokenCalls) || 0;
+    llm.cloudAgreements += Number(report.cloudAgreements) || 0;
+    llm.cloudOverrides += Number(report.cloudOverrides) || 0;
+    llm.rejectedCloudChoices += Number(report.rejectedCloudChoices) || 0;
+    llm.transientFailures += Number(report.transientFailures) || 0;
+    llm.modelOutputFailures += Number(report.modelOutputFailures) || 0;
+    llm.permanentFailures += Number(report.permanentFailures) || 0;
+    llm.backoffSkips += Number(report.backoffSkips) || 0;
+    llm.budgetSkips += Number(report.budgetSkips) || 0;
+    llm.strategicSkips += Number(report.strategicSkips) || 0;
+    if (Number.isFinite(Number(report.minLatencyMs))) {
+      llm.minLatencyMs = llm.minLatencyMs == null
+        ? Number(report.minLatencyMs)
+        : Math.min(llm.minLatencyMs, Number(report.minLatencyMs));
+    }
+    if (Number.isFinite(Number(report.maxLatencyMs))) {
+      llm.maxLatencyMs = llm.maxLatencyMs == null
+        ? Number(report.maxLatencyMs)
+        : Math.max(llm.maxLatencyMs, Number(report.maxLatencyMs));
+    }
+  }
+  s.llm = llm;
+
   s.scoreTrend.push({
     time: new Date().toISOString(),
     difficulty,
@@ -177,10 +247,23 @@ export function unassistedAvgScore(stats) {
   return Math.round(stats.unassistedEvalSum / stats.unassistedEvalCount);
 }
 
+/** 用户可持久化设置中剥离 A/B 模拟器专用实验字段（浅拷贝，其余原样）。 */
+export function sanitizeUserSettings(settings) {
+  if (!settings || typeof settings !== 'object') return {};
+  const {
+    aiPolicyBySeat,
+    aiPolicyFeaturesBySeat,
+    aiDifficultyBySeat,
+    ...rest
+  } = settings;
+  return rest;
+}
+
 export function loadSettings() {
   const defaults = {
     difficulty: 'normal',
     aiSpeed: 'normal',
+    llmPolicyMode: 'local',
     coachMode: false,
     autoHint: false,
     reducedMotion: false,
@@ -188,7 +271,9 @@ export function loadSettings() {
   };
   try {
     const raw = storage().getItem(SETTINGS_KEY);
-    return raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
+    const parsed = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
+    if (!['local', 'auto', 'cloud'].includes(parsed.llmPolicyMode)) parsed.llmPolicyMode = 'local';
+    return parsed;
   } catch {
     return defaults;
   }
@@ -202,7 +287,7 @@ export function saveSettings(settings) {
 export function saveReplay(replay) {
   const list = loadReplays();
   list.unshift(replay);
-  while (list.length > 20) list.pop();
+  while (list.length > REPLAY_LIMIT) list.pop();
   while (list.length) {
     if (safeSet(REPLAY_KEY, list)) return list;
     list.pop();
@@ -259,8 +344,12 @@ export function importTrainingData(data) {
     return { ok: false, reason: '文件不是有效的掼蛋训练数据' };
   }
   const statsOk = safeSet(KEY, mergeStats(data.stats));
-  const settingsOk = safeSet(SETTINGS_KEY, { ...loadSettings(), ...(data.settings || {}) });
-  const replayOk = safeSet(REPLAY_KEY, data.replays.slice(0, 20));
+  // 剥离 A/B 模拟器实验字段，避免导入后正式对局某座被永久钉死 baseline/no-pX
+  const settingsOk = safeSet(SETTINGS_KEY, sanitizeUserSettings({
+    ...loadSettings(),
+    ...(data.settings || {}),
+  }));
+  const replayOk = safeSet(REPLAY_KEY, data.replays.slice(0, REPLAY_LIMIT));
   return statsOk && settingsOk && replayOk
     ? { ok: true }
     : { ok: false, reason: '浏览器存储空间不足，导入未完成' };

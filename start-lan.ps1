@@ -15,6 +15,18 @@ try {
         throw "Missing local server file: $ServerScript"
     }
 
+    $expectedBuild = (Get-FileHash -LiteralPath $ServerScript -Algorithm SHA256).Hash.Substring(0, 12).ToLowerInvariant()
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $projectHashBytes = $sha256.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes([System.IO.Path]::GetFullPath($ProjectRoot).ToLowerInvariant())
+        )
+        $expectedProject = ([BitConverter]::ToString($projectHashBytes) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
     $listeners = @(
         Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
     )
@@ -27,7 +39,9 @@ try {
             $health = $null
         }
 
-        if ($health.ok -eq $true -and $health.service -eq "guandan-trainer") {
+        $sameService = $health.ok -eq $true -and $health.service -eq "guandan-trainer"
+        $sameBuild = $sameService -and $health.build -eq $expectedBuild -and $health.project -eq $expectedProject
+        if ($sameBuild) {
             Write-Host ""
             Write-Host "Guandan Trainer is already running." -ForegroundColor Cyan
             Write-Host "Local URL: $url" -ForegroundColor Green
@@ -36,7 +50,32 @@ try {
             exit 0
         }
 
-        throw "Fixed port $Port is being used by another program. Close that program and start again."
+        if ($sameService) {
+            $listenerPids = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+            $safeToRestart = $false
+            if ($listenerPids.Count -eq 1) {
+                $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($listenerPids[0])" -ErrorAction SilentlyContinue
+                $resolvedScript = [System.IO.Path]::GetFullPath($ServerScript)
+                $safeToRestart = $null -ne $processInfo -and
+                    $processInfo.CommandLine -and
+                    $processInfo.CommandLine.IndexOf($resolvedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0
+            }
+            if (-not $safeToRestart) {
+                throw "Port $Port is running an older Guandan service, but its process path cannot be verified. Close PID $($listenerPids -join ', ') and start again."
+            }
+            Write-Host "Detected an older Guandan service. Restarting it safely..." -ForegroundColor Yellow
+            Stop-Process -Id $listenerPids[0] -ErrorAction Stop
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+                Start-Sleep -Milliseconds 100
+                if (-not (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)) { break }
+            }
+            if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+                throw "The older Guandan service did not release port $Port."
+            }
+        }
+        else {
+            throw "Fixed port $Port is being used by another program. Close that program and start again."
+        }
     }
 
     $python = Get-Command py -ErrorAction SilentlyContinue

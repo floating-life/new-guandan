@@ -69,6 +69,8 @@ function finish() {
     assert(replay.trickLog.every((line) => line.turn && line.trickNumber && line.countsAfter), '每手保存圈号与剩余张数');
     assert(replay.trickLog.some((line) => line.seat === 0 && line.evaluation), '真人动作与评价一一关联');
     assert(replay.roundSummary?.dimensionAverages, '复盘保存五维总结');
+    assert(replay.llmReport && Number.isFinite(replay.llmReport.cloudCalls)
+      && Number.isFinite(replay.llmReport.successes), '复盘保存云端 API 调用报告');
     console.log(`\n结果: 完整一副 ${replay.trickLog.length} 手，回归通过`);
     process.exit(0);
   } catch (error) {

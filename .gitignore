@@ -15,5 +15,11 @@ stats.json
 node_modules/
 coverage/
 dist/
+__pycache__/
+*.py[cod]
 .DS_Store
 Thumbs.db
+
+# A/B / 消融实验输出（不入库）
+ab_*.json
+ab_*.err

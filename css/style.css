@@ -128,6 +128,34 @@ body.reduced-motion *::after {
   flex-wrap: wrap;
 }
 
+.llm-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  max-width: 190px;
+  padding: 4px 9px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.74rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.llm-status.local { color: var(--muted); }
+.llm-status.online { color: var(--ok); border-color: rgba(107, 203, 119, 0.55); }
+.llm-status.warn { color: var(--gold); border-color: rgba(232, 195, 106, 0.55); }
+.llm-status.error { color: #ffb4a8; border-color: rgba(255, 107, 107, 0.6); }
+.llm-status.checking { color: var(--accent); border-color: rgba(61, 214, 198, 0.55); }
+
+.llm-prompt {
+  align-self: center;
+  max-width: 270px;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
 /* Table */
 .table-wrap {
   position: relative;
@@ -1043,6 +1071,39 @@ button.accent {
   font-size: 0.92rem;
 }
 
+.config-form {
+  display: grid;
+  gap: 7px;
+}
+
+.config-form label {
+  color: var(--text);
+  font-size: 0.82rem;
+  margin-top: 4px;
+}
+
+.config-form input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text);
+  font: inherit;
+}
+
+.config-note,
+.config-status {
+  margin: 5px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.config-status { color: var(--accent); }
+
 .modal .actions {
   margin-top: 16px;
   justify-content: flex-end;
@@ -1309,6 +1370,28 @@ button.accent {
   color: var(--gold);
   margin-top: 2px;
 }
+
+.llm-report {
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid rgba(61, 214, 198, 0.25);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.llm-report h4 {
+  margin-top: 0;
+}
+
+.llm-report-status {
+  font-weight: 600;
+}
+
+.llm-report-status.online { color: var(--ok); }
+.llm-report-status.warn { color: var(--gold); }
+.llm-report-status.error { color: var(--danger); }
+.llm-report .muted { color: var(--muted); font-size: 0.78rem; }
+.llm-report ul { margin: 6px 0 0; padding-left: 1.2em; }
 
 @media (max-width: 1180px) {
   .top-actions {

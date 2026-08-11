@@ -149,6 +149,10 @@ console.log('逢人配多解顺子与自动接牌');
   assert(variants.map((hand) => hand.mainRank).join(',') === '5,6,7',
     '3/4/5+两张逢人配可声明 A2345、23456、34567');
   assert(parseHand(cards, level)?.mainRank === 5, 'parseHand 保持稳定的默认低顺解释');
+  const automaticLead = isLegalPlay(cards, level, null);
+  assert(automaticLead.ok && automaticLead.hand.type === HandType.STRAIGHT
+    && automaticLead.hand.mainRank === 7,
+  '领出多解牌且未手动声明时，自动采用可比较的最强顺子解释');
 
   const last = parseHand([
     C(2, 'S'), C(3, 'H'), C(4, 'D'), C(5, 'C'), C(6, 'S'),
@@ -240,6 +244,21 @@ console.log('逢人配补成同花顺时禁止降级声明');
     C(8, 'S'), C(8, 'H'), C(8, 'D'), C(8, 'C'),
   ], level);
   assert(!canBeat(bomb8, automatic.hand, level), '四炸8不能压A高同花顺');
+}
+
+console.log('打3时♥3补方块A高同花顺');
+{
+  const cards = [C(3, 'H'), C(14, 'D'), C(13, 'D'), C(11, 'D'), C(10, 'D')];
+  const variants = parseHandVariants(cards, 3);
+  const flush = variants.find((hand) => hand.type === HandType.FLUSH_STRAIGHT
+    && hand.mainRank === 14 && hand.meta?.suit === 'D');
+  const automatic = parseHand(cards, 3);
+  const legal = isLegalPlay(cards, 3, null);
+  assert(flush?.meta?.wildAs?.includes(12), '♥3补♦Q组成♦10-J-Q-K-A同花顺');
+  assert(automatic?.type === HandType.FLUSH_STRAIGHT && automatic.mainRank === 14,
+    '打3时自动判定为A高同花顺而不是普通顺子');
+  assert(legal.ok && legal.hand.type === HandType.FLUSH_STRAIGHT,
+    '同花顺声明经过出牌合法性校验仍保持');
 }
 
 console.log('三带二、三连对与钢板多解');
