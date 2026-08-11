@@ -2425,6 +2425,55 @@ console.log('P0/P1/P2 独立消融开关');
     '消融配置每次返回独立副本，单局修改不会污染后续牌局');
 }
 
+console.log('实验性锐化阈值变体');
+{
+  const p0Sharp = resolvePolicyVariant('p0-sharp');
+  const p1Sharp = resolvePolicyVariant('p1-sharp');
+  const expert = resolvePolicyVariant('expert');
+  assert(p0Sharp.policyProfile === 'expert'
+      && Object.values(p0Sharp.policyFeatures).every(Boolean)
+      && p0Sharp.policyThresholds.p0LeadGate === 0.9
+      && p0Sharp.policyThresholds.p0BeatGate === 0.85
+      && p0Sharp.policyThresholds.p0StopGate === 0.9,
+    'p0-sharp 保持全部特征启用，仅抬高 P0 三处风险门槛');
+  assert(p1Sharp.policyProfile === 'expert'
+      && p1Sharp.policyFeatures.p0 && p1Sharp.policyFeatures.p1 && p1Sharp.policyFeatures.p2
+      && p1Sharp.policyThresholds.p1PLoseGate === 0.8
+      && p1Sharp.policyThresholds.p0LeadGate === undefined,
+    'p1-sharp 只抬高 P1 的 pLose 门槛，不带 P0 门槛覆盖');
+  assert(expert.policyThresholds === null,
+    '默认 expert 不携带阈值覆盖，沿用内置门槛，行为不变');
+}
+
+console.log('实验性 P1 幅度变体');
+{
+  const p1Soft = resolvePolicyVariant('p1-soft');
+  const p1Sharp = resolvePolicyVariant('p1-sharp');
+  assert(p1Soft.policyProfile === 'expert'
+      && Object.values(p1Soft.policyFeatures).every(Boolean)
+      && p1Soft.policyThresholds.p1LossScale === 0.35
+      && p1Soft.policyThresholds.p1PLoseGate === undefined,
+    'p1-soft 只缩放 P1 丢权损失幅度，不改 0.7 触发门');
+  assert(p1Sharp.policyThresholds.p1LossScale === undefined
+      && p1Sharp.policyThresholds.p1PLoseGate === 0.8,
+    'p1-sharp 与 p1-soft 覆盖不同的 P1 维度，互不污染');
+}
+
+console.log('实验性 P0 幅度变体');
+{
+  const p0Soft = resolvePolicyVariant('p0-soft');
+  const p0Sharp = resolvePolicyVariant('p0-sharp');
+  assert(p0Soft.policyProfile === 'expert'
+      && Object.values(p0Soft.policyFeatures).every(Boolean)
+      && p0Soft.policyThresholds.p0LeadScale === 0.35
+      && p0Soft.policyThresholds.p0BeatScale === 0.35
+      && p0Soft.policyThresholds.p0LeadGate === undefined,
+    'p0-soft 只缩放 P0 领出/接法惩罚幅度，不改默认门槛');
+  assert(p0Sharp.policyThresholds.p0LeadScale === undefined
+      && p0Sharp.policyThresholds.p0LeadGate === 0.9,
+    'p0-sharp 与 p0-soft 覆盖不同的 P0 维度，互不污染');
+}
+
 console.log('P0 记牌器：对手领大王单牌时及时拦截');
 {
   const hand = [

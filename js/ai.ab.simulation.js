@@ -173,6 +173,7 @@ function decisionView(run, seat) {
     deterministic: true,
     policyProfile: run.variantBySeat[seat].policyProfile,
     policyFeatures: run.variantBySeat[seat].policyFeatures,
+    policyThresholds: run.variantBySeat[seat].policyThresholds,
   };
 }
 

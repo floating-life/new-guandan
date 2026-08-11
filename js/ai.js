@@ -72,13 +72,53 @@ export const AI_POLICY_VARIANTS = Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p2: false }),
   }),
-  none: Object.freeze({
+  'none': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({
       ...EXPERT_POLICY_FEATURES,
       p0: false,
       p1: false,
       p2: false,
+    }),
+  }),
+  // 实验性锐化变体：仅在 head-to-head A/B 中使用，不改默认 expert 行为。
+  // 默认 expert 的 P0/P1 阈值是 p0LeadGate=0.8 / p0BeatGate=0.75 / p0StopGate=0.8 /
+  // p1PLoseGate=0.7；锐化变体把对应门槛抬高，让该模块只在更极端风险时介入。
+  'p0-sharp': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p0LeadGate: 0.9,
+      p0BeatGate: 0.85,
+      p0StopGate: 0.9,
+    }),
+  }),
+  // 实验性变体：p0-sharp 已证明 [0.8,0.9) 门槛区间在自对弈中几乎为空，
+  // 阈值杠杆无效；P0 的负贡献在高风险触发行为本身。本变体保留默认门槛，
+  // 只把 P0 两处分数惩罚（领出/接法压回惩罚）按系数缩小。
+  'p0-soft': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p0LeadScale: 0.35,
+      p0BeatScale: 0.35,
+    }),
+  }),
+  'p1-sharp': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p1PLoseGate: 0.8,
+    }),
+  }),
+  // 实验性变体：P1 触发时的丢权损失按系数缩放。p1-sharp 已证明 0.7 门
+  // 在自对弈中从不落在 [0.7,0.8)，阈值杠杆无效；本变体保留默认门，
+  // 只减小 EV = routeAdjustment·(1-p) - p·lossPenalty 中惩罚项的幅度。
+  'p1-soft': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p1LossScale: 0.35,
     }),
   }),
 });
@@ -105,6 +145,7 @@ export function resolvePolicyVariant(name = 'expert') {
     name: normalized,
     policyProfile: variant.policyProfile,
     policyFeatures: { ...variant.policyFeatures },
+    policyThresholds: variant.policyThresholds ? { ...variant.policyThresholds } : null,
   };
 }
 
@@ -362,6 +403,7 @@ function chooseAIPlayInternal(ctx, options) {
     leadAfterOwnBomb = false,
     policyProfile = 'expert',
     policyFeatures = null,
+    policyThresholds = null,
   } = ctx;
   const selectedDifficulty = AI_DIFFICULTY[options.difficulty]
     || AI_DIFFICULTY[ctx.difficulty]
@@ -396,6 +438,7 @@ function chooseAIPlayInternal(ctx, options) {
     leadAfterOwnBomb: !!leadAfterOwnBomb,
     policyProfile: normalizedPolicyProfile,
     policyFeatures: normalizedPolicyFeatures,
+    policyThresholds: policyThresholds ? { ...policyThresholds } : null,
     difficulty: selectedDifficulty,
     strategyWeight: c.strategyWeight,
   };
@@ -598,6 +641,7 @@ function chooseAIPlayInternal(ctx, options) {
     && !shouldBomb(
       lastHand, lastSeat, hand, handCounts, seat, teams, finishOrder, c, best.strategy,
       options.deterministic, stopRisk, bombNet,
+      policyThreshold(decisionCtx, 'p0StopGate', 0.8),
     )) {
     const nonBomb = scored.filter((p) => !isBombType(p.hand));
     if (nonBomb.length) {
@@ -703,6 +747,13 @@ function enemyAboutToWin(handCounts, seat, teams, finishOrder = []) {
  */
 function policyFeatureActive(ctx, feature) {
   return ctx.policyFeatures?.[feature] !== false;
+}
+
+/** 实验性锐化变体按 key 抬高门槛；默认 expert/常规路径无覆盖则返回 fallback。 */
+function policyThreshold(ctx, key, fallback) {
+  const overrides = ctx?.policyThresholds;
+  if (overrides && typeof overrides[key] === 'number') return overrides[key];
+  return fallback;
 }
 
 function candidateBeatRisk(play, ctx) {
@@ -928,13 +979,13 @@ function removeWeakerDeclarations(plays, level) {
 
 function shouldBomb(
   lastHand, lastSeat, hand, handCounts, seat, teams, finishOrder, c, strategy, deterministic,
-  stopRisk = 0, bombNet = null,
+  stopRisk = 0, bombNet = null, p0StopGate = 0.8,
 ) {
   if (strategy?.tags?.includes('bomb_escort')) return true;
   // P0 记牌器：对手剩 5-6 张且本次领出高控牌/大组合（其推进难被普通接法低成本
   // 阻止）时，若连最优普通接法都大概率被压回、无法夺回牌权，则开炸及时拦截，
   // 优先于保留强控制。
-  if (stopRisk >= 0.8
+  if (stopRisk >= p0StopGate
     && !isBombType(lastHand)
     && (lastHand?.power >= 11 || lastHand?.size >= 5)) {
     for (let i = 0; i < 4; i++) {
@@ -971,7 +1022,7 @@ function shouldBomb(
     && !finishOrder.includes(lastSeat)
     && handCounts[lastSeat] === lastHand.size) return true;
   if (hand.length <= 8) {
-    const chance = 0.3 + c.aggressiveness * 0.5 + (stopRisk >= 0.8 ? 0.35 : 0);
+    const chance = 0.3 + c.aggressiveness * 0.5 + (stopRisk >= p0StopGate ? 0.35 : 0);
     return deterministic ? chance >= 0.5 : Math.random() < chance;
   }
   if (c.difficulty === 'easy') return deterministic ? false : Math.random() < 0.35;
@@ -1039,13 +1090,14 @@ function scoreLead(play, hand, level, ctx, c, search, beforeStructure) {
     score += 12;
   }
 
-  // P0 记牌器：仅当领出极大概率（>=0.8）被对手接掉时才压低该领法；
+  // P0 记牌器：仅当领出极大概率（默认 >=0.8）被对手接掉时才压低该领法；
   // 中盘普通领法的可接概率普遍偏高，广谱惩罚只会变成近似常量噪声。
   if (policyFeatureActive(ctx, 'p0') && remain > 0 && !isBombType(h)) {
     const risk = candidateBeatRisk(play, ctx);
-    if (risk >= 0.8) {
+    if (risk >= policyThreshold(ctx, 'p0LeadGate', 0.8)) {
       score -= risk * c.leadBeatRiskPenalty
-        * (isPremiumNonBombControl(h, level) ? 3 : 1);
+        * (isPremiumNonBombControl(h, level) ? 3 : 1)
+        * policyThreshold(ctx, 'p0LeadScale', 1);
     }
   }
 
@@ -1087,7 +1139,7 @@ function scoreBeat(play, hand, level, ctx, c, search, beforeStructure) {
     if (isBombType(h)) score += 60;
   }
 
-  // P0 记牌器：普通接法仅在极大概率（>=0.75）被压回时惩罚先消耗的控制牌；
+  // P0 记牌器：普通接法仅在极大概率（默认 >=0.75）被压回时惩罚先消耗的控制牌；
   // 收官、护送或紧急拦截不受此惩罚。
   if (policyFeatureActive(ctx, 'p0') && remain > 0 && !isBombType(h)
     && !(ctx.handCounts
@@ -1098,9 +1150,10 @@ function scoreBeat(play, hand, level, ctx, c, search, beforeStructure) {
       'public_finish_block',
     ].includes(tag))) {
     const risk = candidateBeatRisk(play, ctx);
-    if (risk >= 0.75) {
+    if (risk >= policyThreshold(ctx, 'p0BeatGate', 0.75)) {
       const controlFactor = isPremiumNonBombControl(h, level) ? 1.6 : h.power >= 12 ? 1.2 : 0.6;
-      score -= risk * c.beatBackRiskPenalty * controlFactor;
+      score -= risk * c.beatBackRiskPenalty * controlFactor
+        * policyThreshold(ctx, 'p0BeatScale', 1);
     }
   }
 
@@ -1208,8 +1261,9 @@ function applyLookAhead(scored, hand, level, search, c, ctx, mode) {
       // 只有 (1-p) 概率能保持牌权兑现路线优势，否则承受丢权损失 L。
       // 仅当被压回风险极高时才覆盖原均值折减，避免广谱缩水变成噪声。
       const pLose = candidateBeatRisk(play, ctx);
-      const lossPenalty = controlLossPenalty(play, ctx, c, level);
-      play.lookAhead.adjustment = pLose >= 0.7
+      const lossPenalty = controlLossPenalty(play, ctx, c, level)
+        * policyThreshold(ctx, 'p1LossScale', 1);
+      play.lookAhead.adjustment = pLose >= policyThreshold(ctx, 'p1PLoseGate', 0.7)
         ? controlEV(routeAdjustment, pLose, lossPenalty)
         : routeAdjustment;
       play.lookAhead.pLose = pLose;
