@@ -39,7 +39,11 @@ function mostFrequent(map) {
 function publicHistorySummary(ctx) {
   const leads = Array.from({ length: 4 }, typeMap);
   const passes = Array.from({ length: 4 }, typeMap);
+  const passesAgainstEnemy = Array.from({ length: 4 }, typeMap);
+  const passesToTeammate = Array.from({ length: 4 }, typeMap);
+  const passEvents = Array.from({ length: 4 }, () => []);
   const responses = Array.from({ length: 4 }, typeMap);
+  const teams = ctx.teams || [0, 1, 0, 1];
   const tricks = new Map();
   for (const item of ctx.publicHistory || []) {
     const seat = Number(item?.seat);
@@ -51,6 +55,8 @@ function publicHistorySummary(ctx) {
         targetType: null,
         lastPlayer: null,
         lastType: null,
+        lastPower: null,
+        lastSize: null,
         hasPlay: false,
       });
     }
@@ -62,27 +68,88 @@ function publicHistorySummary(ctx) {
       trick.targetType = item.hand.type;
       trick.lastPlayer = seat;
       trick.lastType = item.hand.type;
+      trick.lastPower = item.hand.power != null && Number.isFinite(Number(item.hand.power))
+        ? Number(item.hand.power) : null;
+      trick.lastSize = item.hand.size != null && Number.isFinite(Number(item.hand.size))
+        ? Number(item.hand.size)
+        : (Array.isArray(item.cards) ? item.cards.length : null);
     } else if (item.action === 'pass' && trick.targetType) {
       bump(passes[seat], trick.targetType);
+      const controllerSeat = Number(trick.lastPlayer);
+      const hasController = Number.isInteger(controllerSeat)
+        && controllerSeat >= 0 && controllerSeat < 4;
+      const againstEnemy = hasController && teams[seat] !== teams[controllerSeat];
+      const toTeammate = hasController && seat !== controllerSeat
+        && teams[seat] === teams[controllerSeat];
+      if (againstEnemy) bump(passesAgainstEnemy[seat], trick.targetType);
+      else if (toTeammate) bump(passesToTeammate[seat], trick.targetType);
+      passEvents[seat].push({
+        trickNumber: key,
+        controllerSeat: hasController ? controllerSeat : null,
+        targetType: trick.lastType,
+        targetPower: trick.lastPower,
+        targetSize: trick.lastSize,
+        againstEnemy,
+        toTeammate,
+      });
     }
   }
   const controlledTricks = [...tricks.values()].filter((item) => item.hasPlay);
   const recentControllers = controlledTricks.map((item) => item.lastPlayer).slice(-4);
-  let controlStreak = { seat: null, count: 0, singleCount: 0, allSingles: false };
+  let controlStreak = {
+    seat: null, count: 0, singleCount: 0, allSingles: false, singlePowers: [],
+  };
   const latest = controlledTricks.at(-1);
   if (latest) {
     controlStreak = {
       seat: latest.lastPlayer, count: 0, singleCount: 0, allSingles: true,
+      singlePowers: [],
     };
     for (let i = controlledTricks.length - 1; i >= 0; i--) {
       const item = controlledTricks[i];
       if (item.lastPlayer !== controlStreak.seat) break;
       controlStreak.count += 1;
-      if (item.lastType === HandType.SINGLE) controlStreak.singleCount += 1;
-      else controlStreak.allSingles = false;
+      if (item.lastType === HandType.SINGLE) {
+        controlStreak.singleCount += 1;
+        controlStreak.singlePowers.push(item.lastPower);
+      } else controlStreak.allSingles = false;
     }
   }
-  return { leads, passes, responses, recentControllers, controlStreak };
+  return {
+    leads,
+    // Keep the legacy aggregate for callers that only need raw action counts.
+    passes,
+    passesAgainstEnemy,
+    passesToTeammate,
+    passEvents,
+    responses,
+    recentControllers,
+    controlStreak,
+  };
+}
+
+function historicalTargetNoStronger(event, hand) {
+  if (!event?.againstEnemy || !hand || event.targetType !== hand.type) return false;
+  if (event.targetPower == null || hand.power == null) return false;
+  const targetPower = Number(event.targetPower);
+  const currentPower = Number(hand.power);
+  if (!Number.isFinite(targetPower) || !Number.isFinite(currentPower)) return false;
+  const targetSize = event.targetSize == null ? null : Number(event.targetSize);
+  const currentSize = hand.size == null ? null : Number(hand.size);
+  if (hand.type === HandType.BOMB
+    && Number.isFinite(targetSize) && Number.isFinite(currentSize)
+    && targetSize !== currentSize) {
+    return targetSize < currentSize;
+  }
+  if (Number.isFinite(targetSize) && Number.isFinite(currentSize)
+    && targetSize !== currentSize) return false;
+  return targetPower <= currentPower;
+}
+
+export function relevantEnemyPassCount(history, seat, hand) {
+  if (!Number.isInteger(Number(seat)) || Number(seat) < 0 || !hand) return 0;
+  return (history?.passEvents?.[Number(seat)] || [])
+    .filter((event) => historicalTargetNoStronger(event, hand)).length;
 }
 
 function countRisk(count) {
@@ -144,10 +211,14 @@ export function inferPublicThreats(ctx) {
   const lastType = ctx.lastHand?.type || null;
   const lastSeat = ctx.lastSeat;
   const partnerLead = mostFrequent(history.leads[partner]);
-  const partnerPass = lastType ? history.passes[partner].get(lastType) || 0 : 0;
+  // 只把对家面对敌方控制牌的过牌视为“可能接不住”的公开证据；
+  // 对家礼让本方牌权的过牌不能降低其后续回手概率。
+  const partnerPass = lastType
+    ? relevantEnemyPassCount(history, partner, ctx.lastHand) : 0;
 
   const enemyProfiles = enemies.map((enemy) => {
-    const passesAgainstLast = lastType ? history.passes[enemy.seat].get(lastType) || 0 : 0;
+    const passesAgainstLast = lastType
+      ? relevantEnemyPassCount(history, enemy.seat, ctx.lastHand) : 0;
     const leadType = mostFrequent(history.leads[enemy.seat]);
     const recentControlCount = history.recentControllers
       .filter((controller) => controller === enemy.seat).length;
@@ -163,7 +234,8 @@ export function inferPublicThreats(ctx) {
       passesAgainstLast,
       leadType,
       recentControlCount,
-      passesByType: history.passes[enemy.seat],
+      passesByType: history.passesAgainstEnemy[enemy.seat],
+      passEvents: history.passEvents[enemy.seat],
       responsesByType: history.responses[enemy.seat],
     };
   });
@@ -643,10 +715,10 @@ export function createBeatModel(ctx) {
     return otherProbability(hand.type, hand.power, hand.size, k, known, seat);
   };
 
-  const evidenceFactor = (seat, type) => {
+  const evidenceFactor = (seat, hand) => {
     if (!Number.isInteger(Number(seat)) || Number(seat) < 0) return 1;
-    const passes = history.passes?.[Number(seat)]?.get(type) || 0;
-    const responses = history.responses?.[Number(seat)]?.get(type) || 0;
+    const passes = relevantEnemyPassCount(history, Number(seat), hand);
+    const responses = history.responses?.[Number(seat)]?.get(hand?.type) || 0;
     return clamp(1 - Math.min(0.28, passes * 0.07) + Math.min(0.05, responses * 0.02), 0.72, 1.05);
   };
 
@@ -669,7 +741,7 @@ export function createBeatModel(ctx) {
     const known = knownProfile(seat);
     const guaranteed = known.cards.length > 0
       && typeProbability(hand, known.cards.length, seat) >= 1 - 1e-12;
-    const result = guaranteed ? 1 : clamp(raw * evidenceFactor(seat, hand.type));
+    const result = guaranteed ? 1 : clamp(raw * evidenceFactor(seat, hand));
     seatCache.set(key, result);
     return result;
   };
@@ -697,9 +769,9 @@ export function createBeatModel(ctx) {
 }
 
 /**
- * P0 消融用的未观测先验：保留牌型、级牌和对手公开张数这些基础规则，
- * 但故意不读取本家手牌、已出牌、贡还归属或行为历史。P1/P2 仍可使用
- * 同一概率接口，因此关闭 P0 时不会顺带关闭 P1/P2 的算法分支。
+ * 未观测静态先验：保留牌型、级牌和对手公开张数这些基础规则，但故意不读取
+ * 本家手牌、已出牌、贡还归属或行为历史。仅用于诊断模型边界；正式 no-pX
+ * 独立消融始终复用同一个公开信息模型，避免替换输入分布污染归因。
  */
 export function createUnconditionedBeatModel(ctx) {
   return createBeatModel({
@@ -750,6 +822,395 @@ export function enemyBeatProbability(play, ctx, model) {
   return p;
 }
 
+/**
+ * 按真实座位顺序估算「本手打出后，敌方最终保住牌权」的软概率。
+ *
+ * 这里只计算同型普通接牌；炸弹概率单独留给炸弹净收益模块，避免一名对手
+ * 牌多时“可能有任意炸弹”把所有候选都压成接近 100%，从而淹没 K/A、
+ * 对J/对K之间真正有用的控权差异。下家先接、对家再尝试接回、上家最后
+ * 反压，因此不能用两个敌方概率的简单并集。
+ *
+ * 对家回手同样只使用公开信息，并且必须满足牌型尺寸：对家剩余张数少于
+ * 本手尺寸时，回手概率严格为 0。seatTypeBeat 只表示能压过当前候选，
+ * 实际还要压过下家的更高出牌，所以再乘保守折扣，避免固定常数幻觉。
+ */
+export function orderedTeamControlLossProbability(play, ctx, model) {
+  const beatModel = model || createBeatModel(ctx);
+  if (!play?.hand || !beatModel) return 0;
+  const active = new Map(beatModel.enemies.map((enemy) => [enemy.seat, enemy]));
+  const downstreamSeat = (ctx.seat + 1) % 4;
+  const upstreamSeat = (ctx.seat + 3) % 4;
+  const enemyTypeBeat = (seat) => {
+    const enemy = active.get(seat);
+    return enemy
+      ? beatModel.seatTypeBeat(play.hand, enemy.count, enemy.seat)
+      : 0;
+  };
+  const downstreamBeat = enemyTypeBeat(downstreamSeat);
+  const upstreamBeat = enemyTypeBeat(upstreamSeat);
+
+  const partnerSeat = (ctx.seat + 2) % 4;
+  const partnerCount = ctx.handCounts?.[partnerSeat] ?? 0;
+  const partnerActive = !(ctx.finishOrder || []).includes(partnerSeat)
+    && partnerCount >= (play.hand.size || play.cards?.length || 1);
+  let partnerRetake = 0;
+  if (partnerActive) {
+    // 能压当前候选只是回手的上界；下家若接牌，其牌力必然更高。
+    partnerRetake = beatModel.seatTypeBeat(play.hand, partnerCount, partnerSeat) * 0.55;
+    if (ctx.publicModel?.partner?.preferredLeadType === play.hand.type) {
+      partnerRetake *= 1.06;
+    }
+    if ((ctx.publicModel?.partner?.passesAgainstLast || 0) >= 2) {
+      partnerRetake *= 0.82;
+    }
+    partnerRetake = clamp(partnerRetake, 0, 0.45);
+  }
+
+  return clamp(
+    upstreamBeat + (1 - upstreamBeat) * downstreamBeat * (1 - partnerRetake),
+  );
+}
+
+function nextComparableResponseHand(hand, level) {
+  if (!hand || BOMB_TYPES.includes(hand.type)) return null;
+  let powers;
+  if (SIMPLE_TYPES.includes(hand.type) || hand.type === HandType.FULLHOUSE) {
+    const ranks = hand.type === HandType.SINGLE || hand.type === HandType.PAIR
+      ? [...NORMAL_RANKS, ...JOKER_RANKS]
+      : NORMAL_RANKS;
+    powers = ranks
+      .map((rank) => ({ rank, power: soloPower({ rank }, level) }))
+      .filter((item, index, values) => (
+        values.findIndex((other) => other.power === item.power) === index
+      ));
+  } else {
+    // 顺子、三连对和钢板都按最高点比较；A23 三连对为3高、A2钢板为2高。
+    const minimum = hand.type === HandType.PLATE ? 2
+      : hand.type === HandType.TRIPLE_PAIR ? 3 : 5;
+    powers = Array.from({ length: 15 - minimum }, (_, index) => ({
+      rank: index + minimum,
+      power: index + minimum,
+    }));
+  }
+  const next = powers
+    .filter((item) => item.power > Number(hand.power))
+    .sort((left, right) => left.power - right.power)[0];
+  return next ? { ...hand, mainRank: next.rank, power: next.power } : null;
+}
+
+function responseBombUseProbability(handCount, opposingRemaining) {
+  // bombProbability 表示“可能持有”，不是“本手必定会用”。只在敌方即将走完、
+  // 或持炸者自己已进入短手时提高投入率，普通中盘保持明显低于一半。
+  const ownUrgency = handCount <= 5 ? 0.3 : handCount <= 9 ? 0.16 : 0;
+  const blockUrgency = opposingRemaining <= 3 ? 0.42 : opposingRemaining <= 6 ? 0.2 : 0;
+  return clamp(0.08 + ownUrgency + blockUrgency, 0.08, 0.8);
+}
+
+function partnerRetakeIntent(partnerCount, playSize, activeEnemyMin) {
+  if (partnerCount === playSize) return 1;
+  if (partnerCount <= 6) return 0.86;
+  if (activeEnemyMin <= 5) return 0.78;
+  if (partnerCount <= 10) return 0.7;
+  return 0.58;
+}
+
+/**
+ * P1 一层公开应手树：自己出牌后，仅展开
+ *   下家普通接/炸/过 → 对家能否接回 → 上家普通反压/炸/过。
+ *
+ * 返回的是公开信息下的软概率，不重建、抽样或读取任何一家真实暗牌。
+ * 同型反压使用“下一档最低合法应手”作为门槛：对家要接下家，至少要压过
+ * 下一档；上家要再压对家，至少要压过再下一档，避免旧固定 0.55 折扣把
+ * 不同牌型都当成同一个难度。
+ */
+export function evaluatePublicResponseTree(play, ctx, model, options = {}) {
+  const beatModel = model || createBeatModel(ctx);
+  if (!play?.hand || !beatModel) return null;
+  const seat = Number(ctx.seat) || 0;
+  const teams = ctx.teams || [0, 1, 0, 1];
+  const finishOrder = ctx.finishOrder || [];
+  const handCounts = ctx.handCounts || [];
+  const playSize = play.hand.size || play.cards?.length || 1;
+  const ownRemaining = Math.max(0, Number(options.ownRemaining) || 0);
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin
+    ?? Math.min(...handCounts.map((count, index) => (
+      index !== seat && !finishOrder.includes(index) && teams[index] !== teams[seat]
+        ? count : 99
+    )));
+  const activeCount = (target) => (
+    target >= 0 && target < 4 && !finishOrder.includes(target)
+      ? Math.max(0, Number(handCounts[target]) || 0)
+      : 0
+  );
+  const isEnemy = (target) => teams[target] !== teams[seat];
+  const bombType = BOMB_TYPES.includes(play.hand.type);
+  const minimumResponse = nextComparableResponseHand(play.hand, ctx.level);
+  const secondResponse = minimumResponse
+    ? nextComparableResponseHand(minimumResponse, ctx.level)
+    : null;
+
+  const response = (target, threshold = play.hand) => {
+    const count = activeCount(target);
+    if (!count || !isEnemy(target)) return { type: 0, bomb: 0, pass: 1 };
+    const type = count >= playSize
+      ? clamp(beatModel.seatTypeBeat(threshold, count, target))
+      : 0;
+    // 对炸弹候选，seatTypeBeat 已经表示更强炸弹，不能再并一次“任意炸弹”。
+    const bomb = bombType || count < 4
+      ? 0
+      : clamp((1 - type) * beatModel.bombProbability(count, target)
+        * responseBombUseProbability(count, ownRemaining));
+    return { type, bomb, pass: clamp(1 - type - bomb) };
+  };
+
+  const downstreamSeat = (seat + 1) % 4;
+  const partnerSeat = (seat + 2) % 4;
+  const upstreamSeat = (seat + 3) % 4;
+  const downstream = response(downstreamSeat, play.hand);
+  const upstreamDirect = response(upstreamSeat, play.hand);
+  const partnerCount = activeCount(partnerSeat);
+  const partnerCanRetake = minimumResponse
+    && partnerCount >= playSize
+    && teams[partnerSeat] === teams[seat];
+  const partnerRetake = partnerCanRetake
+    ? clamp(
+        beatModel.seatTypeBeat(minimumResponse, partnerCount, partnerSeat)
+          * partnerRetakeIntent(partnerCount, playSize, activeEnemyMin),
+      )
+    : 0;
+  // P3 才展开“下家过 → 对家直接接手”的分支。旧 P1 只模拟下家先接后
+  // 对家反接，漏掉了真实座位顺序中最常见的送牌路径；通过显式选项保持
+  // no-p3 消融只改变这一项。
+  const partnerDirect = options.includePartnerHandoff && partnerCanRetake
+    ? clamp(
+        beatModel.seatTypeBeat(play.hand, partnerCount, partnerSeat)
+          * partnerRetakeIntent(partnerCount, playSize, activeEnemyMin),
+      )
+    : 0;
+  // 已无第三档同型牌时，仍保留上家用炸弹反压的分支；null 门槛只令
+  // seatTypeBeat 为0，不会抹掉独立的炸弹资源投入概率。
+  const upstreamAfterPartner = minimumResponse
+    ? response(upstreamSeat, secondResponse)
+    : { type: 0, bomb: 0, pass: 1 };
+  const upstreamAfterPartnerResponse = upstreamAfterPartner.type
+    + upstreamAfterPartner.bomb;
+  const upstreamDirectResponse = upstreamDirect.type + upstreamDirect.bomb;
+
+  const partnerTakes = downstream.type * partnerRetake
+    + downstream.pass * partnerDirect;
+  const partnerControl = partnerTakes * (1 - upstreamAfterPartnerResponse);
+  const enemyAfterPartner = partnerTakes
+    * upstreamAfterPartnerResponse;
+  const enemyFromDownstream = downstream.type * (1 - partnerRetake) + downstream.bomb;
+  const enemyFromUpstream = downstream.pass * (1 - partnerDirect)
+    * upstreamDirectResponse;
+  const selfControl = downstream.pass * (1 - partnerDirect)
+    * (1 - upstreamDirectResponse);
+  const enemyControl = enemyFromDownstream + enemyAfterPartner + enemyFromUpstream;
+  const enemyBomb = downstream.bomb
+    + partnerTakes * upstreamAfterPartner.bomb
+    + downstream.pass * (1 - partnerDirect) * upstreamDirect.bomb;
+  const total = selfControl + partnerControl + enemyControl;
+  const normalize = total > 0 ? 1 / total : 1;
+
+  return {
+    selfControl: clamp(selfControl * normalize),
+    partnerControl: clamp(partnerControl * normalize),
+    enemyControl: clamp(enemyControl * normalize),
+    enemyBomb: clamp(enemyBomb * normalize),
+    teamControl: clamp((selfControl + partnerControl) * normalize),
+    seats: { downstream: downstreamSeat, partner: partnerSeat, upstream: upstreamSeat },
+    branches: {
+      downstream,
+      partnerRetake,
+      partnerDirect,
+      upstreamDirect,
+      upstreamAfterPartner,
+    },
+  };
+}
+
+/** P3 共享护牌信号：AI 与真人评价使用完全相同的公开风险差。 */
+export function publicPartnerProtectionValue(play, ctx, model) {
+  if (!play?.hand || !ctx?.lastHand || BOMB_TYPES.includes(ctx.lastHand.type)) return null;
+  const beatModel = model || createBeatModel(ctx);
+  const seat = Number(ctx.seat) || 0;
+  const downstream = (seat + 1) % 4;
+  const partner = (seat + 2) % 4;
+  if ((ctx.finishOrder || []).includes(downstream)
+    || ctx.teams?.[downstream] === ctx.teams?.[seat]) return null;
+  const downstreamCount = ctx.handCounts?.[downstream] ?? 99;
+  const partnerCount = (ctx.finishOrder || []).includes(partner)
+    ? 0 : (ctx.handCounts?.[partner] ?? 99);
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  if (partnerCount <= 5 || (downstreamCount > 8 && activeEnemyMin > 5)) return null;
+  const currentRisk = beatModel.seatTypeBeat(ctx.lastHand, downstreamCount, downstream);
+  const protectedRisk = beatModel.seatTypeBeat(play.hand, downstreamCount, downstream);
+  const reduction = currentRisk - protectedRisk;
+  return {
+    eligible: currentRisk >= 0.38 && reduction >= 0.16,
+    downstream,
+    downstreamCount,
+    partnerCount,
+    currentRisk,
+    protectedRisk,
+    reduction,
+  };
+}
+
+function rolloutRoutePenalty(route) {
+  if (!route) return 80;
+  return route.estimatedTricks * 15
+    + route.loose * 2.2
+    + route.controlsSpent * 1.4
+    + (route.bombsSpent || 0) * 3.5
+    - (route.adjustment || 0) * 0.35;
+}
+
+/**
+ * P4 受限残局公开情景 rollout。
+ *
+ * 只展开当前候选的公开应手结果；若本家继续持权，再枚举本家下一次领出。
+ * 对家/对手分支只使用公开牌池软概率与公开张数作为终值，不生成、更不读取
+ * 任一真实暗牌。节点或墙钟预算耗尽时返回 timedOut，由调用者完整丢弃本次
+ * 未完成结果并保留 P0-P3 排名。
+ */
+export function evaluatePublicEndgameRollout(
+  play,
+  remainingHand,
+  ctx,
+  model,
+  options = {},
+) {
+  if (!play?.hand || !Array.isArray(remainingHand)) return null;
+  const beatModel = model || createBeatModel(ctx);
+  const nodeBudget = Math.max(4, Number(options.nodeBudget) || 30);
+  const branchLimit = Math.max(2, Math.min(8, Number(options.branchLimit) || 4));
+  const deadlineMs = Number.isFinite(options.deadlineMs) ? options.deadlineMs : null;
+  const now = typeof options.now === 'function'
+    ? options.now
+    : () => globalThis.performance?.now?.() ?? Date.now();
+  let nodes = 0;
+  let timedOut = false;
+  const takeNode = () => {
+    nodes += 1;
+    if (nodes > nodeBudget || (deadlineMs != null && now() >= deadlineMs)) {
+      timedOut = true;
+      return false;
+    }
+    return true;
+  };
+  if (!takeNode()) return { timedOut: true, nodes };
+
+  const includePartnerHandoff = !!options.includePartnerHandoff;
+  const first = evaluatePublicResponseTree(play, ctx, beatModel, {
+    ownRemaining: remainingHand.length,
+    includePartnerHandoff,
+  });
+  if (!first) return null;
+  if (!remainingHand.length) {
+    return {
+      expectedUtility: 140,
+      selfContinuation: 140,
+      first,
+      nodes,
+      timedOut: false,
+      depth: 2,
+    };
+  }
+
+  const routeCtx = { ...ctx, mode: 'lead', publicModel: ctx.publicModel };
+  const fallbackRoute = options.baseRoute || estimateThreeStepRoute(
+    remainingHand,
+    ctx.level,
+    routeCtx,
+    {
+      depth: 3,
+      beam: branchLimit,
+      cache: options.cache || new Map(),
+    },
+  );
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  const finishRisk = ctx.publicModel?.nearestEnemy?.finishRisk || 0;
+  const enemyLoss = 26
+    + Math.max(0, 7 - activeEnemyMin) * 7
+    + finishRisk * 34;
+  const partnerSeat = ((Number(ctx.seat) || 0) + 2) % 4;
+  const partnerCount = (ctx.finishOrder || []).includes(partnerSeat)
+    ? 0 : (ctx.handCounts?.[partnerSeat] ?? 99);
+  const partnerGain = partnerCount <= 2 ? 72
+    : partnerCount <= 5 ? 52
+      : partnerCount <= 8 ? 34 : 20;
+  let selfContinuation = 34 - rolloutRoutePenalty(fallbackRoute);
+  let bestNext = null;
+
+  const nextLeads = routeCandidates(remainingHand, ctx.level, branchLimit)
+    .slice(0, branchLimit);
+  for (const next of nextLeads) {
+    if (!takeNode()) break;
+    const tail = removeCards(remainingHand, next.cards);
+    const tailRoute = estimateThreeStepRoute(tail, ctx.level, routeCtx, {
+      // 第二层的核心问题是“下一手能否站住”；尾部牌数沿用一手路线下界，
+      // 不再在每个分支重复展开两手搜索。
+      depth: 1,
+      beam: branchLimit,
+      cache: options.cache || new Map(),
+    });
+    const nextResponse = evaluatePublicResponseTree(next, ctx, beatModel, {
+      ownRemaining: tail.length,
+      includePartnerHandoff,
+    });
+    if (!nextResponse) continue;
+    const finishBonus = tail.length === 0 ? 120 : 0;
+    const nextValue = finishBonus
+      - rolloutRoutePenalty(tailRoute)
+      + nextResponse.selfControl * (tail.length <= 3 ? 48 : 28)
+      + nextResponse.partnerControl * partnerGain * 0.65
+      - nextResponse.enemyControl * enemyLoss
+      + nextResponse.enemyBomb * 4;
+    if (!bestNext || nextValue > bestNext.value) {
+      bestNext = {
+        value: nextValue,
+        type: next.hand.type,
+        size: next.hand.size,
+        power: next.hand.power,
+        teamControl: nextResponse.teamControl,
+      };
+      selfContinuation = nextValue;
+    }
+  }
+  if (timedOut) return { timedOut: true, nodes };
+
+  const expectedUtility = first.selfControl * selfContinuation
+    + first.partnerControl * partnerGain
+    - first.enemyControl * enemyLoss
+    + first.enemyBomb * 5;
+  return {
+    expectedUtility,
+    selfContinuation,
+    partnerGain,
+    enemyLoss,
+    first,
+    bestNext,
+    nodes,
+    timedOut: false,
+    depth: 2,
+  };
+}
+
+/** 活跃对手至少一家具备任意炸弹的公开信息软概率，供炸弹模块单独折价。 */
+export function enemyBombExposureProbability(ctx, model) {
+  const beatModel = model || createBeatModel(ctx);
+  let probability = 0;
+  for (const enemy of beatModel.enemies) {
+    probability = unionProbability(
+      probability,
+      beatModel.bombProbability(enemy.count, enemy.seat),
+    );
+  }
+  return clamp(probability);
+}
+
 /** Public-information coordination value shared by AI and evaluator. */
 export function publicCoordinationScore(play, ctx, model = inferPublicThreats(ctx)) {
   const mode = ctx.mode || (ctx.lastHand ? 'beat' : 'lead');
@@ -783,7 +1244,7 @@ export function publicCoordinationScore(play, ctx, model = inferPublicThreats(ct
     const partnerCount = model.partner.count;
     // 对家手牌 ≤3 时只有张数不超其手数的牌才可能被其接住；
     // 残局型匹配与大牌路加成都不应对超尺寸的长组合生效。
-    const sizeOk = partnerCount <= 3 ? play.cards.length <= partnerCount : true;
+    const sizeOk = play.cards.length <= partnerCount;
     if (model.partner.preferredLeadType === play.hand?.type
       && model.partner.preferredLeadCount >= 2 && sizeOk) {
       score += model.partner.closing ? 28 : 16;
@@ -829,7 +1290,7 @@ export function publicCoordinationScore(play, ctx, model = inferPublicThreats(ct
     const type = play.hand?.type;
     const enemies = (model.enemies || []).filter((enemy) => enemy.count > 0);
     const passedBy = enemies.filter((enemy) => (
-      (enemy.passesByType?.get(type) || 0) > 0
+      relevantEnemyPassCount(model.history, enemy.seat, play.hand) > 0
     ));
     const respondedBy = enemies.filter((enemy) => (
       (enemy.responsesByType?.get(type) || 0) > 0

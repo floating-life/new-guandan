@@ -4,7 +4,8 @@ import { parseHand } from './rules.js';
 import {
   createMatch, startRound, getReturnCandidates, humanPickReturnCard, humanPass,
   humanSelectSet, humanPlay, markAssistance, persistMatch, restoreMatch,
-  getPublicTributeContext, resetLLMFallback, markLLMFallback, applySettings, PHASE,
+  getPublicTributeContext, resetLLMFallback, markLLMFallback, applySettings,
+  aiDecisionContext, resolveAISearchBudget, PHASE,
 } from './game.js';
 import { loadSettings } from './stats.js';
 
@@ -23,6 +24,21 @@ function assert(condition, message) {
 
 function C(rank, suit = 'S', deck = 0) {
   return createCard(rank, suit, deck);
+}
+
+console.log('大师强度不随快动画降级');
+{
+  assert(resolveAISearchBudget({ difficulty: 'master', aiSpeed: 'fast' }) === 250,
+    '大师快档保留250ms基础搜索，不再被压缩到60ms');
+  assert(resolveAISearchBudget({ difficulty: 'master', aiSpeed: 'normal' }) === 250,
+    '大师中档与快档使用相同基础搜索强度');
+  assert(resolveAISearchBudget({ difficulty: 'master', aiSpeed: 'slow' }) === 600,
+    '大师慢档仍可利用额外时间加宽搜索');
+  assert(resolveAISearchBudget({ difficulty: 'hard', aiSpeed: 'fast' }) === 60,
+    '非大师快档保持原性能取舍，不扩大本轮改动范围');
+  assert(resolveAISearchBudget({
+    difficulty: 'master', aiSpeed: 'slow', deterministicAI: true,
+  }) === 0, '确定性镜像赛继续禁用墙钟预算，保持可复现');
 }
 
 console.log('严格还贡限制');
@@ -353,16 +369,19 @@ console.log('实验性座位策略字段不会进入用户设置');
     difficulty: 'hard',
     aiPolicyBySeat: ['expert', 'baseline', 'no-p0', 'expert'],
     aiPolicyFeaturesBySeat: [{ p0: true }, {}, {}, {}],
+    aiPolicyThresholdsBySeat: [null, { p0LeadGate: 0.91 }, null, null],
     aiDifficultyBySeat: ['master', 'master', 'master', 'master'],
   });
   assert(state.settings.aiPolicyBySeat === undefined
     && state.settings.aiPolicyFeaturesBySeat === undefined
+    && state.settings.aiPolicyThresholdsBySeat === undefined
     && state.settings.aiDifficultyBySeat === undefined,
     'applySettings 剥离实验性座位策略字段，不写入 state.settings');
   assert(state.settings.difficulty === 'hard', 'applySettings 仍正常合并合法字段');
   const persisted = loadSettings();
   assert(persisted.aiPolicyBySeat === undefined
     && persisted.aiPolicyFeaturesBySeat === undefined
+    && persisted.aiPolicyThresholdsBySeat === undefined
     && persisted.aiDifficultyBySeat === undefined
     && persisted.difficulty === 'hard',
     'applySettings 持久化结果不含实验字段');
@@ -373,6 +392,7 @@ console.log('实验性座位策略字段不会进入用户设置');
     ...state.settings,
     aiPolicyBySeat: ['baseline', 'baseline', 'baseline', 'baseline'],
     aiPolicyFeaturesBySeat: [{}, {}, {}, {}],
+    aiPolicyThresholdsBySeat: [null, { p1SpreadFloor: 0.18 }, null, null],
     aiDifficultyBySeat: ['easy', 'easy', 'easy', 'easy'],
   };
   assert(persistMatch(state), '带实验字段的进行中牌局可保存');
@@ -380,8 +400,68 @@ console.log('实验性座位策略字段不会进入用户设置');
   assert(restored?.round === 2, 'restoreMatch 仍能恢复牌局');
   assert(restored.settings.aiPolicyBySeat === undefined
     && restored.settings.aiPolicyFeaturesBySeat === undefined
+    && restored.settings.aiPolicyThresholdsBySeat === undefined
     && restored.settings.aiDifficultyBySeat === undefined,
     'restoreMatch 剥离 snapshot.settings 中的实验性座位策略字段');
+}
+
+console.log('A/B 阈值覆盖进入1-3号座决策上下文');
+{
+  const thresholds = [
+    { p0LeadGate: 0.81 },
+    { p0StopGate: 0.82 },
+    { p1SpreadFloor: 0.13 },
+    { p1LossScale: 0.84 },
+  ];
+  const state = createMatch({
+    difficulty: 'master',
+    aiSpeed: 'fast',
+    coachMode: false,
+    deterministicAI: true,
+    aiPolicyBySeat: ['expert', 'expert', 'expert', 'expert'],
+    aiPolicyFeaturesBySeat: [
+      { p0: true, p1: true, p2: true, endgame: true },
+      { p0: true, p1: true, p2: true, endgame: true },
+      { p0: true, p1: true, p2: true, endgame: true },
+      { p0: true, p1: true, p2: true, endgame: true },
+    ],
+    aiPolicyThresholdsBySeat: thresholds,
+  });
+  for (const seat of [1, 2, 3]) {
+    const context = aiDecisionContext(state, seat);
+    assert(context.policyThresholds !== thresholds[seat]
+      && Object.entries(thresholds[seat]).every(([key, value]) => (
+        context.policyThresholds[key] === value
+      )),
+    `${seat}号座正式AI决策上下文复制收到本座位的阈值覆盖`);
+  }
+  const seatZeroContext = aiDecisionContext(state, 0);
+  assert(seatZeroContext.policyThresholds !== thresholds[0]
+    && seatZeroContext.policyThresholds.p0LeadGate === thresholds[0].p0LeadGate,
+  '0号座与电脑座位使用相同的阈值复制口径');
+}
+
+console.log('混合决策设置与公平观察边界');
+{
+  const state = createMatch({
+    difficulty: 'master',
+    aiSpeed: 'fast',
+    coachMode: false,
+    localAiEngine: 'hybrid',
+  });
+  const context = aiDecisionContext(state, 1);
+  assert(context.decisionEngine === 'hybrid', '正式决策上下文收到用户选择的混合引擎');
+  assert(!('hands' in context) && !('deck' in context)
+    && !('initialHands' in context) && !('lastReplay' in context),
+  '正式决策上下文不暴露四家暗牌、牌堆、初始牌面或终局复盘');
+
+  const token = state.aiRequestToken;
+  state.phase = PHASE.PLAYING;
+  state.currentSeat = 1;
+  state.aiThinking = true;
+  applySettings(state, { localAiEngine: 'expert' });
+  assert(state.aiRequestToken !== token && state.aiThinking === false,
+    '切换本地决策引擎会作废正在计算的旧策略请求');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

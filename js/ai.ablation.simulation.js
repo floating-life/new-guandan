@@ -1,5 +1,8 @@
 /**
- * P0/P1/P2 独立消融：完整 expert 分别对阵只关闭一个模块的 expert。
+ * P0-P5 独立消融：每一臂都从同一个正式 expert 中只关闭被测模块。
+ * 另加 expert vs p1-only 的 P2-P5 联合消融，检查新阶段整体交互；各结果
+ * 不能机械相加。P5 是运行时置信融合，离线选型/留出集门禁见
+ * ai.policy.calibration.js。
  *
  * 用法：
  *   node js/ai.ablation.simulation.js [每项种子组数=30] [基础种子=20260811]
@@ -14,12 +17,19 @@ import path from 'node:path';
 const groups = positiveInteger(process.argv[2], 30);
 const baseSeed = finiteUint32(process.argv[3], 20260811);
 const jsonOnly = process.argv.includes('--json');
+const levelsFlag = process.argv.find((item) => String(item).startsWith('--levels=')) || '--levels=all';
+const forwardedFlags = ['--level-blocks', '--continuous-match', '--trace-divergence']
+  .filter((flag) => process.argv.includes(flag));
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const runner = path.join(currentDir, 'ai.ab.simulation.js');
 const ablations = [
-  { module: 'P0', comparison: 'no-p0' },
-  { module: 'P1', comparison: 'no-p1' },
-  { module: 'P2', comparison: 'no-p2' },
+  { module: 'P0', candidate: 'expert', comparison: 'no-p0' },
+  { module: 'P1', candidate: 'expert', comparison: 'no-p1' },
+  { module: 'P2', candidate: 'expert', comparison: 'no-p2' },
+  { module: 'P3', candidate: 'expert', comparison: 'no-p3' },
+  { module: 'P4', candidate: 'expert', comparison: 'no-p4' },
+  { module: 'P5', candidate: 'expert', comparison: 'no-p5' },
+  { module: 'P2-P5', candidate: 'expert', comparison: 'p1-only' },
 ];
 
 function positiveInteger(value, fallback) {
@@ -33,14 +43,19 @@ function finiteUint32(value, fallback) {
 }
 
 function runAblation(item) {
-  if (!jsonOnly) process.stderr.write(`[${item.module}] expert vs ${item.comparison}...\n`);
+  if (!jsonOnly) process.stderr.write(
+    `[${item.module}] ${item.candidate} vs ${item.comparison}...\n`,
+  );
   const child = spawnSync(process.execPath, [
     runner,
     String(groups),
     String(baseSeed),
-    'expert',
+    item.candidate,
     item.comparison,
     '--json',
+    '--summary-only',
+    levelsFlag,
+    ...forwardedFlags,
   ], {
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
@@ -59,9 +74,10 @@ function runAblation(item) {
   }
   return {
     module: item.module,
-    full: 'expert',
+    full: item.candidate,
     ablated: item.comparison,
     completion: report.completion,
+    evaluationConfig: report.config,
     effect: {
       upgradeUtilityPerGame: report.result.candidateUpgradeUtilityPerGame,
       pairedUtilityPerSeed: report.result.candidatePairedUtilityPerSeed,
@@ -70,9 +86,14 @@ function runAblation(item) {
       ablatedHeads: report.result.comparisonHeads,
       fullHeadRate: report.result.candidateHeadRate,
       fullHeadWilson95: report.result.candidateHeadWilson95,
+      fullHeadPairedBootstrap95: report.result.candidateHeadPairedBootstrap95,
       fullDoubleUps: report.result.candidateDoubleUps,
       ablatedDoubleUps: report.result.comparisonDoubleUps,
+      doubleUpDifferencePerGame: report.result.candidateDoubleUpDifferencePerGame,
+      doubleUpDifferencePairedBootstrap95:
+        report.result.candidateDoubleUpDifferencePairedBootstrap95,
     },
+    byLevel: report.byLevel,
     performance: report.performance,
   };
 }
@@ -87,19 +108,23 @@ try {
 
 const allComplete = !error && results.length === ablations.length
   && results.every((item) => item.completion.failures === 0
-    && item.completion.mirrorPairsCompleted === groups);
+    && item.completion.mirrorPairsCompleted === item.evaluationConfig.seedGroups
+    && item.completion.baseDealBlocksCompleted === groups);
 const output = {
   config: {
     seedGroupsPerAblation: groups,
-    gamesPerAblation: groups * 2,
-    totalGamesPlanned: groups * 2 * ablations.length,
+    gamesPerAblation: results[0]?.evaluationConfig?.gamesPlanned || groups * 2,
+    totalGamesPlanned: (results[0]?.evaluationConfig?.gamesPlanned || groups * 2)
+      * ablations.length,
     baseSeed,
-    fullPolicy: 'expert',
+    evaluationLevels: levelsFlag.slice('--levels='.length),
+    fullPolicy: 'expert（P0-P5）',
     ablatedPolicies: ablations.map((item) => item.comparison),
     deterministic: true,
     sameSeedsAcrossAblations: true,
+    forwardedFlags,
   },
-  interpretation: '每项只关闭对应 P 模块。no-p0 仅把 P0 的可接概率换为不含本局证据的静态先验；P1/P2 与共享威胁模型保持不变。效用 = expert 减 no-pX，正值表示该模块带来收益。模块可能交互，三项效用不可直接相加。',
+  interpretation: 'P0-P5 单项各只关闭对应模块；P2-P5 为新阶段联合消融。使用 --level-blocks 时，同一副基础牌会跨全部指定级牌复用，并按基础牌区组重采样；保持相同公开信息模型、expert权重、其它生产模块与残局搜索。正值表示完整侧更优；模块存在交互，单项与联合结果不可机械相加。',
   validity: {
     allComplete,
     independentFeatureGates: true,

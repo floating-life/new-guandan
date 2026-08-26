@@ -11,13 +11,18 @@ import {
   generateLegalPlays, canBeat, HandType, handSignature,
 } from './rules.js';
 import {
-  completedFlushStraightCount, countDisjointStraights, countPotentialBombs, createStrategicMemo,
-  downstreamEnemyNeedsBlock, evaluateStrategicPlay, selectEmergencyBlock,
+  analyzeSingleRunPressure, completedFlushStraightCount, countDisjointStraights,
+  countPotentialBombs, createStrategicMemo, downstreamEnemyNeedsBlock,
+  evaluateStrategicPlay, selectEmergencyBlock, assessTeamFinishDelay,
+  RESPONSE_DAMAGE_WEIGHT, selectPressureOrdinaryResponse, strategicResponseDamage,
 } from './strategy-core.js';
 import {
-  estimateThreeStepRoute, inferPublicThreats, createBeatModel, createUnconditionedBeatModel,
-  controlEV, bombNetGain,
+  estimateThreeStepRoute, inferPublicThreats, createBeatModel,
+  enemyBombExposureProbability, orderedTeamControlLossProbability,
+  evaluatePublicResponseTree, evaluatePublicEndgameRollout,
+  publicPartnerProtectionValue,
 } from './ai-route.js';
+import { chooseHybridFromConsultation } from './ai-hybrid.js';
 
 export const AI_DIFFICULTY = {
   easy: 'easy',
@@ -33,19 +38,90 @@ export const AI_DIFFICULTY_LABEL = {
   master: '大师',
 };
 
-const POLICY_FEATURE_KEYS = ['p0', 'p1', 'p2', 'endgame'];
+const CONTROL_V2_FEATURE_KEYS = Object.freeze([
+  'controlRiskV2',
+  'cheapControl',
+  'partnerCover',
+  'placementControl',
+  'publicLockLead',
+]);
+const POLICY_FEATURE_KEYS = [
+  'p0', 'p1', 'p1ResponseSearch', 'p2', 'p3', 'p4', 'p5',
+  'endgame', 'controlV2', 'teamFinishDelay', 'emergencyOrdinaryBlock',
+  'softOrdinaryPressure', 'highShedRunBlock',
+  ...CONTROL_V2_FEATURE_KEYS,
+];
 const EXPERT_POLICY_FEATURES = Object.freeze({
   p0: true,
   p1: true,
+  // P1 升级为一层公开应手树；p1-legacy 变体可单独关闭该搜索，保留旧控权校正。
+  p1ResponseSearch: true,
+  // P2 v2 只在公开威胁/短手语境下比较炸、普通接与过牌，并把有序应手树
+  // 纳入净收益；P3/P4/P5 分别负责搭档交接、残局情景 rollout 与模块融合校准。
   p2: true,
+  p3: true,
+  p4: true,
+  p5: true,
   endgame: true,
+  controlV2: true,
+  // 两批跨级独立消融中，新有序控权概率一批中性、一批负向；
+  // 保留 only-control-risk 实验臂，未达到发布证据前不改变正式 P0/P1。
+  controlRiskV2: false,
+  cheapControl: true,
+  // 独立跨级消融显示“只因下家短手就机械抬高对家牌”有负收益；
+  // 保留实验臂和共享标签，但正式策略继续让对家控牌。
+  partnerCover: false,
+  placementControl: true,
+  publicLockLead: true,
+  teamFinishDelay: true,
+  emergencyOrdinaryBlock: true,
+  // 十张软压力在首批未见种子镜像赛显著负向；保留显式实验臂，正式大师
+  // 只发布五张硬残局拦截。
+  softOrdinaryPressure: false,
+  // 真实复盘实验：对手跨牌型连续控圈且短时间大量减牌时，允许用最低损伤
+  // 普通牌截断。先保留为独立实验臂，镜像赛通过后再发布到大师默认策略。
+  highShedRunBlock: false,
+});
+const EXPERIMENTAL_P2_POLICY_FEATURES = Object.freeze({
+  ...EXPERT_POLICY_FEATURES,
+  p2: true,
 });
 const BASELINE_POLICY_FEATURES = Object.freeze({
   p0: false,
   p1: false,
+  p1ResponseSearch: false,
   p2: false,
+  p3: false,
+  p4: false,
+  p5: false,
   endgame: false,
+  controlV2: false,
+  controlRiskV2: false,
+  cheapControl: false,
+  partnerCover: false,
+  placementControl: false,
+  publicLockLead: false,
+  teamFinishDelay: false,
+  emergencyOrdinaryBlock: false,
+  softOrdinaryPressure: false,
+  highShedRunBlock: false,
 });
+
+function withControlV2Features(features, enabled) {
+  return Object.freeze({
+    ...features,
+    controlV2: enabled,
+    ...Object.fromEntries(CONTROL_V2_FEATURE_KEYS.map((key) => [key, enabled])),
+  });
+}
+
+function withOnlyControlV2Feature(key) {
+  return Object.freeze({
+    ...EXPERT_POLICY_FEATURES,
+    controlV2: true,
+    ...Object.fromEntries(CONTROL_V2_FEATURE_KEYS.map((item) => [item, item === key])),
+  });
+}
 
 /**
  * 独立策略消融定义。no-p0/no-p1/no-p2 始终保留 expert 的统一策略权重，
@@ -55,6 +131,16 @@ export const AI_POLICY_VARIANTS = Object.freeze({
   expert: Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'expert',
+  }),
+  'hybrid-v1': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'hybrid',
+  }),
+  'p2-on': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERIMENTAL_P2_POLICY_FEATURES,
   }),
   baseline: Object.freeze({
     policyProfile: 'baseline',
@@ -66,11 +152,41 @@ export const AI_POLICY_VARIANTS = Object.freeze({
   }),
   'no-p1': Object.freeze({
     policyProfile: 'expert',
-    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p1: false }),
+    policyFeatures: Object.freeze({
+      ...EXPERT_POLICY_FEATURES,
+      p1: false,
+      p1ResponseSearch: false,
+    }),
+  }),
+  'p1-legacy': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p1ResponseSearch: false }),
   }),
   'no-p2': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p2: false }),
+  }),
+  'no-p3': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p3: false }),
+  }),
+  'no-p4': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p4: false }),
+  }),
+  'no-p5': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, p5: false }),
+  }),
+  'p1-only': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({
+      ...EXPERT_POLICY_FEATURES,
+      p2: false,
+      p3: false,
+      p4: false,
+      p5: false,
+    }),
   }),
   'none': Object.freeze({
     policyProfile: 'expert',
@@ -78,47 +194,119 @@ export const AI_POLICY_VARIANTS = Object.freeze({
       ...EXPERT_POLICY_FEATURES,
       p0: false,
       p1: false,
+      p1ResponseSearch: false,
       p2: false,
+      p3: false,
+      p4: false,
+      p5: false,
     }),
   }),
+  'no-control-v2': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withControlV2Features(EXPERT_POLICY_FEATURES, false),
+  }),
+  'only-control-risk': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withOnlyControlV2Feature('controlRiskV2'),
+  }),
+  'only-cheap-control': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withOnlyControlV2Feature('cheapControl'),
+  }),
+  'only-partner-cover': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withOnlyControlV2Feature('partnerCover'),
+  }),
+  'only-placement-control': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withOnlyControlV2Feature('placementControl'),
+  }),
+  'only-public-lock': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: withOnlyControlV2Feature('publicLockLead'),
+  }),
+  // 8 月真实牌局复盘形成的两个独立发布门：一个只处理团队名次下的延迟
+  // 出完，一个只处理十/五张压力区的最低损伤普通接牌，便于逐项消融。
+  'no-team-finish-delay': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, teamFinishDelay: false }),
+  }),
+  'no-emergency-ordinary-block': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, emergencyOrdinaryBlock: false }),
+  }),
+  'no-replay-v2': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({
+      ...EXPERT_POLICY_FEATURES,
+      teamFinishDelay: false,
+      emergencyOrdinaryBlock: false,
+    }),
+  }),
+  'with-soft-ordinary-pressure': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, softOrdinaryPressure: true }),
+  }),
+  'with-high-shed-run-block': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, highShedRunBlock: true }),
+  }),
   // 实验性锐化变体：仅在 head-to-head A/B 中使用，不改默认 expert 行为。
-  // 默认 expert 的 P0/P1 阈值是 p0LeadGate=0.8 / p0BeatGate=0.75 / p0StopGate=0.8 /
-  // p1PLoseGate=0.7；锐化变体把对应门槛抬高，让该模块只在更极端风险时介入。
+  // 默认 expert 的 P0/P1 阈值是 p0LeadGate=0.8 / p0StopGate=0.8 /
+  // p1SpreadFloor=0.04；锐化变体用于验证模块只在风险差更明显时介入的灵敏度。
   'p0-sharp': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
     policyThresholds: Object.freeze({
       p0LeadGate: 0.9,
-      p0BeatGate: 0.85,
       p0StopGate: 0.9,
     }),
   }),
-  // 实验性变体：p0-sharp 已证明 [0.8,0.9) 门槛区间在自对弈中几乎为空，
-  // 阈值杠杆无效；P0 的负贡献在高风险触发行为本身。本变体保留默认门槛，
-  // 只把 P0 两处分数惩罚（领出/接法压回惩罚）按系数缩小。
+  // 实验性幅度变体：保留默认门槛，只缩放 P0 高控制领出的风险惩罚，供消融与
+  // 灵敏度分析使用；不作为默认 expert 的隐式配置。
   'p0-soft': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
     policyThresholds: Object.freeze({
       p0LeadScale: 0.35,
-      p0BeatScale: 0.35,
     }),
   }),
   'p1-sharp': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
     policyThresholds: Object.freeze({
-      p1PLoseGate: 0.8,
+      p1SpreadFloor: 0.14,
     }),
   }),
-  // 实验性变体：P1 触发时的丢权损失按系数缩放。p1-sharp 已证明 0.7 门
-  // 在自对弈中从不落在 [0.7,0.8)，阈值杠杆无效；本变体保留默认门，
-  // 只减小 EV = routeAdjustment·(1-p) - p·lossPenalty 中惩罚项的幅度。
+  // 实验性幅度变体：保留 P1 默认触发门，只缩放相对控权差的影响，供
+  // 独立灵敏度分析使用。
   'p1-soft': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
     policyThresholds: Object.freeze({
       p1LossScale: 0.35,
+    }),
+  }),
+  // P5 离线校准候选。只有显式 A/B/校准脚本会选择这些幅度臂；正式档
+  // 使用上面的保守默认值，脚本不会在运行时自改权重。
+  'p5-soft': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p2ControlScale: 0.8,
+      p3Scale: 0.75,
+      p4Scale: 0.72,
+      p5FusionCap: 22,
+    }),
+  }),
+  'p5-wide': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES }),
+    policyThresholds: Object.freeze({
+      p2ControlScale: 1.08,
+      p3Scale: 1,
+      p4Scale: 0.92,
+      p5FusionCap: 36,
     }),
   }),
 });
@@ -146,6 +334,7 @@ export function resolvePolicyVariant(name = 'expert') {
     policyProfile: variant.policyProfile,
     policyFeatures: { ...variant.policyFeatures },
     policyThresholds: variant.policyThresholds ? { ...variant.policyThresholds } : null,
+    decisionEngine: variant.decisionEngine === 'hybrid' ? 'hybrid' : 'expert',
   };
 }
 
@@ -186,12 +375,19 @@ function cfg(difficulty = _difficulty) {
         lookAheadEndgameHand: 0,
         lookAheadEndgameNodes: 0,
         controlLeadRiskPenalty: 8,
-        leadBeatRiskPenalty: 2,
-        beatBackRiskPenalty: 18,
         controlLossBase: 0,
         controlLossFinishBoost: 0,
         controlLossControlBoost: 0,
         controlLossNearBoost: 0,
+        responseSearchRootLimit: 0,
+        responseSearchMaxAdjustment: 0,
+        partnerSearchRootLimit: 0,
+        partnerSearchMaxAdjustment: 0,
+        rolloutRootLimit: 0,
+        rolloutBranchLimit: 0,
+        rolloutEndgameHand: 0,
+        rolloutMaxAdjustment: 0,
+        policyFusionCap: 0,
         bombNetEnabled: false,
         bombNetResource: 3,
         bombNetPlayThresh: 10,
@@ -218,12 +414,19 @@ function cfg(difficulty = _difficulty) {
         lookAheadEndgameHand: 8,
         lookAheadEndgameNodes: 30000,
         controlLeadRiskPenalty: 42,
-        leadBeatRiskPenalty: 7,
-        beatBackRiskPenalty: 48,
         controlLossBase: 22,
         controlLossFinishBoost: 30,
         controlLossControlBoost: 15,
         controlLossNearBoost: 35,
+        responseSearchRootLimit: 8,
+        responseSearchMaxAdjustment: 28,
+        partnerSearchRootLimit: 6,
+        partnerSearchMaxAdjustment: 18,
+        rolloutRootLimit: 3,
+        rolloutBranchLimit: 3,
+        rolloutEndgameHand: 8,
+        rolloutMaxAdjustment: 17,
+        policyFusionCap: 28,
         bombNetEnabled: true,
         bombNetResource: 6,
         bombNetPlayThresh: 14,
@@ -250,12 +453,19 @@ function cfg(difficulty = _difficulty) {
         lookAheadEndgameHand: 7,
         lookAheadEndgameNodes: 20000,
         controlLeadRiskPenalty: 34,
-        leadBeatRiskPenalty: 6,
-        beatBackRiskPenalty: 40,
         controlLossBase: 16,
         controlLossFinishBoost: 25,
         controlLossControlBoost: 12,
         controlLossNearBoost: 30,
+        responseSearchRootLimit: 6,
+        responseSearchMaxAdjustment: 22,
+        partnerSearchRootLimit: 4,
+        partnerSearchMaxAdjustment: 14,
+        rolloutRootLimit: 3,
+        rolloutBranchLimit: 2,
+        rolloutEndgameHand: 7,
+        rolloutMaxAdjustment: 13,
+        policyFusionCap: 24,
         bombNetEnabled: true,
         bombNetResource: 5,
         bombNetPlayThresh: 12,
@@ -283,12 +493,19 @@ function cfg(difficulty = _difficulty) {
         lookAheadEndgameHand: 0,
         lookAheadEndgameNodes: 0,
         controlLeadRiskPenalty: 22,
-        leadBeatRiskPenalty: 4,
-        beatBackRiskPenalty: 30,
         controlLossBase: 12,
         controlLossFinishBoost: 20,
         controlLossControlBoost: 10,
         controlLossNearBoost: 25,
+        responseSearchRootLimit: 4,
+        responseSearchMaxAdjustment: 14,
+        partnerSearchRootLimit: 3,
+        partnerSearchMaxAdjustment: 10,
+        rolloutRootLimit: 2,
+        rolloutBranchLimit: 2,
+        rolloutEndgameHand: 6,
+        rolloutMaxAdjustment: 10,
+        policyFusionCap: 18,
         bombNetEnabled: false,
         bombNetResource: 4,
         bombNetPlayThresh: 12,
@@ -302,10 +519,32 @@ function cfg(difficulty = _difficulty) {
  * @param {object} ctx
  */
 export function chooseAIPlay(ctx) {
+  const selectedDifficulty = AI_DIFFICULTY[ctx?.difficulty] || _difficulty;
+  if (ctx?.decisionEngine === 'hybrid' && selectedDifficulty === AI_DIFFICULTY.master) {
+    const consultation = getAIConsultation(ctx, {
+      deterministic: !!ctx?.deterministic,
+      timeBudgetMs: Number(ctx?.timeBudgetMs) || 0,
+      applyHybrid: true,
+    });
+    if (!consultation?.action) return null;
+    return {
+      action: consultation.action,
+      ...(consultation.action === 'play'
+        ? {
+            cards: consultation.cards,
+            hand: consultation.hand,
+            signature: consultation.signature || handSignature(consultation.hand),
+          }
+        : {}),
+      reason: consultation.reason || '',
+      projectedTricks: consultation.projectedTricks ?? null,
+      hybrid: consultation.hybrid || null,
+    };
+  }
   return chooseAIPlayInternal(ctx, {
     explain: false,
     deterministic: !!ctx?.deterministic,
-    difficulty: AI_DIFFICULTY[ctx?.difficulty] || _difficulty,
+    difficulty: selectedDifficulty,
     timeBudgetMs: Number(ctx?.timeBudgetMs) || 0,
   });
 }
@@ -322,11 +561,21 @@ export function applySearchTimeBudget(c, timeBudgetMs) {
     c.lookAheadRootLimit += 4;
     c.lookAheadFutureBeam += 1;
     c.lookAheadEndgameHand += 2;
+    c.responseSearchRootLimit += 2;
+    c.partnerSearchRootLimit += 1;
+    c.rolloutRootLimit += 1;
+    c.rolloutBranchLimit += 1;
   } else if (budget >= 150) {
     c.lookAheadRootLimit += 4;
     c.lookAheadEndgameHand += 2;
+    c.responseSearchRootLimit += 1;
+    c.rolloutRootLimit += 1;
   }
   return c;
+}
+
+function monotonicNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
 }
 
 function publicCard(card) {
@@ -441,16 +690,24 @@ function chooseAIPlayInternal(ctx, options) {
     policyThresholds: policyThresholds ? { ...policyThresholds } : null,
     difficulty: selectedDifficulty,
     strategyWeight: c.strategyWeight,
+    // 真实对局严格受思考预算约束；超时只跳过尚未完成的 P1 扩展，沿用已经
+    // 排好的本地候选。确定性单测/A-B 不设墙钟截止点，保证完全可复现。
+    searchDeadlineMs: !options.deterministic && options.timeBudgetMs > 0
+      ? monotonicNow() + Math.max(12, options.timeBudgetMs * 0.82)
+      : null,
   };
   decisionCtx.strategyMemo = createStrategicMemo(decisionCtx.hand, level);
   decisionCtx.publicModel = inferPublicThreats(decisionCtx);
-  if (normalizedPolicyFeatures.p0) {
+  if (normalizedPolicyFeatures.p0
+    || normalizedPolicyFeatures.p1
+    || normalizedPolicyFeatures.p1ResponseSearch
+    || normalizedPolicyFeatures.p2
+    || normalizedPolicyFeatures.p3
+    || normalizedPolicyFeatures.p4) {
+    // 可接概率是 P0-P4 共用的公开信息输入，不属于某一个 feature 的开关。
+    // no-p0 只关闭 P0 的领出/接牌/拦截分支，其它模块仍读取完全相同的模型，
+    // 才能保证消融两臂只有一个变量。
     decisionCtx.beatModel = createBeatModel(decisionCtx);
-  } else if (normalizedPolicyFeatures.p1 || normalizedPolicyFeatures.p2) {
-    // no-p0 只把「P0 的可接概率模型」换成不含本局证据的静态先验
-    // （createUnconditionedBeatModel）；P1/P2 仍使用共享威胁模型 publicModel。
-    // 两臂唯一差异是 p0 特征本身，归因干净——不会把“关 P0”偷换成“同时关掉 P1/P2”。
-    decisionCtx.beatModel = createUnconditionedBeatModel(decisionCtx);
   } else {
     decisionCtx.beatModel = null;
   }
@@ -494,13 +751,21 @@ function chooseAIPlayInternal(ctx, options) {
   const partnerSeat = (seat + 2) % 4;
   const partnerFinished = finishOrder.includes(partnerSeat);
 
-  // Finishing the hand has priority over every optional pass/resource rule.
-  // Keep this before teammate cooperation, random passing and bomb preservation
-  // so a complete bomb/straight-flush is never split instead of going out.
+  // 一手出完通常优先；但整手强控制在团队名次仍未确定时可以延迟一次，
+  // 避免“个人先走”硬门越过对家争头游/双上的判断。
   const finishPlays = plays.filter((play) => play.cards.length === hand.length);
   if (finishPlays.length && c.finishFirst) {
     const ranked = rankPlays(finishPlays, 'beat', hand, level, decisionCtx, c, search);
     const best = ranked[0];
+    const finishDelay = assessTeamFinishDelay(best, decisionCtx);
+    if (finishDelay.shouldDelay) {
+      return respond(
+        { action: 'pass', tacticalConstraint: 'team_finish_delay' },
+        ranked,
+        finishDelay.reason,
+        best,
+      );
+    }
     return respond(
       { action: 'play', cards: best.cards, hand: best.hand },
       ranked,
@@ -525,6 +790,58 @@ function chooseAIPlayInternal(ctx, options) {
         `下家只剩${handCounts[downstream]}张，必须用较高控制牌抬高对家的牌，阻止对手直接走完`,
         best,
       );
+    }
+
+    const downstream = (seat + 1) % 4;
+    if (policyFeatureActive(decisionCtx, 'p3') && c.difficulty !== 'easy') {
+      const protectionRanked = rankPlays(
+        plays,
+        'beat',
+        hand,
+        level,
+        decisionCtx,
+        { ...c, lookAhead: false },
+        search,
+      );
+      const partnerProtection = selectPartnerProtection(
+        protectionRanked,
+        decisionCtx,
+        level,
+      );
+      if (partnerProtection) {
+        return respond(
+          { action: 'play', cards: partnerProtection.cards, hand: partnerProtection.hand },
+          protectionRanked,
+          `公开应手模型显示下家接走对家牌权的风险可由${partnerProtection.riskReductionPercent}%降到更低，且本手不拆组合、不用王或逢人配；用最低成本抬门保护团队牌权`,
+          partnerProtection,
+        );
+      }
+    }
+
+    if (c.difficulty !== 'easy'
+      && handCounts[downstream] <= 5
+      && (handCounts[lastSeat] ?? 99) > 5
+      && lastHand.power <= 9
+      && !isBombType(lastHand)) {
+      // 仅在明确短手威胁下做一次无前瞻的共享策略评分；普通队友回合仍零额外搜索。
+      const coverRanked = rankPlays(
+        plays,
+        'beat',
+        hand,
+        level,
+        decisionCtx,
+        { ...c, lookAhead: false },
+        search,
+      );
+      const partnerCover = selectTaggedSafeControl(coverRanked, 'partner_cover', level);
+      if (partnerCover) {
+        return respond(
+          { action: 'play', cards: partnerCover.cards, hand: partnerCover.hand },
+          coverRanked,
+          `下家只剩${handCounts[downstream]}张，用不拆结构的普通牌安全抬高门槛，协助对家守住牌权`,
+          partnerCover,
+        );
+      }
     }
 
     // hard：几乎不压队友；easy：经常乱压。
@@ -555,6 +872,7 @@ function chooseAIPlayInternal(ctx, options) {
   // —— 接对手 ——
   if (passOk
     && c.randomPass > 0
+    && c.difficulty === 'easy'
     && Math.random() < c.randomPass
     && hand.length > 8
     && !enemyAboutToWin(handCounts, seat, teams, finishOrder)) {
@@ -563,6 +881,10 @@ function chooseAIPlayInternal(ctx, options) {
 
   const scored = rankPlays(plays, 'beat', hand, level, decisionCtx, c, search);
   let best = pickByDifficulty(scored, c);
+  const cheapControlTake = c.difficulty !== 'easy'
+    ? selectTaggedSafeControl(scored, 'cheap_control_take', level)
+    : null;
+  if (cheapControlTake) best = cheapControlTake;
 
   const activeEnemyMin = Math.min(...handCounts.map((count, i) => (
     i !== seat && !finishOrder.includes(i) && teams[i] !== teams[seat] ? count : 99
@@ -572,7 +894,58 @@ function chooseAIPlayInternal(ctx, options) {
     && teams[upstreamSeat] !== teams[seat]
     && !finishOrder.includes(upstreamSeat)
     && handCounts[upstreamSeat] <= 6;
-  const canConserveOrdinaryResponse = passOk && activeEnemyMin > 5 && !upstreamThreat;
+  const singleRunPressure = analyzeSingleRunPressure(
+    { ...decisionCtx, mode: 'beat' },
+    decisionCtx.publicModel?.history,
+  );
+  const singleRunBlock = singleRunPressure.active
+    ? selectSingleRunBlock(scored, level)
+    : null;
+  if (singleRunBlock) best = singleRunBlock;
+  const mustTakeCheapControl = !!cheapControlTake && !singleRunBlock;
+  const bestNonBomb = scored.find((play) => !isBombType(play.hand));
+  const bestBomb = scored.find((play) => isBombType(play.hand));
+  const pressureOrdinary = policyFeatureActive(decisionCtx, 'emergencyOrdinaryBlock')
+    ? selectPressureOrdinaryResponse(scored, decisionCtx)
+    : null;
+  // P2 同时比较最优普通接法、最优炸弹与过牌。旧实现只在“当前第一名本来
+  // 就是炸弹”时计算，既不能把次优炸弹提升上来，也无法判断只能炸时是否该过。
+  const bombChoice = computeBombActionChoice(
+    bestBomb, bestNonBomb, hand, level, decisionCtx, search, c,
+  );
+  const bombNet = bombChoice?.bombNet ?? null;
+  // P2 v2 允许公开应手净收益在小范围内覆盖基础排名，但仍设结构分护栏；
+  // 不能因为一个噪声概率把明显更差、拆结构的炸弹强行抬成第一名。
+  const p2ScoreMargin = policyThreshold(decisionCtx, 'p2ScoreMargin', 18);
+  const bombScoreAligned = !bestNonBomb || !bestBomb
+    || bestBomb.score >= bestNonBomb.score - p2ScoreMargin;
+  const bombJustified = !singleRunBlock
+    && !mustTakeCheapControl
+    && bombChoice?.action === 'bomb'
+    && bombChoice.advantage >= c.bombNetPlayThresh
+    && bombScoreAligned;
+  if (bombJustified && bestBomb) best = bestBomb;
+  else if (!singleRunBlock
+    && bombChoice?.action === 'ordinary'
+    && bombChoice.advantage >= c.bombNetSaveThresh
+    && bestNonBomb) best = bestNonBomb;
+  if (!bombJustified && pressureOrdinary?.play) best = pressureOrdinary.play;
+  const p2PassPreferred = !singleRunBlock
+    && !mustTakeCheapControl
+    && !pressureOrdinary
+    && bombChoice?.action === 'pass'
+    && bombChoice.advantage >= c.bombNetSaveThresh
+    && activeEnemyMin > 5;
+  if (p2PassPreferred) {
+    return respond(
+      { action: 'pass' },
+      scored,
+      '炸弹、普通接法与过牌三路比较后，当前交牌的资源代价高于暂时让权；保留控制等待更关键牌权',
+      bestBomb || bestNonBomb,
+    );
+  }
+  const canConserveOrdinaryResponse = passOk && activeEnemyMin > 5
+    && !upstreamThreat && !pressureOrdinary;
   if (canConserveOrdinaryResponse && ordinaryResponseTooCostly(best)) {
     return respond(
       { action: 'pass' },
@@ -583,14 +956,32 @@ function chooseAIPlayInternal(ctx, options) {
   if (passOk
     && hand.length > 8
     && activeEnemyMin > 5
+    && !pressureOrdinary
     && !upstreamThreat
     && !best.strategy?.tags?.includes('stop_opponent_run')
+    && !best.strategy?.tags?.includes('stop_single_run')
+    && !best.strategy?.tags?.includes('cheap_control_take')
     && isPremiumNonBombControl(best.hand, level)) {
-    return respond(
-      { action: 'pass' },
-      scored,
-      '对手尚未进入紧急残局，保留王或级牌控制，避免大牌打空后单吊小牌',
-    );
+    const ordinaryFallback = scored.filter((play) => (
+      !isBombType(play.hand)
+      && !isPremiumNonBombControl(play.hand, level)
+      && responseDamage(play, level) === 0
+      && !ordinaryResponseTooCostly(play)
+    )).sort((left, right) => (
+      playResourcePower(left.hand) - playResourcePower(right.hand)
+      || right.score - left.score
+    ))[0];
+    if (ordinaryFallback) {
+      // P1 可能把A/王抬到第一名；“保留高控制”不能因此直接把整轮变成过牌。
+      // 还有安全普通接法时回退该接法，避免再次暴露“所有单牌都放行”的漏洞。
+      best = ordinaryFallback;
+    } else {
+      return respond(
+        { action: 'pass' },
+        scored,
+        '对手尚未进入紧急残局，且没有安全普通接法；保留王或级牌控制，避免大牌打空后单吊小牌',
+      );
+    }
   }
 
 
@@ -610,7 +1001,7 @@ function chooseAIPlayInternal(ctx, options) {
     return !severeStructureDamage;
   });
   if (passOk && preservedStrongControl && !highPriorityBomb
-    && !viableOrdinaryResponse && activeEnemyMin > 2) {
+    && !viableOrdinaryResponse && activeEnemyMin > 2 && !pressureOrdinary) {
     const survival = preservedStrongControl.strategy.tags.includes('survival_preserve_control');
     return respond(
       { action: 'pass' },
@@ -626,15 +1017,9 @@ function chooseAIPlayInternal(ctx, options) {
     && !!best.strategy?.createsTwoStepFinish;
   // P0 记牌器：最优普通接法被（另一名）对手压回、对方团队继续持权的概率，
   // 用于判断不炸开是否就拦不住其推进。
-  const bestNonBomb = scored.find((play) => !isBombType(play.hand));
   const stopRisk = policyFeatureActive(decisionCtx, 'p0')
     ? (bestNonBomb ? candidateBeatRisk(bestNonBomb, decisionCtx) : 1)
     : 0;
-  // P2 炸弹净收益：对「现在炸 vs 走普通路线」做前瞻比较，仅信号决定性时覆盖启发式。
-  const bombNet = computeBombNetGain(
-    best, bestNonBomb, hand, level, decisionCtx, search, c,
-  );
-  const bombJustified = bombNet != null && bombNet >= c.bombNetPlayThresh;
   if (isBombType(best.hand)
     && !bombCreatesTwoStepFinish
     && !bombJustified
@@ -645,7 +1030,7 @@ function chooseAIPlayInternal(ctx, options) {
     )) {
     const nonBomb = scored.filter((p) => !isBombType(p.hand));
     if (nonBomb.length) {
-      best = pickByDifficulty(nonBomb, c);
+      best = pressureOrdinary?.play || pickByDifficulty(nonBomb, c);
       if (canConserveOrdinaryResponse && ordinaryResponseTooCostly(best)) {
         return respond(
           { action: 'pass' },
@@ -656,8 +1041,10 @@ function chooseAIPlayInternal(ctx, options) {
       }
       if (best.score < -50 && hand.length > 10 && lastHand.power < 10
         && !upstreamThreat
+        && !pressureOrdinary
         && !best.strategy?.tags?.includes('stop_opponent_run')
-        && !best.strategy?.tags?.includes('stop_single_run')) {
+        && !best.strategy?.tags?.includes('stop_single_run')
+        && !best.strategy?.tags?.includes('cheap_control_take')) {
         return respond(
           { action: 'pass' },
           scored,
@@ -698,9 +1085,10 @@ function chooseAIPlayInternal(ctx, options) {
   }
 
   if (best.score < -50 && hand.length > 10 && lastHand.power < 10
-    && !isBombType(lastHand) && !upstreamThreat
+    && !isBombType(lastHand) && !upstreamThreat && !pressureOrdinary
     && !best.strategy?.tags?.includes('stop_opponent_run')
-    && !best.strategy?.tags?.includes('stop_single_run')) {
+    && !best.strategy?.tags?.includes('stop_single_run')
+    && !best.strategy?.tags?.includes('cheap_control_take')) {
     if (c.difficulty !== 'easy' || Math.random() < 0.7) {
       return respond({ action: 'pass' }, scored, '接牌代价过高，暂时保留牌型结构');
     }
@@ -757,14 +1145,55 @@ function policyThreshold(ctx, key, fallback) {
 }
 
 function candidateBeatRisk(play, ctx) {
+  if (!ctx.beatModel || !play?.hand) return 0;
+  if (!policyFeatureActive(ctx, 'controlV2')
+    || !policyFeatureActive(ctx, 'controlRiskV2')) return legacyCandidateBeatRisk(play, ctx);
+  const typeRisk = orderedTeamControlLossProbability(play, ctx, ctx.beatModel);
+  // 炸弹不能和普通同型接牌等价，否则27张中盘几乎所有候选都会饱和到1；
+  // 但完全忽略又会高估A、王等牌的稳定牌权。P0/P1只折算12%的资源暴露。
+  const bombExposure = enemyBombExposureProbability(ctx, ctx.beatModel);
+  return Math.max(0, Math.min(1,
+    typeRisk + (1 - typeRisk) * bombExposure * 0.12,
+  ));
+}
+
+/** 仅供 no-control-v2 对照臂复现旧的“同型∪炸弹+固定对家回手”口径。 */
+function legacyCandidateBeatRisk(play, ctx) {
   const beatModel = ctx.beatModel;
-  if (!beatModel || !play?.hand) return 0;
-  let p = 0;
-  for (const enemy of beatModel.enemies) {
-    const pr = beatModel.seatTypeBeat(play.hand, enemy.count, enemy.seat);
-    p = p + pr - p * pr;
-  }
-  return p;
+  const active = new Map(beatModel.enemies.map((enemy) => [enemy.seat, enemy]));
+  const downstreamSeat = (ctx.seat + 1) % 4;
+  const upstreamSeat = (ctx.seat + 3) % 4;
+  const probability = (seat) => {
+    const enemy = active.get(seat);
+    return enemy ? beatModel.seatBeat(play.hand, enemy.count, enemy.seat) : 0;
+  };
+  const downstreamBeat = probability(downstreamSeat);
+  const upstreamBeat = probability(upstreamSeat);
+  const partnerSeat = (ctx.seat + 2) % 4;
+  const partnerActive = !(ctx.finishOrder || []).includes(partnerSeat)
+    && (ctx.handCounts?.[partnerSeat] ?? 0) > 0;
+  let partnerRetake = partnerActive ? 0.34 : 0;
+  if (ctx.publicModel?.partner?.preferredLeadType === play.hand.type) partnerRetake += 0.1;
+  if ((ctx.publicModel?.partner?.passesAgainstLast || 0) >= 2) partnerRetake -= 0.08;
+  partnerRetake = partnerActive ? Math.max(0.12, Math.min(0.5, partnerRetake)) : 0;
+  return Math.max(0, Math.min(1,
+    upstreamBeat + (1 - upstreamBeat) * downstreamBeat * (1 - partnerRetake),
+  ));
+}
+
+/**
+ * 炸弹是敌方额外付出的强资源，不能与同型普通接牌等价计入 P0/P1。
+ * 仅在实验性 P2 比较“普通接法/现在开炸”时，以 25% 权重单独折价。
+ */
+function candidateBombAdjustedRisk(play, ctx) {
+  if (!ctx.beatModel) return 0;
+  if (!policyFeatureActive(ctx, 'controlV2')
+    || !policyFeatureActive(ctx, 'controlRiskV2')) return legacyCandidateBeatRisk(play, ctx);
+  const typeRisk = orderedTeamControlLossProbability(play, ctx, ctx.beatModel);
+  const bombExposure = enemyBombExposureProbability(ctx, ctx.beatModel);
+  return Math.max(0, Math.min(1,
+    typeRisk + (1 - typeRisk) * bombExposure * 0.25,
+  ));
 }
 
 /**
@@ -778,7 +1207,7 @@ function controlLossPenalty(play, ctx, c, level) {
     if ((model.nearestEnemy?.finishRisk || 0) >= 0.72) loss += c.controlLossFinishBoost;
     if (model.activeEnemyMin <= 5) loss += c.controlLossNearBoost;
   }
-  if (isPremiumNonBombControl(play.hand, level)) loss += c.controlLossControlBoost;
+  if (play && isPremiumNonBombControl(play.hand, level)) loss += c.controlLossControlBoost;
   return loss;
 }
 
@@ -797,26 +1226,110 @@ function routeCostOf(hand, level, ctx, search, c) {
 }
 
 /**
- * P2 炸弹净收益：比较「不炸、走最优普通接法」与「炸、走炸后路线」的期望成本。
- * 仅在 expert 策略档 + 可接概率模型就绪时计算；无普通接法或整手出完时返回 null。
+ * P2 炸弹净收益：把炸弹、最优普通接法和过牌作为三个正式动作比较期望成本。
+ * 仅在 expert 策略档 + 可接概率模型就绪时计算；整手出完由更高优先级直接处理。
  * 只作用于残局/威胁语境：自己手牌已短（炸弹用于收官）或对手逼近（炸弹用于拦截），
  * 否则中盘大牌堆的炸弹是长期保险，路线比较不可靠，不应据此覆盖既有启发式。
  */
-function computeBombNetGain(bombPlay, nonBombPlay, hand, level, ctx, search, c) {
+function bombResourceOpportunityCost(play, ctx, c) {
+  if (!play || !isBombType(play.hand)) return Infinity;
+  if (play.strategy?.createsTwoStepFinish) return 0;
+  let cost;
+  if (play.hand.type === HandType.JOKER_BOMB) cost = 64;
+  else if (play.hand.type === HandType.FLUSH_STRAIGHT) cost = 48;
+  else cost = Math.max(18, 34 - Math.max(0, (play.hand.size || 4) - 4) * 4);
+
+  const tags = play.strategy?.tags || [];
+  // 紧急标签只表示“值得纳入比较”，不是把炸弹当成近乎免费。尤其逢人配拼炸、
+  // 同时拆顺子的接法，必须把真实结构机会成本带入三路比较。
+  if (play.cards.some((card) => isWild(card, ctx.level))) cost += 18;
+  if (tags.includes('split_straight')) cost += 22;
+  if (tags.includes('split_flush_straight')) cost += 30;
+  if (tags.includes('bomb_escort')) cost *= 0.35;
+  else if (tags.includes('timely_bomb')) cost *= 0.75;
+  const enemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  if (enemyMin <= 3) cost *= 0.55;
+  else if (enemyMin <= 5) cost *= 0.72;
+  else if ((ctx.hand || []).length <= 8) cost *= 0.7;
+  return Math.max(c.bombNetResource, cost);
+}
+
+function passControlOpportunityCost(ctx) {
+  const model = ctx.publicModel;
+  const enemyMin = model?.activeEnemyMin ?? 99;
+  const finishRisk = model?.nearestEnemy?.finishRisk || 0;
+  let cost = 5 + finishRisk * 22;
+  if (enemyMin <= 3) cost += 28;
+  else if (enemyMin <= 5) cost += 16;
+  else if (enemyMin <= 8) cost += 7;
+  if ((ctx.lastHand?.size || 0) >= 5) cost += 6;
+  return cost;
+}
+
+function computeBombActionChoice(bombPlay, nonBombPlay, hand, level, ctx, search, c) {
   if (!c.bombNetEnabled || !policyFeatureActive(ctx, 'p2') || !ctx.beatModel) return null;
-  if (!bombPlay || !isBombType(bombPlay.hand) || !nonBombPlay) return null;
+  if (!bombPlay || !isBombType(bombPlay.hand)) return null;
+  if ((bombPlay.strategy?.tags || []).some((tag) => [
+    'survival_preserve_control', 'preserve_strong_control',
+  ].includes(tag))) return null;
   const model = ctx.publicModel;
   const threat = (model?.activeEnemyMin ?? 99) <= 6
     || (model?.nearestEnemy?.finishRisk || 0) >= 0.6;
   if (hand.length > 14 && !threat) return null;
-  const remainOrd = removeCards(hand, nonBombPlay.cards);
   const remainBomb = removeCards(hand, bombPlay.cards);
-  if (!remainOrd.length || !remainBomb.length) return null;
-  const routeOrd = routeCostOf(remainOrd, level, ctx, search, c);
-  const routeBomb = routeCostOf(remainBomb, level, ctx, search, c);
-  const pLose = candidateBeatRisk(nonBombPlay, ctx);
-  const lossPenalty = controlLossPenalty(nonBombPlay, ctx, c, level);
-  return bombNetGain(routeOrd, routeBomb, pLose, lossPenalty, c.bombNetResource);
+  if (!remainBomb.length) return null;
+  // rankPlays 已为入围候选算过相同单位的路线成本；P2 直接复用，避免在
+  // 每个接牌回合重复展开两次三手搜索。过牌不消耗实体牌，用快速下界即可。
+  const routeCostFor = (play, remain) => Number.isFinite(play?.lookAhead?.cost)
+    ? play.lookAhead.cost
+    : routeCostOf(remain, level, ctx, search, c);
+  const passEstimate = fastTrickEstimate(hand, level, search);
+  const passCost = passEstimate.tricks * 18 + passEstimate.loose * 2.5
+    + passControlOpportunityCost(ctx);
+  const controlScale = policyThreshold(ctx, 'p2ControlScale', 1);
+  const expectedPlayCost = (play, remain, resourceCost = 0) => {
+    const routeCost = routeCostFor(play, remain);
+    const response = evaluatePublicResponseTree(play, ctx, ctx.beatModel, {
+      ownRemaining: remain.length,
+      includePartnerHandoff: policyFeatureActive(ctx, 'p3'),
+    });
+    if (!response) return routeCost + resourceCost;
+    const weights = responsePlacementWeights(ctx, c, level, remain.length);
+    // 同一套团队名次权重同时约束普通接法和炸弹。旧 P2 把炸弹视为必然站住，
+    // 会漏掉被更大炸弹反压的代价；v2 显式计入该公开概率，并把逼出敌炸作为
+    // 很小的补偿，而不是把“对手可能有炸”当成确定事件。
+    return routeCost + resourceCost
+      + response.enemyControl * weights.enemyControlLoss * controlScale
+      - response.selfControl * weights.selfControl * 0.28 * controlScale
+      - response.partnerControl * weights.partnerControl * 0.2 * controlScale
+      - response.enemyBomb * weights.enemyBombBurn;
+  };
+  let ordinaryCost = Infinity;
+  if (nonBombPlay) {
+    const remainOrd = removeCards(hand, nonBombPlay.cards);
+    if (remainOrd.length) {
+      ordinaryCost = expectedPlayCost(nonBombPlay, remainOrd);
+    }
+  }
+  const bombCost = expectedPlayCost(
+    bombPlay,
+    remainBomb,
+    bombResourceOpportunityCost(bombPlay, ctx, c),
+  );
+  const choices = [
+    { action: 'bomb', cost: bombCost },
+    { action: 'pass', cost: passCost },
+  ];
+  if (Number.isFinite(ordinaryCost)) choices.push({ action: 'ordinary', cost: ordinaryCost });
+  choices.sort((left, right) => left.cost - right.cost);
+  const best = choices[0];
+  const runnerUp = choices[1] || best;
+  return {
+    action: best.action,
+    advantage: Math.max(0, runnerUp.cost - best.cost),
+    bombNet: Math.min(passCost, ordinaryCost) - bombCost,
+    costs: { bomb: bombCost, ordinary: ordinaryCost, pass: passCost },
+  };
 }
 
 function tacticalAdjustment(play, mode, ctx, hand, level) {
@@ -855,17 +1368,25 @@ function isPremiumNonBombControl(hand, level) {
     && [HandType.SINGLE, HandType.PAIR, HandType.TRIPLE].includes(hand.type);
 }
 
-const RESPONSE_DAMAGE_WEIGHT = {
-  split_bomb: 1000,
-  split_flush_straight: 700,
-  split_straight: 400,
-  split_group: 250,
-  split_pair: 180,
-};
+function leadControlExposureFactor(hand, level) {
+  if (!hand || isBombType(hand)) return 0;
+  if (isPremiumNonBombControl(hand, level)) return 1;
+  if (![HandType.SINGLE, HandType.PAIR, HandType.TRIPLE].includes(hand.type)) return 0;
+  if (hand.power >= 14) return 0.45;
+  if (hand.power >= 12) return 0.2;
+  return 0;
+}
 
 function responseDamage(play, level) {
+  return strategicResponseDamage(play, level);
+}
+
+function hardResponseDamage(play, level) {
   const tags = play.strategy?.tags || [];
-  let damage = tags.reduce((sum, tag) => sum + (RESPONSE_DAMAGE_WEIGHT[tag] || 0), 0);
+  let damage = Number(tags.includes('split_bomb')) * RESPONSE_DAMAGE_WEIGHT.split_bomb
+    + Number(tags.includes('split_flush_straight'))
+      * RESPONSE_DAMAGE_WEIGHT.split_flush_straight
+    + Number(tags.includes('split_straight')) * RESPONSE_DAMAGE_WEIGHT.split_straight;
   if (!isBombType(play.hand) && play.cards.some((card) => isWild(card, level))) damage += 450;
   if (!isBombType(play.hand)) {
     damage += play.cards.filter((card) => isJoker(card)).length * 160;
@@ -873,11 +1394,72 @@ function responseDamage(play, level) {
   return damage;
 }
 
+/**
+ * 连续走单压力已经成立时，不再让“结构分低于阈值就过牌”的硬门覆盖防守。
+ * 候选仍严格遵循：独立单张优先，其次结构损失更小的拆牌，并使用最小充分点数；
+ * 拆炸弹/拆同花顺的候选不会获得 stop_single_run 标签，因而不会被这里强选。
+ */
+function selectSingleRunBlock(scored, level) {
+  return scored
+    .filter((play) => play.hand?.type === HandType.SINGLE
+      && !isBombType(play.hand)
+      && play.strategy?.tags?.includes('stop_single_run'))
+    .sort((a, b) => (
+      responseDamage(a, level) - responseDamage(b, level)
+      || a.hand.power - b.hand.power
+      || b.score - a.score
+    ))[0] || null;
+}
+
+/** 共享策略核心已确认无结构代价后，仍按损伤与最小充分点数稳定选牌。 */
+function selectTaggedSafeControl(scored, tag, level) {
+  return scored
+    .filter((play) => !isBombType(play.hand)
+      && play.strategy?.tags?.includes(tag))
+    .sort((a, b) => (
+      responseDamage(a, level) - responseDamage(b, level)
+      || a.hand.power - b.hand.power
+      || b.score - a.score
+    ))[0] || null;
+}
+
+/**
+ * P3 搭档协同 2.0：只有公开模型显示下家很可能接走对家的牌，并且一张
+ * 不拆结构、不动逢人配/王的普通牌能显著降低该概率时才抬牌。它替代
+ * “下家一短就机械压队友”的旧规则，不推断任何暗牌。
+ */
+function selectPartnerProtection(scored, ctx, level) {
+  if (!ctx.beatModel || !ctx.lastHand || isBombType(ctx.lastHand)) return null;
+  const candidates = scored
+    .filter((play) => !isBombType(play.hand)
+      && responseDamage(play, level) === 0
+      && !ordinaryResponseTooCostly(play)
+      && !isPremiumNonBombControl(play.hand, level)
+      && !play.cards.some((card) => isWild(card, level) || isJoker(card)))
+    .map((play) => ({
+      play,
+      signal: publicPartnerProtectionValue(play, ctx, ctx.beatModel),
+    }))
+    .filter((item) => item.signal?.eligible)
+    .sort((left, right) => (
+      right.signal.reduction - left.signal.reduction
+      || left.play.hand.power - right.play.hand.power
+      || right.play.score - left.play.score
+    ));
+  if (!candidates.length) return null;
+  const selected = candidates[0].play;
+  selected.partnerProtection = candidates[0].signal;
+  selected.riskReductionPercent = Math.round(candidates[0].signal.reduction * 100);
+  return selected;
+}
+
 function hasUrgentStrategy(play) {
   const tags = play.strategy?.tags || [];
   return !!play.strategy?.createsTwoStepFinish
     || tags.some((tag) => [
       'stop_single_run', 'stop_opponent_run', 'bomb_escort', 'timely_bomb',
+      'cheap_control_take', 'partner_cover', 'double_up_block', 'avoid_double_down',
+      'urgent_ordinary_block',
     ].includes(tag));
 }
 
@@ -894,50 +1476,32 @@ function enemyWithin(ctx, maximum) {
  * 普通接牌先比较结构损伤等级，再使用最小充分点数。明确残局拦截、护送或
  * 两手收官仍服从总策略分，不受该常规排序限制。
  */
-function compareSafeBeatCandidates(a, b, mode, ctx, level) {
-  if (mode === 'beat'
-    && !enemyWithin(ctx, 4)
-    && !isBombType(a.hand)
-    && !isBombType(b.hand)
-    && a.hand.type === b.hand.type
-    && !hasUrgentStrategy(a)
-    && !hasUrgentStrategy(b)) {
-    const damageDifference = responseDamage(a, level) - responseDamage(b, level);
-    if (damageDifference) return damageDifference;
-    if (a.hand.power !== b.hand.power) return a.hand.power - b.hand.power;
-    return 0;
-  }
-  return null;
+function rankedSafetyScore(play, mode, ctx, level) {
+  if (mode !== 'beat' || enemyWithin(ctx, 4)
+    || isBombType(play.hand) || hasUrgentStrategy(play)) return play.score;
+  const hardDamage = hardResponseDamage(play, level);
+  const softDamage = Math.max(0, responseDamage(play, level) - hardDamage);
+  // 使用单一标量键，避免“同型按结构、跨型按总分”形成非传递比较器。
+  // 这里只做温和安全校正；主要结构代价仍来自统一策略核心，避免重复重罚。
+  return play.score - hardDamage * 0.25 - Math.min(24, softDamage * 0.1);
 }
 
 function compareRankedPlays(a, b, mode, ctx, level) {
-  const safeOrder = compareSafeBeatCandidates(a, b, mode, ctx, level);
-  return safeOrder == null ? b.score - a.score : safeOrder || b.score - a.score;
-}
-
-/**
- * beam search 只展开有限候选。先后各归整一次同型候选，确保未展开标记不会
- * 把同组里更伤结构的出法重新顶到前面。
- */
-function normalizeSafeBeatGroups(scored, mode, ctx, level) {
-  if (mode !== 'beat' || enemyWithin(ctx, 4)) return;
-  const positionsByType = new Map();
-  for (let index = 0; index < scored.length; index++) {
-    const play = scored[index];
-    if (isBombType(play.hand) || hasUrgentStrategy(play)) continue;
-    if (!positionsByType.has(play.hand.type)) positionsByType.set(play.hand.type, []);
-    positionsByType.get(play.hand.type).push(index);
-  }
-  for (const positions of positionsByType.values()) {
-    if (positions.length < 2) continue;
-    const group = positions.map((index) => scored[index]).sort((a, b) => {
-      const safeOrder = compareSafeBeatCandidates(a, b, mode, ctx, level);
-      if (safeOrder) return safeOrder;
-      const searchedDifference = Number(!!b.lookAhead) - Number(!!a.lookAhead);
-      return searchedDifference || b.score - a.score;
-    });
-    positions.forEach((position, index) => { scored[position] = group[index]; });
-  }
+  const scoreDifference = rankedSafetyScore(b, mode, ctx, level)
+    - rankedSafetyScore(a, mode, ctx, level);
+  if (scoreDifference) return scoreDifference;
+  // 后续键对所有牌型一视同仁，形成稳定的全序；旧实现只在同牌型时比较
+  // 点数/损伤，可能出现 A~B、B~C 但 A<C 的非传递等价关系。
+  const damageDifference = responseDamage(a, level) - responseDamage(b, level);
+  if (damageDifference) return damageDifference;
+  const resourceDifference = playResourcePower(a.hand) - playResourcePower(b.hand);
+  if (resourceDifference) return resourceDifference;
+  if (a.cards.length !== b.cards.length) return b.cards.length - a.cards.length;
+  const typeDifference = String(a.hand.type).localeCompare(String(b.hand.type));
+  if (typeDifference) return typeDifference;
+  const powerDifference = (Number(a.hand.power) || 0) - (Number(b.hand.power) || 0);
+  if (powerDifference) return powerDifference;
+  return cardsKey(a.cards).localeCompare(cardsKey(b.cards));
 }
 
 function ordinaryResponseTooCostly(play) {
@@ -1039,17 +1603,16 @@ function rankPlays(plays, mode, hand, level, ctx, c, search) {
       : scoreBeat(play, hand, level, ctx, c, search, beforeStructure);
     return { ...play, score };
   }).sort((a, b) => compareRankedPlays(a, b, mode, ctx, level));
-  normalizeSafeBeatGroups(scored, mode, ctx, level);
 
   if (c.lookAhead && scored.length > 1) {
     applyLookAhead(scored, hand, level, search, c, ctx, mode);
-    // 困难模式采用 beam search：最终主选来自已完成前瞻的候选，未展开项仍保留作兜底。
-    scored.sort((a, b) => {
-      const aSearched = a.lookAhead ? 1 : 0;
-      const bSearched = b.lookAhead ? 1 : 0;
-      return bSearched - aSearched || compareRankedPlays(a, b, mode, ctx, level);
-    });
-    normalizeSafeBeatGroups(scored, mode, ctx, level);
+    // 未展开候选只承担小幅不确定性折价。过去把所有已搜索项硬排在未搜索项
+    // 之前，会让一个前瞻后已经明显变差的候选仍压住统一评分更高的安全路线。
+    const fallbackPenalty = c.difficulty === 'master' ? 6 : 4;
+    for (const play of scored) {
+      if (!play.lookAhead) play.score -= fallbackPenalty;
+    }
+    scored.sort((a, b) => compareRankedPlays(a, b, mode, ctx, level));
   }
   return scored;
 }
@@ -1077,7 +1640,7 @@ function scoreLead(play, hand, level, ctx, c, search, beforeStructure) {
     || play.strategy?.productiveRestructure
     || safeLongCombination
     ? 0
-    : 1;
+    : sharedStructureDamage ? 0.45 : 1;
   score -= splitPenalty(hand, play.cards, level, search, beforeStructure)
     * 15 * c.structureWeight * splitWeight;
   score -= play.cards.filter((card) => isWild(card, level)).length * c.wildPenalty;
@@ -1090,13 +1653,13 @@ function scoreLead(play, hand, level, ctx, c, search, beforeStructure) {
     score += 12;
   }
 
-  // P0 记牌器：仅当领出极大概率（默认 >=0.8）被对手接掉时才压低该领法；
-  // 中盘普通领法的可接概率普遍偏高，广谱惩罚只会变成近似常量噪声。
+  // P0 记牌器只衡量“高控制牌打空”的代价。低牌本来就用于试探和清理，
+  // 若仅因容易被接就扣分，会反向鼓励先打大牌、最后单吊小牌。
   if (policyFeatureActive(ctx, 'p0') && remain > 0 && !isBombType(h)) {
     const risk = candidateBeatRisk(play, ctx);
-    if (risk >= policyThreshold(ctx, 'p0LeadGate', 0.8)) {
-      score -= risk * c.leadBeatRiskPenalty
-        * (isPremiumNonBombControl(h, level) ? 3 : 1)
+    const exposure = leadControlExposureFactor(h, level);
+    if (exposure > 0 && risk >= policyThreshold(ctx, 'p0LeadGate', 0.8)) {
+      score -= risk * c.controlLeadRiskPenalty * exposure
         * policyThreshold(ctx, 'p0LeadScale', 1);
     }
   }
@@ -1125,7 +1688,7 @@ function scoreBeat(play, hand, level, ctx, c, search, beforeStructure) {
     || play.strategy?.productiveRestructure
     || safeLongCombination
     ? 0
-    : conditionalSingleBlock ? 0.18 : 1;
+    : conditionalSingleBlock ? 0.12 : sharedStructureDamage ? 0.4 : 1;
   score -= splitPenalty(hand, play.cards, level, search, beforeStructure)
     * 20 * c.structureWeight * splitWeight;
   score -= play.cards.filter((card) => isWild(card, level)).length * c.wildPenalty;
@@ -1137,24 +1700,6 @@ function scoreBeat(play, hand, level, ctx, c, search, beforeStructure) {
     && enemyAboutToWin(ctx.handCounts, ctx.seat, ctx.teams, ctx.finishOrder)) {
     score += 80;
     if (isBombType(h)) score += 60;
-  }
-
-  // P0 记牌器：普通接法仅在极大概率（默认 >=0.75）被压回时惩罚先消耗的控制牌；
-  // 收官、护送或紧急拦截不受此惩罚。
-  if (policyFeatureActive(ctx, 'p0') && remain > 0 && !isBombType(h)
-    && !(ctx.handCounts
-      && enemyAboutToWin(ctx.handCounts, ctx.seat, ctx.teams, ctx.finishOrder))
-    && !play.strategy?.createsTwoStepFinish
-    && !(play.strategy?.tags || []).some((tag) => [
-      'stop_opponent_run', 'stop_single_run', 'timely_bomb', 'bomb_escort',
-      'public_finish_block',
-    ].includes(tag))) {
-    const risk = candidateBeatRisk(play, ctx);
-    if (risk >= policyThreshold(ctx, 'p0BeatGate', 0.75)) {
-      const controlFactor = isPremiumNonBombControl(h, level) ? 1.6 : h.power >= 12 ? 1.2 : 0.6;
-      score -= risk * c.beatBackRiskPenalty * controlFactor
-        * policyThreshold(ctx, 'p0BeatScale', 1);
-    }
   }
 
   score += strategyScore;
@@ -1192,6 +1737,292 @@ function structureBonus(hand, level, search) {
     bonus -= fastTrickEstimate(hand, level, search).tricks * 4;
     return bonus;
   });
+}
+
+function responsePlacementWeights(ctx, c, level, ownRemaining) {
+  const seat = ctx.seat;
+  const partnerSeat = (seat + 2) % 4;
+  const partnerFinished = (ctx.finishOrder || []).includes(partnerSeat);
+  const partnerCount = partnerFinished ? 0 : (ctx.handCounts?.[partnerSeat] ?? 99);
+  const headSeat = ctx.finishOrder?.[0];
+  const ownTeam = ctx.teams?.[seat];
+  const headIsPartner = headSeat != null && ctx.teams?.[headSeat] === ownTeam;
+  const headIsEnemy = headSeat != null && ctx.teams?.[headSeat] !== ownTeam;
+  let selfControl = ownRemaining <= 2 ? 34
+    : ownRemaining <= 5 ? 25
+      : ownRemaining <= 8 ? 17 : 10;
+  let partnerControl = partnerFinished ? 4
+    : partnerCount <= 2 ? 31
+      : partnerCount <= 5 ? 23
+        : partnerCount <= 8 ? 15 : 8;
+  let enemyControlLoss = controlLossPenalty(null, ctx, c, level);
+  if (headIsPartner) {
+    // 对家已经头游：自己的牌权直接决定双上/头三，团队升级价值提高。
+    selfControl += 16;
+    enemyControlLoss += 10;
+  } else if (headIsEnemy) {
+    // 对手已经头游：当前目标转为阻止双下并争取三游。
+    selfControl += 8;
+    partnerControl += 6;
+    enemyControlLoss += 14;
+  }
+  return {
+    selfControl,
+    partnerControl,
+    enemyControlLoss,
+    enemyBombBurn: (ctx.publicModel?.activeEnemyMin ?? 99) <= 6 ? 4 : 7,
+  };
+}
+
+function applyPublicResponseSearch(projections, hand, level, search, c, ctx, mode) {
+  if (!policyFeatureActive(ctx, 'p1')
+    || !policyFeatureActive(ctx, 'p1ResponseSearch')
+    || !ctx.beatModel
+    || c.responseSearchRootLimit <= 0) return false;
+  // 只在同一“安全普通接法”层内比较控权。若把王、逢人配、拆炸候选也放进
+  // 同一均值，它们的高控权会给所有正常小牌附加负税，最终反而诱发整轮过牌。
+  const candidates = projections
+    .filter(({ play }) => !isBombType(play.hand)
+      && responseDamage(play, level) === 0
+      && !ordinaryResponseTooCostly(play))
+    .slice(0, c.responseSearchRootLimit);
+  if (candidates.length < 2) return false;
+
+  const evaluations = [];
+  for (const item of candidates) {
+    if (ctx.searchDeadlineMs != null && monotonicNow() >= ctx.searchDeadlineMs) {
+      search.responseSearch = { evaluated: 0, timedOut: true };
+      return false;
+    }
+    const ownRemaining = hand.length - item.play.cards.length;
+    const response = evaluatePublicResponseTree(item.play, ctx, ctx.beatModel, {
+      ownRemaining,
+    });
+    if (!response) continue;
+    const weights = responsePlacementWeights(ctx, c, level, ownRemaining);
+    const expectedUtility = response.selfControl * weights.selfControl
+      + response.partnerControl * weights.partnerControl
+      - response.enemyControl * weights.enemyControlLoss
+      + response.enemyBomb * weights.enemyBombBurn;
+    evaluations.push({ ...item, response, weights, expectedUtility });
+  }
+  if (evaluations.length < 2) return false;
+  const values = evaluations.map((item) => item.expectedUtility);
+  const averageUtility = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const spread = Math.max(...values) - Math.min(...values);
+  const lossScale = Math.max(1, controlLossPenalty(null, ctx, c, level));
+  const normalizedSpread = spread / lossScale;
+  if (normalizedSpread < policyThreshold(ctx, 'p1SpreadFloor', 0.04)) return false;
+
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  const partnerSeat = (ctx.seat + 2) % 4;
+  const partnerCount = (ctx.finishOrder || []).includes(partnerSeat)
+    ? 0 : (ctx.handCounts?.[partnerSeat] ?? 99);
+  const ownBestRemaining = Math.min(...evaluations.map((item) => (
+    hand.length - item.play.cards.length
+  )));
+  // 领出时降低控权项幅度，防止重新退化成“先打A/王”；残局、送对家和接牌
+  // 才放大应手树。基础结构分与 P0 惜大牌仍然完整保留。
+  const urgentControl = activeEnemyMin <= 6 || partnerCount <= 3
+    || ownBestRemaining <= 6 || (ctx.finishOrder || []).length > 0;
+  const modeScale = mode === 'beat'
+    ? (urgentControl ? 1 : 0.12)
+    : (urgentControl ? 0.62 : 0.28);
+  const featureScale = policyThreshold(ctx, 'p1LossScale', 1);
+  const maxAdjustment = c.responseSearchMaxAdjustment * modeScale * featureScale;
+  for (const item of evaluations) {
+    const relative = Math.max(-maxAdjustment, Math.min(
+      maxAdjustment,
+      (item.expectedUtility - averageUtility) * modeScale * featureScale,
+    ));
+    item.play.lookAhead.responseSearch = {
+      ...item.response,
+      expectedUtility: item.expectedUtility,
+      relativeAdjustment: relative,
+      depth: 1,
+    };
+    item.play.lookAhead.adjustment += relative;
+    item.play.score += relative;
+  }
+  search.responseSearch = {
+    evaluated: evaluations.length,
+    timedOut: false,
+    spread,
+  };
+  return true;
+}
+
+function applyPartnerCoordinationSearch(projections, hand, level, c, ctx, mode) {
+  if (!policyFeatureActive(ctx, 'p3') || mode !== 'lead' || !ctx.beatModel
+    || c.partnerSearchRootLimit <= 0) return false;
+  const partnerSeat = (ctx.seat + 2) % 4;
+  if ((ctx.finishOrder || []).includes(partnerSeat)) return false;
+  const partnerCount = ctx.handCounts?.[partnerSeat] ?? 99;
+  if (partnerCount <= 0 || partnerCount > 8) return false;
+  const candidates = projections
+    .filter(({ play }) => !isBombType(play.hand)
+      && play.cards.length <= partnerCount
+      && responseDamage(play, level) === 0
+      && !ordinaryResponseTooCostly(play))
+    .slice(0, c.partnerSearchRootLimit);
+  if (candidates.length < 2) return false;
+
+  const evaluated = [];
+  for (const item of candidates) {
+    if (ctx.searchDeadlineMs != null && monotonicNow() >= ctx.searchDeadlineMs) return false;
+    const response = evaluatePublicResponseTree(item.play, ctx, ctx.beatModel, {
+      ownRemaining: hand.length - item.play.cards.length,
+      includePartnerHandoff: true,
+    });
+    if (!response) continue;
+    // 只计团队交接的增量，不再重复 P1 已经计过的敌方失权与本家控权。
+    const sizeFit = Math.max(0, 1 - Math.abs(partnerCount - item.play.cards.length) / 8);
+    const utility = response.partnerControl
+      * (partnerCount <= 3 ? 58 : partnerCount <= 5 ? 44 : 28)
+      * (0.72 + sizeFit * 0.28);
+    evaluated.push({ ...item, response, utility });
+  }
+  if (evaluated.length < 2) return false;
+  const average = evaluated.reduce((sum, item) => sum + item.utility, 0) / evaluated.length;
+  const scale = policyThreshold(ctx, 'p3Scale', 1);
+  const cap = c.partnerSearchMaxAdjustment * scale;
+  for (const item of evaluated) {
+    const relative = Math.max(-cap, Math.min(cap, (item.utility - average) * scale));
+    item.play.lookAhead.partnerSearch = {
+      partnerControl: item.response.partnerControl,
+      directHandoff: item.response.branches?.partnerDirect || 0,
+      expectedUtility: item.utility,
+      relativeAdjustment: relative,
+    };
+    item.play.lookAhead.adjustment += relative;
+    item.play.score += relative;
+  }
+  return true;
+}
+
+function applyEndgameRolloutSearch(projections, hand, level, search, c, ctx) {
+  if (!policyFeatureActive(ctx, 'p4') || !ctx.beatModel
+    || c.rolloutRootLimit <= 0 || hand.length > 14) return false;
+  const partnerSeat = (ctx.seat + 2) % 4;
+  const partnerCount = (ctx.finishOrder || []).includes(partnerSeat)
+    ? 0 : (ctx.handCounts?.[partnerSeat] ?? 99);
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  const urgent = hand.length <= c.rolloutEndgameHand
+    || (hand.length <= 10 && (
+      activeEnemyMin <= 4
+      || partnerCount <= 3
+      || (ctx.finishOrder || []).length > 0
+    ));
+  if (!urgent) return false;
+
+  const candidates = projections
+    .filter(({ play }) => responseDamage(play, level) < RESPONSE_DAMAGE_WEIGHT.split_bomb)
+    .slice(0, c.rolloutRootLimit);
+  if (candidates.length < 2) return false;
+  const evaluated = [];
+  for (const item of candidates) {
+    if (ctx.searchDeadlineMs != null && monotonicNow() >= ctx.searchDeadlineMs) return false;
+    const remain = removeCards(hand, item.play.cards);
+    const rollout = evaluatePublicEndgameRollout(
+      item.play,
+      remain,
+      ctx,
+      ctx.beatModel,
+      {
+        branchLimit: c.rolloutBranchLimit,
+        nodeBudget: c.rolloutBranchLimit + 3,
+        deadlineMs: ctx.searchDeadlineMs,
+        cache: search.route,
+        baseRoute: {
+          estimatedTricks: item.play.lookAhead.projectedTricks,
+          loose: item.play.lookAhead.looseCards,
+          controlsSpent: item.play.lookAhead.controlsSpent,
+          bombsSpent: item.play.lookAhead.bombsSpent,
+          adjustment: 0,
+        },
+        includePartnerHandoff: policyFeatureActive(ctx, 'p3'),
+      },
+    );
+    // 任何根候选超时都丢弃整批 P4，不把半批结果写回排名。
+    if (rollout?.timedOut) {
+      search.endgameRollout = { evaluated: 0, timedOut: true };
+      return false;
+    }
+    if (rollout && Number.isFinite(rollout.expectedUtility)) {
+      evaluated.push({ ...item, rollout });
+    }
+  }
+  if (evaluated.length < 2) return false;
+  const average = evaluated.reduce(
+    (sum, item) => sum + item.rollout.expectedUtility,
+    0,
+  ) / evaluated.length;
+  const scale = policyThreshold(ctx, 'p4Scale', 0.82);
+  const cap = c.rolloutMaxAdjustment * scale;
+  for (const item of evaluated) {
+    const relative = Math.max(-cap, Math.min(
+      cap,
+      (item.rollout.expectedUtility - average) * 0.55 * scale,
+    ));
+    item.play.lookAhead.endgameRollout = {
+      expectedUtility: item.rollout.expectedUtility,
+      selfContinuation: item.rollout.selfContinuation,
+      teamControl: item.rollout.first?.teamControl ?? null,
+      bestNext: item.rollout.bestNext,
+      nodes: item.rollout.nodes,
+      depth: item.rollout.depth,
+      relativeAdjustment: relative,
+    };
+    item.play.lookAhead.adjustment += relative;
+    item.play.score += relative;
+  }
+  search.endgameRollout = { evaluated: evaluated.length, timedOut: false };
+  return true;
+}
+
+export function calibratePolicyFusionValues(components, cap) {
+  if (!Array.isArray(components) || !components.length) return [];
+  const safeCap = Math.max(1, Number(cap) || 1);
+  const values = components.map((item) => safeCap * Math.tanh((
+    (Number(item?.p1) || 0)
+    + (Number(item?.p3) || 0) * 0.86
+    + (Number(item?.p4) || 0) * 0.9
+  ) / safeCap));
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return values.map((value) => value - mean);
+}
+
+/**
+ * P5 置信融合：P1/P3/P4 都描述牌权，直接相加会重复计分。先保留各模块
+ * 独立输出，再用有界函数合并并重新中心化；no-p5 可恢复原始相加做消融。
+ */
+function applyPolicyFusionCalibration(projections, c, ctx) {
+  if (!policyFeatureActive(ctx, 'p5') || c.policyFusionCap <= 0) return false;
+  const rows = projections.map(({ play }) => {
+    const p1 = play.lookAhead?.responseSearch?.relativeAdjustment || 0;
+    const p3 = play.lookAhead?.partnerSearch?.relativeAdjustment || 0;
+    const p4 = play.lookAhead?.endgameRollout?.relativeAdjustment || 0;
+    return { play, raw: p1 + p3 + p4, p1, p3, p4 };
+  }).filter((item) => Math.abs(item.raw) > 1e-9);
+  if (rows.length < 2) return false;
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  const urgencyScale = activeEnemyMin <= 5 || (ctx.finishOrder || []).length > 0 ? 1 : 0.78;
+  const cap = Math.max(8, policyThreshold(ctx, 'p5FusionCap', c.policyFusionCap))
+    * urgencyScale;
+  const calibratedValues = calibratePolicyFusionValues(rows, cap);
+  for (const [index, item] of rows.entries()) {
+    const calibrated = calibratedValues[index];
+    const delta = calibrated - item.raw;
+    item.play.score += delta;
+    item.play.lookAhead.adjustment += delta;
+    item.play.lookAhead.policyFusion = {
+      rawAdjustment: item.raw,
+      calibratedAdjustment: calibrated,
+      cap,
+      components: { p1: item.p1, p3: item.p3, p4: item.p4 },
+    };
+  }
+  return true;
 }
 
 /**
@@ -1248,30 +2079,69 @@ function applyLookAhead(scored, hand, level, search, c, ctx, mode) {
 
   if (!projections.length) return;
   const averageCost = projections.reduce((sum, item) => sum + item.cost, 0) / projections.length;
-  // P1 控权期望：只在 expert（A/B 对照组 baseline 关闭）与已建可接模型时启用。
-  // 仅作用于接牌模式：领出时"难被接"的强牌更该保留（惜大打小），
-  // 用 p 奖励强领会与既有领出策略冲突。
-  const controlEnabled = policyFeatureActive(ctx, 'p1') && !!ctx.beatModel
-    && c.controlLossBase > 0 && mode === 'beat';
   for (const { play, cost } of projections) {
     // 以候选均值为中心，既奖励更短的收尾路线，也惩罚明显拖长手数的路线。
     const routeAdjustment = (averageCost - cost) * 1.35;
+    play.lookAhead.adjustment = routeAdjustment;
+    play.score += routeAdjustment;
+  }
+
+  // P1-P4 都先保留独立分量，再由 P5 对相关的牌权分做有界融合。任一超时
+  // 模块只回退自己，已经完成的更浅层结果仍然有效。
+  const p1Applied = applyPublicResponseSearch(projections, hand, level, search, c, ctx, mode);
+  applyPartnerCoordinationSearch(projections, hand, level, c, ctx, mode);
+  applyEndgameRolloutSearch(projections, hand, level, search, c, ctx);
+  applyPolicyFusionCalibration(projections, c, ctx);
+  if (p1Applied || policyFeatureActive(ctx, 'p1ResponseSearch')) return;
+
+  // P1 控权期望：只在 expert（A/B 对照组 baseline 关闭）与已建可接模型时启用。
+  // 仅作用于接牌模式：领出时"难被接"的强牌更该保留（惜大打小），
+  // 用 p 奖励强领会与既有领出策略冲突。
+  const controlCandidates = projections.filter(({ play }) => !isBombType(play.hand));
+  const controlRisks = new Map(controlCandidates.map(({ play }) => [
+    play,
+    candidateBeatRisk(play, ctx),
+  ]));
+  const averageRisk = controlRisks.size
+    ? [...controlRisks.values()].reduce((sum, value) => sum + value, 0) / controlRisks.size
+    : 0;
+  const maximumRisk = controlRisks.size ? Math.max(...controlRisks.values()) : 0;
+  const minimumRisk = controlRisks.size ? Math.min(...controlRisks.values()) : 0;
+  const riskSpread = maximumRisk - minimumRisk;
+  const minimumProjectedTricks = controlCandidates.length
+    ? Math.min(...controlCandidates.map(({ play }) => play.lookAhead?.projectedTricks ?? 99))
+    : 99;
+  const activeEnemyMin = ctx.publicModel?.activeEnemyMin ?? 99;
+  const controlContext = activeEnemyMin <= 8 || minimumProjectedTricks <= 2;
+  const spreadFloor = policyThreshold(ctx, 'p1SpreadFloor', 0.04);
+  const controlSignal = Math.max(0, Math.min(1,
+    (riskSpread - spreadFloor) / Math.max(0.1, 0.4 - spreadFloor),
+  ));
+  const enemyUrgency = Math.max(0, Math.min(1, (10 - activeEnemyMin) / 6));
+  const routeUrgency = minimumProjectedTricks <= 2 ? 0.5 : 0;
+  const controlUrgency = Math.max(enemyUrgency, routeUrgency);
+  const controlEnabled = policyFeatureActive(ctx, 'p1') && !!ctx.beatModel
+    && c.controlLossBase > 0 && mode === 'beat' && controlContext
+    && controlSignal > 0;
+  // 所有候选使用同一个损失尺度，确保 sum(avgRisk - pLose) 严格为0；
+  // 旧实现按候选是否为高控制牌改变尺度，会重新给整组候选附加净奖惩。
+  const commonControlScale = Math.min(32,
+    controlLossPenalty(null, ctx, c, level) * 0.75
+      * policyThreshold(ctx, 'p1LossScale', 1));
+  for (const { play, cost } of projections) {
     if (controlEnabled && !isBombType(play.hand)) {
-      // EV = -C - p·L：p 为另一名对手同型压回（我方丢权）的联集概率；
-      // 只有 (1-p) 概率能保持牌权兑现路线优势，否则承受丢权损失 L。
-      // 仅当被压回风险极高时才覆盖原均值折减，避免广谱缩水变成噪声。
-      const pLose = candidateBeatRisk(play, ctx);
-      const lossPenalty = controlLossPenalty(play, ctx, c, level)
-        * policyThreshold(ctx, 'p1LossScale', 1);
-      play.lookAhead.adjustment = pLose >= policyThreshold(ctx, 'p1PLoseGate', 0.7)
-        ? controlEV(routeAdjustment, pLose, lossPenalty)
-        : routeAdjustment;
+      // P1 只比较同一候选集里的相对控权能力：风险高于均值的牌受罚，低于
+      // 均值的牌获奖，整体保持中心化，不再给整组候选附加“复杂度税”。
+      const pLose = controlRisks.get(play) ?? candidateBeatRisk(play, ctx);
+      const lossPenalty = commonControlScale;
+      const relativeControl = (averageRisk - pLose)
+        * commonControlScale * controlSignal * controlUrgency;
+      play.lookAhead.adjustment += relativeControl;
       play.lookAhead.pLose = pLose;
       play.lookAhead.lossPenalty = lossPenalty;
-    } else {
-      play.lookAhead.adjustment = routeAdjustment;
+      play.lookAhead.controlRelative = relativeControl;
+      play.score += relativeControl;
     }
-    play.score += play.lookAhead.adjustment;
   }
 }
 
@@ -1495,6 +2365,10 @@ function reasonForCandidate(candidate, mode, ctx) {
     return '对手已接近出完，用炸弹及时阻断';
   }
   if (candidate.lookAhead) {
+    if (candidate.lookAhead.responseSearch) {
+      const teamControl = Math.round(candidate.lookAhead.responseSearch.teamControl * 100);
+      return `公开应手搜索估计我方可保有牌权约 ${teamControl}%，前瞻后还需约 ${candidate.lookAhead.projectedTricks} 手`;
+    }
     return `前瞻后预计还需约 ${candidate.lookAhead.projectedTricks} 手，兼顾结构与关键资源`;
   }
   return mode === 'lead'
@@ -1525,12 +2399,12 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
     alternatives.push(alternative);
   }
   result.alternatives = alternatives;
-  result.candidates = selectDiverseCandidates(
-    ranked,
-    ctx.hand.length,
-    12,
-    6,
-  ).map((play, index) => ({
+  // 云端只需要少量多样候选；本地混合引擎则在专家已经完成打分的全部
+  // “规则生成候选”上先做安全筛选，不能沿用云端的三选一窄瓶颈。
+  const consultationPlays = ctx.decisionEngine === 'hybrid'
+    ? ranked
+    : selectDiverseCandidates(ranked, ctx.hand.length, 24, 10);
+  result.candidates = consultationPlays.map((play, index) => ({
     id: `candidate_${index}`,
     action: 'play',
     cards: play.cards.map((card) => ({
@@ -1546,6 +2420,33 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
     } : null,
     signature: handSignature(play.hand),
     projectedTricks: play.lookAhead?.projectedTricks ?? null,
+    responseSearch: play.lookAhead?.responseSearch ? {
+      teamControl: play.lookAhead.responseSearch.teamControl,
+      selfControl: play.lookAhead.responseSearch.selfControl,
+      partnerControl: play.lookAhead.responseSearch.partnerControl,
+      enemyControl: play.lookAhead.responseSearch.enemyControl,
+      enemyBomb: play.lookAhead.responseSearch.enemyBomb,
+      expectedUtility: play.lookAhead.responseSearch.expectedUtility,
+      relativeAdjustment: play.lookAhead.responseSearch.relativeAdjustment,
+    } : null,
+    partnerSearch: play.lookAhead?.partnerSearch ? {
+      partnerControl: play.lookAhead.partnerSearch.partnerControl,
+      directHandoff: play.lookAhead.partnerSearch.directHandoff,
+      expectedUtility: play.lookAhead.partnerSearch.expectedUtility,
+      relativeAdjustment: play.lookAhead.partnerSearch.relativeAdjustment,
+    } : null,
+    endgameRollout: play.lookAhead?.endgameRollout ? {
+      expectedUtility: play.lookAhead.endgameRollout.expectedUtility,
+      teamControl: play.lookAhead.endgameRollout.teamControl,
+      bestNext: play.lookAhead.endgameRollout.bestNext,
+      nodes: play.lookAhead.endgameRollout.nodes,
+      relativeAdjustment: play.lookAhead.endgameRollout.relativeAdjustment,
+    } : null,
+    policyFusion: play.lookAhead?.policyFusion ? {
+      rawAdjustment: play.lookAhead.policyFusion.rawAdjustment,
+      calibratedAdjustment: play.lookAhead.policyFusion.calibratedAdjustment,
+      cap: play.lookAhead.policyFusion.cap,
+    } : null,
     routeTags: play.lookAhead?.routeTags || [],
     tags: play.strategy?.tags || [],
     localScore: Number.isFinite(play.score) ? Math.round(play.score * 10) / 10 : null,
@@ -1564,14 +2465,18 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
  * 为可选云端增强生成本地完整候选集。云端只能在这些合法候选中选择，
  * 因此无论模型输出什么，都不会绕过本地规则校验。
  */
-export function getAIConsultation(ctx) {
+export function getAIConsultation(ctx, options = {}) {
+  const startedAt = monotonicNow();
+  const deterministic = options.deterministic !== false;
+  const timeBudgetMs = Math.max(0, Number(options.timeBudgetMs ?? ctx?.timeBudgetMs) || 0);
   const consultation = chooseAIPlayInternal({
     ...ctx,
     policyProfile: ctx.policyProfile === 'baseline' ? 'baseline' : 'expert',
   }, {
     explain: true,
-    deterministic: true,
+    deterministic,
     difficulty: AI_DIFFICULTY[ctx?.difficulty] || _difficulty,
+    timeBudgetMs,
   });
   if (!consultation?.candidates?.length) return consultation;
   const localCandidate = consultation.candidates.find(
@@ -1588,23 +2493,72 @@ export function getAIConsultation(ctx) {
     && consultation.cards?.length === ctx.hand?.length;
   const hardTags = new Set([
     'stop_single_run', 'stop_opponent_run', 'public_finish_block',
-    'bomb_escort', 'timely_bomb',
+    'bomb_escort', 'timely_bomb', 'cheap_control_take', 'partner_cover',
+    'double_up_block', 'avoid_double_down', 'urgent_ordinary_block',
   ]);
   const localHasHardTag = (localCandidate.tags || []).some((tag) => hardTags.has(tag));
 
-  if (finishesNow) cloudConstraint = 'finish_now';
+  if (consultation.tacticalConstraint === 'team_finish_delay') {
+    cloudConstraint = 'team_finish_delay';
+  } else if (finishesNow) cloudConstraint = 'finish_now';
   else if (teammateLead && !emergencyPartnerBlock && consultation.action === 'pass') {
     cloudConstraint = 'yield_to_partner';
   } else if (emergencyPartnerBlock || localHasHardTag) {
     cloudConstraint = 'mandatory_block';
   }
 
+  const applyHybrid = (result) => {
+    if (ctx?.decisionEngine !== 'hybrid' || options.applyHybrid === false) return result;
+    try {
+      const deterministicSearch = deterministic || timeBudgetMs <= 0;
+      const deadlineMs = deterministicSearch
+        ? null
+        : startedAt + clampHybridBudget(timeBudgetMs);
+      const hybridInput = result.cloudConstraint === 'soft_rerank'
+        ? { ...result, candidates: consultation.candidates }
+        : result;
+      const hybrid = chooseHybridFromConsultation(ctx, hybridInput, {
+        candidateLimit: 6,
+        sampleCount: deterministicSearch ? 6 : timeBudgetMs >= 500 ? 8 : 4,
+        behaviorAttempts: 2,
+        maxPlies: timeBudgetMs >= 500 ? 120 : 88,
+        nodeBudget: deterministicSearch ? 3600 : timeBudgetMs >= 500 ? 5200 : 2400,
+        deadlineMs,
+      });
+      const decision = hybrid?.decision;
+      if (!decision?.action) return result;
+      const finalCandidateId = decision.hybrid?.finalCandidateId || result.localCandidateId;
+      let returnedCandidates = result.candidates || [];
+      if (finalCandidateId && !returnedCandidates.some((candidate) => candidate.id === finalCandidateId)) {
+        const selected = consultation.candidates.find((candidate) => candidate.id === finalCandidateId);
+        if (selected) returnedCandidates = [selected, ...returnedCandidates].slice(0, 3);
+      }
+      return {
+        ...result,
+        ...decision,
+        candidates: returnedCandidates,
+        localCandidateId: finalCandidateId,
+        hybrid: decision.hybrid || null,
+      };
+    } catch (error) {
+      return {
+        ...result,
+        hybrid: {
+          version: 1,
+          applied: false,
+          reason: 'hybrid_exception',
+          error: String(error?.message || error).slice(0, 120),
+        },
+      };
+    }
+  };
+
   if (cloudConstraint !== 'soft_rerank') {
-    return {
+    return applyHybrid({
       ...consultation,
       candidates: [localCandidate],
       cloudConstraint,
-    };
+    });
   }
   // CodingPlan/兼容网关对候选数量和提示长度较敏感。云端只负责在本地
   // 已经筛过的安全路线中做轻量重排，不需要重复接收完整候选池；保留
@@ -1632,7 +2586,12 @@ export function getAIConsultation(ctx) {
     if (cloudCandidates.length >= 3) break;
     addCandidate(candidate);
   }
-  return { ...consultation, candidates: cloudCandidates };
+  return applyHybrid({ ...consultation, candidates: cloudCandidates, cloudConstraint });
+}
+
+function clampHybridBudget(timeBudgetMs) {
+  const budget = Number(timeBudgetMs) || 250;
+  return Math.max(400, Math.min(1200, budget * 2));
 }
 
 /** 教练推荐：用确定性的“大师”策略给出主选、理由与最多三个备选。 */

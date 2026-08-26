@@ -34,6 +34,13 @@
             <option value="master">大师</option>
           </select>
         </label>
+        <label class="setting-inline" title="混合搜索只在大师难度的关键残局启用；失败或超时自动回退专家策略">
+          本地引擎
+          <select id="selLocalEngine" aria-label="本地AI决策引擎">
+            <option value="expert" selected>专家策略</option>
+            <option value="hybrid">混合搜索（实验）</option>
+          </select>
+        </label>
         <label class="setting-inline" title="AI 出牌速度">
           速度
           <select id="selSpeed" aria-label="AI速度">
@@ -231,6 +238,7 @@
         <h4>训练功能</h4>
         <ul>
           <li><strong>难度</strong>：简单 / 普通 / 困难 / 大师。大师模式强化公开牌史记忆、牌型规划、搭档配合与残局控制，不读取其他玩家未公开手牌。</li>
+          <li><strong>本地引擎</strong>：专家策略为稳定默认；混合搜索仅在大师关键残局中，对未知牌做合规假想发牌并模拟候选，任何超时、采样不一致或模型缺失都会安全回退。假想牌面不是读取真实暗牌。</li>
           <li><strong>AI策略</strong>：本地 AI 默认离线；智能增强仅在关键/有歧义回合请求云端。超时、429、5xx 和网络波动只回退当前手并自动重试；密钥、模型或协议错误才转为全场景本地 AI。</li>
           <li><strong>云端隐私</strong>：每次仅发送当前电脑玩家自己的手牌、合法候选和公开牌史，不发送其他玩家暗牌；但整局多次调用可能让第三方服务累计看到多名电脑玩家手牌，请同时遵守所选 API 服务商的数据保留政策。</li>
           <li><strong>教练模式</strong>：轮到你时给出推荐出法（按困难 AI 思路）。</li>

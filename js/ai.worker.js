@@ -4,12 +4,16 @@
  * Node 单测/A-B 没有 window，一律走客户端同步回退，行为不变。
  */
 import { chooseAIPlay } from './ai.js';
+import { configureHybridValueModel } from './ai-hybrid.js';
+import { createPublicAIObservation } from './ai-observation.js';
 
 self.onmessage = (event) => {
-  const { id, ctx } = event.data || {};
+  const { id, type = 'decision', ctx, model } = event.data || {};
   let payload;
   try {
-    payload = { id, ok: true, decision: chooseAIPlay(ctx) };
+    payload = type === 'configure-hybrid-model'
+      ? { id, ok: true, decision: configureHybridValueModel(model) }
+      : { id, ok: true, decision: chooseAIPlay(createPublicAIObservation(ctx)) };
   } catch (error) {
     payload = { id, ok: false, error: String(error?.message || error) };
   }

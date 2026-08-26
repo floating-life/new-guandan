@@ -68,9 +68,15 @@ function finish() {
     assert(replay?.trickLog?.length > 0, '复盘保存逐手时间线');
     assert(replay.trickLog.every((line) => line.turn && line.trickNumber && line.countsAfter), '每手保存圈号与剩余张数');
     assert(replay.trickLog.some((line) => line.seat === 0 && line.evaluation), '真人动作与评价一一关联');
+    assert(replay.trickLog.filter((line) => line.seat !== 0).every((line) => (
+      Number.isFinite(line.decisionMeta?.localDecision?.budgetMs)
+      && (line.decisionMeta.localDecision.latencyMs == null
+        || Number.isFinite(line.decisionMeta.localDecision.latencyMs))
+    )), '复盘逐手保存本地AI搜索预算与耗时，便于区分策略问题和超时降级');
     assert(replay.roundSummary?.dimensionAverages, '复盘保存五维总结');
     assert(replay.llmReport && Number.isFinite(replay.llmReport.cloudCalls)
       && Number.isFinite(replay.llmReport.successes), '复盘保存云端 API 调用报告');
+    assert(replay.localAiEngine === 'expert', '复盘保存本副使用的本地决策引擎');
     console.log(`\n结果: 完整一副 ${replay.trickLog.length} 手，回归通过`);
     process.exit(0);
   } catch (error) {

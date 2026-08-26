@@ -3,13 +3,14 @@
  *
  * 用法：
  *   node js/ai.ab.simulation.js [种子组数=30] [基础种子=20260801]
- *     [候选策略=expert] [对照策略=baseline]
+ *     [候选策略=expert] [对照策略=baseline] [--levels=all|2,3,...,A]
+ *     [--level-blocks] [--continuous-match] [--trace-divergence] [--summary-only]
  *
  * 每个种子发两次完全相同的牌：
  *   1. candidate 坐 0+2，comparison 坐 1+3；
  *   2. comparison 坐 0+2，candidate 坐 1+3。
  * 所有座位都通过 chooseAIPlay，以 master + deterministic 作出决定。
- * 可用策略：expert、baseline、no-p0、no-p1、no-p2、none。
+ * 可用策略还包括 no-control-v2 与五个 only-* 控制策略独立消融臂。
  */
 import { performance } from 'node:perf_hooks';
 
@@ -30,19 +31,35 @@ const {
   humanPlay,
   humanPass,
   humanSelectSet,
+  humanPickReturnCard,
+  humanConfirmReturn,
+  getReturnCandidates,
+  nextRound,
   setUpdateCallback,
+  setAIDecisionObserver,
   PHASE,
   TEAM_OF,
 } = await import('./game.js');
-const { chooseAIPlay, resolvePolicyVariant, AI_POLICY_VARIANTS } = await import('./ai.js');
+const {
+  chooseAIPlay, chooseReturnCard, resolvePolicyVariant, AI_POLICY_VARIANTS,
+} = await import('./ai.js');
 const { describeUpgrade, handSignature } = await import('./rules.js');
+const { sortHand } = await import('./cards.js');
 
 const groupCount = positiveInteger(process.argv[2], 30);
 const baseSeed = finiteUint32(process.argv[3], 20260801);
 const candidateName = policyVariantName(process.argv[4], 'expert');
 const comparisonName = policyVariantName(process.argv[5], 'baseline');
 const jsonOnly = process.argv.includes('--json');
-const MAX_ACTIONS = 2000;
+const evaluationLevels = parseEvaluationLevels(process.argv);
+const levelBlockDesign = process.argv.includes('--level-blocks');
+const continuousMatch = process.argv.includes('--continuous-match');
+const traceDivergence = process.argv.includes('--trace-divergence');
+// 大样本门禁只需要汇总量。省略逐副明细可显著降低子进程 JSON 序列化、
+// 内存复制和父进程解析成本，不改变任何对局或统计口径。
+const summaryOnly = process.argv.includes('--summary-only');
+const MAX_ACTIONS = continuousMatch ? 30_000 : 2000;
+const MAX_MATCH_ROUNDS = 80;
 const GAME_TIMEOUT_MS = 180_000;
 const CANDIDATE = resolvePolicyVariant(candidateName);
 const COMPARISON = resolvePolicyVariant(comparisonName);
@@ -68,6 +85,34 @@ function policyVariantName(value, fallback) {
     );
   }
   return name;
+}
+
+function parseEvaluationLevels(args) {
+  const flag = args.find((item) => String(item).startsWith('--levels='));
+  const raw = flag ? String(flag).slice('--levels='.length).trim() : 'all';
+  if (!raw || raw.toLowerCase() === 'all') {
+    return Array.from({ length: 13 }, (_, index) => index + 2);
+  }
+  const rank = (token) => {
+    const normalized = String(token).trim().toUpperCase();
+    if (normalized === 'A') return 14;
+    if (normalized === 'K') return 13;
+    if (normalized === 'Q') return 12;
+    if (normalized === 'J') return 11;
+    const value = Number(normalized);
+    return Number.isInteger(value) && value >= 2 && value <= 14 ? value : null;
+  };
+  const levels = [...new Set(raw.split(',').map(rank).filter(Number.isInteger))];
+  if (!levels.length) throw new Error(`无有效评测级牌：${raw}`);
+  return levels;
+}
+
+function forceEvaluationLevel(state, level) {
+  state.currentLevel = level;
+  state.levels = [level, level];
+  state.levelOwner = 0;
+  state.hands = state.hands.map((hand) => sortHand(hand, level));
+  state.handCounts = state.hands.map((hand) => hand.length);
 }
 
 function seededRandom(seed) {
@@ -152,7 +197,7 @@ function leadAfterOwnBomb(state, seat) {
 }
 
 /** AI 的白名单视图：只有自己的手牌和公开牌桌信息。 */
-function decisionView(run, seat) {
+function decisionView(run, seat, variant = run.variantBySeat[seat]) {
   const state = run.state;
   return {
     seat,
@@ -171,15 +216,134 @@ function decisionView(run, seat) {
     leadAfterOwnBomb: leadAfterOwnBomb(state, seat),
     difficulty: 'master',
     deterministic: true,
-    policyProfile: run.variantBySeat[seat].policyProfile,
-    policyFeatures: run.variantBySeat[seat].policyFeatures,
-    policyThresholds: run.variantBySeat[seat].policyThresholds,
+    policyProfile: variant.policyProfile,
+    policyFeatures: variant.policyFeatures,
+    policyThresholds: variant.policyThresholds,
+    decisionEngine: variant.decisionEngine,
+  };
+}
+
+function decisionKey(decision) {
+  if (!decision || decision.action === 'pass') return 'pass';
+  const cards = (decision.cards || []).map((card) => String(card.id)).sort().join(',');
+  return `play:${cards}|${decision.signature || handSignature(decision.hand)}`;
+}
+
+function compactDecision(decision) {
+  if (!decision) return { action: 'pass' };
+  const compact = {
+    action: decision.action === 'pass' ? 'pass' : 'play',
+    ...(decision.hybrid ? {
+      hybrid: {
+        applied: decision.hybrid.applied === true,
+        reason: decision.hybrid.reason || null,
+        localCandidateId: decision.hybrid.localCandidateId || null,
+        finalCandidateId: decision.hybrid.finalCandidateId || null,
+        changedDecision: decision.hybrid.changedDecision === true,
+        samples: Number(decision.hybrid.samples) || 0,
+        nodes: Number(decision.hybrid.nodes) || 0,
+        candidates: Array.isArray(decision.hybrid.candidates)
+          ? decision.hybrid.candidates.slice(0, 3) : [],
+      },
+    } : {}),
+  };
+  if (decision.action === 'pass') return compact;
+  return {
+    ...compact,
+    cards: (decision.cards || []).map((card) => String(card.id)).sort(),
+    hand: decision.hand ? {
+      type: decision.hand.type,
+      mainRank: decision.hand.mainRank,
+      size: decision.hand.size,
+      power: decision.hand.power,
+    } : null,
+    signature: decision.signature || handSignature(decision.hand),
+  };
+}
+
+function createHybridCounters() {
+  return {
+    turns: 0,
+    applied: 0,
+    changed: 0,
+    samples: 0,
+    nodes: 0,
+    reasons: {},
+    rejected: {},
+  };
+}
+
+function recordHybridDecision(run, decision) {
+  const hybrid = decision?.hybrid;
+  if (!hybrid || !run?.hybrid) return;
+  run.hybrid.turns += 1;
+  run.hybrid.applied += Number(hybrid.applied === true);
+  run.hybrid.changed += Number(hybrid.changedDecision === true);
+  run.hybrid.samples += Number(hybrid.samples) || 0;
+  run.hybrid.nodes += Number(hybrid.nodes) || 0;
+  const reason = String(hybrid.reason || 'unknown');
+  run.hybrid.reasons[reason] = (run.hybrid.reasons[reason] || 0) + 1;
+  const rejectionEntries = hybrid.rejectionSummary
+    ? Object.entries(hybrid.rejectionSummary)
+    : (hybrid.rejectedCandidates || []).map((item) => [item?.reason || 'unknown', 1]);
+  for (const [key, count] of rejectionEntries) {
+    const rejectedReason = String(key || 'unknown');
+    run.hybrid.rejected[rejectedReason] = (run.hybrid.rejected[rejectedReason] || 0)
+      + (Number(count) || 0);
+  }
+}
+
+/** 在完全相同的本家牌与公开信息上做影子策略比较，不执行影子动作。 */
+function traceFirstDivergence(run, seat, baseContext = null, actualDecision = null) {
+  if (!traceDivergence || run.firstDivergence) return;
+  const publicContext = baseContext || decisionView(run, seat);
+  const candidateDecision = chooseAIPlay({
+    ...publicContext,
+    deterministic: true,
+    timeBudgetMs: 0,
+    policyProfile: CANDIDATE.policyProfile,
+    policyFeatures: CANDIDATE.policyFeatures,
+    policyThresholds: CANDIDATE.policyThresholds,
+    decisionEngine: CANDIDATE.decisionEngine,
+  });
+  const comparisonDecision = chooseAIPlay({
+    ...publicContext,
+    deterministic: true,
+    timeBudgetMs: 0,
+    policyProfile: COMPARISON.policyProfile,
+    policyFeatures: COMPARISON.policyFeatures,
+    policyThresholds: COMPARISON.policyThresholds,
+    decisionEngine: COMPARISON.decisionEngine,
+  });
+  if (decisionKey(candidateDecision) === decisionKey(comparisonDecision)) return;
+  run.firstDivergence = {
+    round: run.state.round,
+    turn: run.state.trickLog.length + 1,
+    trickNumber: run.state.trickNumber,
+    seat,
+    level: run.state.currentLevel,
+    lastHand: publicContext.lastHand ? {
+      type: publicContext.lastHand.type,
+      mainRank: publicContext.lastHand.mainRank,
+      size: publicContext.lastHand.size,
+      power: publicContext.lastHand.power,
+    } : null,
+    lastSeat: publicContext.lastSeat,
+    handCounts: publicContext.handCounts.slice(0, 4),
+    publicActions: publicContext.publicHistory.length,
+    actualPolicy: run.variantBySeat[seat].name,
+    actual: compactDecision(actualDecision),
+    candidate: compactDecision(candidateDecision),
+    comparison: compactDecision(comparisonDecision),
   };
 }
 
 function playSeatZero(run) {
   const state = run.state;
-  const decision = chooseAIPlay(decisionView(run, 0));
+  const view = decisionView(run, 0);
+  const decision = chooseAIPlay(view);
+  recordHybridDecision(run, decision);
+  traceFirstDivergence(run, 0, view, decision);
   if (!decision) throw new Error('chooseAIPlay 在领出时没有返回出牌');
   if (decision.action === 'pass') {
     if (!state.lastHand) throw new Error('chooseAIPlay 在领出时错误地选择过牌');
@@ -197,11 +361,26 @@ function playSeatZero(run) {
   if (!result?.ok) throw new Error(result?.reason || '0号位出牌失败');
 }
 
+function handleReturn(state) {
+  const task = state.tributeState?.pendingReturns?.[0];
+  if (!task || task.from !== 0) return;
+  const candidates = getReturnCandidates(state);
+  if (!candidates.length) throw new Error('0号位没有可用还贡牌');
+  const preferred = chooseReturnCard(state.hands[0].slice(), state.currentLevel, {
+    toPartner: TEAM_OF[task.from] === TEAM_OF[task.to],
+  });
+  const card = candidates.find((item) => item.id === preferred?.id) || candidates[0];
+  const pick = humanPickReturnCard(state, card.id);
+  if (!pick?.ok) throw new Error(pick?.reason || '0号位选择还贡牌失败');
+  const confirm = humanConfirmReturn(state);
+  if (!confirm?.ok) throw new Error(confirm?.reason || '0号位确认还贡失败');
+}
+
 function dealFingerprint(state) {
   const hands = state.roundInitialHands || state.hands;
   return hands.map((hand) => hand.map((card) => (
     `${card.rank}:${card.suit}:${card.deckIndex}`
-  )).join(',')).join('|');
+  )).sort().join(',')).join('|');
 }
 
 function fallbackCount(state) {
@@ -210,6 +389,37 @@ function fallbackCount(state) {
     && typeof item.decisionMeta?.reason === 'string'
     && item.decisionMeta.reason.includes('兜底')
   )).length;
+}
+
+function recordCompletedRound(run) {
+  const state = run.state;
+  if (run.lastRecordedRound === state.round) return;
+  const order = state.finishOrder.slice();
+  if (order.length !== 4 || new Set(order).size !== 4) return;
+  const headTeam = TEAM_OF[order[0]];
+  const upgrade = describeUpgrade(order, (seat) => TEAM_OF[seat]).levels;
+  const aAttempt = state.currentLevel === 14;
+  const aPassed = aAttempt && state.phase === PHASE.MATCH_END;
+  const aFailed = aAttempt && !aPassed;
+  run.totalActions += state.trickLog.length;
+  run.totalFallbacks += fallbackCount(state);
+  run.roundResults.push({
+    round: state.round,
+    level: state.currentLevel,
+    levelsAfter: state.levels.slice(0, 2),
+    levelOwner: state.levelOwner,
+    order,
+    upgrade,
+    candidateUtility: headTeam === run.candidateTeam ? upgrade : -upgrade,
+    aFailCount: state.aFailCount.slice(0, 2),
+    aAttempt,
+    aPassed,
+    aFailed,
+    aReset: aFailed && state.aFailCount[state.levelOwner] === 0,
+    tribute: !!state.tributeState,
+    actions: state.trickLog.length,
+  });
+  run.lastRecordedRound = state.round;
 }
 
 function finishRun(run, result) {
@@ -231,7 +441,8 @@ function successfulResult(run) {
       durationMs: performance.now() - run.startedAt,
     };
   }
-  const fallbacks = fallbackCount(state);
+  recordCompletedRound(run);
+  const fallbacks = run.totalFallbacks;
   if (fallbacks > 0) {
     return {
       ok: false,
@@ -243,9 +454,48 @@ function successfulResult(run) {
   const headTeam = TEAM_OF[order[0]];
   const upgrade = describeUpgrade(order, (seat) => TEAM_OF[seat]).levels;
   const doubleUp = TEAM_OF[order[0]] === TEAM_OF[order[1]];
+  if (continuousMatch) {
+    if (state.phase !== PHASE.MATCH_END || ![0, 1].includes(state.winner)) {
+      return {
+        ok: false,
+        deadlock: false,
+        reason: '连续比赛未产生合法胜方',
+        durationMs: performance.now() - run.startedAt,
+      };
+    }
+    const candidateWon = state.winner === candidateTeam;
+    return {
+      ok: true,
+      seed: run.seed,
+      level: run.level,
+      candidateTeam,
+      order,
+      firstPlayer: run.firstPlayer,
+      dealFingerprint: run.dealFingerprint,
+      upgrade: 1,
+      utility: candidateWon ? 1 : -1,
+      candidateHead: candidateWon,
+      comparisonHead: !candidateWon,
+      baselineHead: !candidateWon,
+      candidateDoubleUp: false,
+      comparisonDoubleUp: false,
+      baselineDoubleUp: false,
+      matchWinner: state.winner,
+      rounds: run.roundResults.length,
+      roundUpgradeUtility: run.roundResults.reduce(
+        (sum, item) => sum + item.candidateUtility, 0,
+      ),
+      roundResults: run.roundResults,
+      firstDivergence: run.firstDivergence,
+      hybrid: run.hybrid,
+      actions: run.totalActions,
+      durationMs: performance.now() - run.startedAt,
+    };
+  }
   return {
     ok: true,
     seed: run.seed,
+    level: run.level,
     candidateTeam,
     order,
     firstPlayer: run.firstPlayer,
@@ -258,7 +508,9 @@ function successfulResult(run) {
     candidateDoubleUp: doubleUp && headTeam === candidateTeam,
     comparisonDoubleUp: doubleUp && headTeam !== candidateTeam,
     baselineDoubleUp: doubleUp && headTeam !== candidateTeam,
-    actions: state.trickLog.length,
+    firstDivergence: run.firstDivergence,
+    hybrid: run.hybrid,
+    actions: run.totalActions,
     durationMs: performance.now() - run.startedAt,
   };
 }
@@ -271,17 +523,31 @@ function pump() {
     try {
       if (!run) return;
       const state = run.state;
-      if (state.trickLog.length > MAX_ACTIONS) {
+      if (run.totalActions + state.trickLog.length > MAX_ACTIONS) {
         finishRun(run, {
           ok: false,
           deadlock: true,
           reason: `行动数超过 ${MAX_ACTIONS}`,
           durationMs: performance.now() - run.startedAt,
         });
+      } else if (state.phase === PHASE.RETURN) {
+        handleReturn(state);
       } else if (state.phase === PHASE.PLAYING
         && state.currentSeat === 0
         && !state.finishOrder.includes(0)) {
         playSeatZero(run);
+      } else if (state.phase === PHASE.ROUND_END && continuousMatch) {
+        recordCompletedRound(run);
+        if (run.roundResults.length >= MAX_MATCH_ROUNDS) {
+          finishRun(run, {
+            ok: false,
+            deadlock: true,
+            reason: `连续比赛超过 ${MAX_MATCH_ROUNDS} 副仍未结束`,
+            durationMs: performance.now() - run.startedAt,
+          });
+        } else {
+          nextRound(state);
+        }
       } else if (state.phase === PHASE.ROUND_END || state.phase === PHASE.MATCH_END) {
         finishRun(run, successfulResult(run));
       }
@@ -300,9 +566,15 @@ function pump() {
 }
 
 setUpdateCallback(pump);
+setAIDecisionObserver(({ seat, context, decision }) => {
+  if (activeRun) {
+    recordHybridDecision(activeRun, decision);
+    traceFirstDivergence(activeRun, seat, context, decision);
+  }
+});
 const heartbeat = globalThis.setInterval(pump, 5);
 
-async function playGame({ seed, candidateTeam }) {
+async function playGame({ seed, candidateTeam, level }) {
   Math.random = seededRandom(seed);
   const variantBySeat = TEAM_OF.map((team) => (
     team === candidateTeam ? CANDIDATE : COMPARISON
@@ -315,12 +587,17 @@ async function playGame({ seed, candidateTeam }) {
     aiDifficultyBySeat: ['master', 'master', 'master', 'master'],
     aiPolicyBySeat: variantBySeat.map((variant) => variant.policyProfile),
     aiPolicyFeaturesBySeat: variantBySeat.map((variant) => ({ ...variant.policyFeatures })),
+    aiPolicyThresholdsBySeat: variantBySeat.map((variant) => (
+      variant.policyThresholds ? { ...variant.policyThresholds } : null
+    )),
+    aiDecisionEngineBySeat: variantBySeat.map((variant) => variant.decisionEngine),
   });
 
   return new Promise((resolve) => {
     const run = {
       state,
       seed,
+      level,
       candidateTeam,
       variantBySeat,
       resolve,
@@ -329,6 +606,12 @@ async function playGame({ seed, candidateTeam }) {
       timeoutId: null,
       firstPlayer: null,
       dealFingerprint: null,
+      firstDivergence: null,
+      roundResults: [],
+      lastRecordedRound: 0,
+      totalActions: 0,
+      totalFallbacks: 0,
+      hybrid: createHybridCounters(),
     };
     activeRun = run;
     run.timeoutId = realSetTimeout(() => {
@@ -338,9 +621,12 @@ async function playGame({ seed, candidateTeam }) {
         reason: `超过 ${GAME_TIMEOUT_MS / 1000} 秒未结束`,
         durationMs: performance.now() - run.startedAt,
       });
-    }, GAME_TIMEOUT_MS);
+    }, continuousMatch ? GAME_TIMEOUT_MS * 3 : GAME_TIMEOUT_MS);
     try {
       startMatch(state);
+      // startMatch 的正式首局固定打2；评测在首个自动出牌微任务执行前切换级牌，
+      // 同一组镜像仍保留完全相同的牌面与先手，且不需要读取任何暗牌。
+      forceEvaluationLevel(state, level);
       run.firstPlayer = state.firstPlayer;
       run.dealFingerprint = dealFingerprint(state);
       pump();
@@ -406,68 +692,149 @@ const games = [];
 const pairs = [];
 const failures = [];
 const startedAt = performance.now();
+const plannedPairs = groupCount * (levelBlockDesign ? evaluationLevels.length : 1);
 
 try {
-  for (let index = 0; index < groupCount; index++) {
-    const seed = (baseSeed + index) >>> 0;
-    const candidateEven = await playGame({ seed, candidateTeam: 0 });
-    const candidateOdd = await playGame({ seed, candidateTeam: 1 });
-    games.push(candidateEven, candidateOdd);
+  let pairIndex = 0;
+  for (let blockIndex = 0; blockIndex < groupCount; blockIndex++) {
+    const seed = (baseSeed + blockIndex) >>> 0;
+    const levelsForSeed = levelBlockDesign
+      ? evaluationLevels
+      : [evaluationLevels[blockIndex % evaluationLevels.length]];
+    for (const level of levelsForSeed) {
+      pairIndex += 1;
+      const candidateEven = await playGame({ seed, candidateTeam: 0, level });
+      const candidateOdd = await playGame({ seed, candidateTeam: 1, level });
+      games.push(candidateEven, candidateOdd);
 
-    for (const [leg, result] of [
-      ['candidate-even', candidateEven],
-      ['candidate-odd', candidateOdd],
-    ]) {
-      if (!result.ok) failures.push({ group: index + 1, seed, leg, ...result });
-    }
+      for (const [leg, result] of [
+        ['candidate-even', candidateEven],
+        ['candidate-odd', candidateOdd],
+      ]) {
+        if (!result.ok) failures.push({
+          group: pairIndex, block: blockIndex + 1, seed, level, leg, ...result,
+        });
+      }
 
-    const mirrorMatched = candidateEven.ok
-      && candidateOdd.ok
-      && candidateEven.firstPlayer === candidateOdd.firstPlayer
-      && candidateEven.dealFingerprint === candidateOdd.dealFingerprint;
-    if (candidateEven.ok && candidateOdd.ok && !mirrorMatched) {
-      failures.push({
-        group: index + 1,
+      const mirrorMatched = candidateEven.ok
+        && candidateOdd.ok
+        && candidateEven.firstPlayer === candidateOdd.firstPlayer
+        && candidateEven.dealFingerprint === candidateOdd.dealFingerprint;
+      if (candidateEven.ok && candidateOdd.ok && !mirrorMatched) {
+        failures.push({
+          group: pairIndex,
+          block: blockIndex + 1,
+          seed,
+          level,
+          leg: 'mirror',
+          ok: false,
+          deadlock: false,
+          reason: '镜像两场的初始牌面或先手不一致',
+        });
+      }
+
+      pairs.push({
+        group: pairIndex,
+        block: blockIndex + 1,
         seed,
-        leg: 'mirror',
-        ok: false,
-        deadlock: false,
-        reason: '镜像两场的初始牌面或先手不一致',
+        level,
+        mirrorMatched,
+        crossLevelMatched: true,
+        dealFingerprint: candidateEven.dealFingerprint || candidateOdd.dealFingerprint || null,
+        complete: candidateEven.ok && candidateOdd.ok && mirrorMatched,
+        utility: candidateEven.ok && candidateOdd.ok
+          ? (candidateEven.utility + candidateOdd.utility) / 2
+          : null,
+        candidateHeads: Number(!!candidateEven.candidateHead)
+          + Number(!!candidateOdd.candidateHead),
+        candidateDoubleUps: Number(!!candidateEven.candidateDoubleUp)
+          + Number(!!candidateOdd.candidateDoubleUp),
+        comparisonDoubleUps: Number(!!candidateEven.comparisonDoubleUp)
+          + Number(!!candidateOdd.comparisonDoubleUp),
+        orders: [candidateEven.order || null, candidateOdd.order || null],
+        firstDivergences: [
+          candidateEven.firstDivergence || null,
+          candidateOdd.firstDivergence || null,
+        ],
       });
+      if (!jsonOnly) {
+        process.stdout.write(
+          `${pairIndex}/${plannedPairs}[${level === 14 ? 'A' : level}]:${candidateEven.ok ? candidateEven.utility : 'E'}`
+          + `,${candidateOdd.ok ? candidateOdd.utility : 'E'} `,
+        );
+      }
     }
-
-    pairs.push({
-      group: index + 1,
-      seed,
-      mirrorMatched,
-      complete: candidateEven.ok && candidateOdd.ok && mirrorMatched,
-      utility: candidateEven.ok && candidateOdd.ok
-        ? (candidateEven.utility + candidateOdd.utility) / 2
-        : null,
-      candidateHeads: Number(!!candidateEven.candidateHead) + Number(!!candidateOdd.candidateHead),
-      candidateDoubleUps: Number(!!candidateEven.candidateDoubleUp)
-        + Number(!!candidateOdd.candidateDoubleUp),
-      orders: [candidateEven.order || null, candidateOdd.order || null],
-    });
-    if (!jsonOnly) {
-      process.stdout.write(
-        `${index + 1}/${groupCount}:${candidateEven.ok ? candidateEven.utility : 'E'}`
-        + `,${candidateOdd.ok ? candidateOdd.utility : 'E'} `,
-      );
+    if (levelBlockDesign) {
+      const blockPairs = pairs.filter((pair) => pair.block === blockIndex + 1);
+      const fingerprints = new Set(blockPairs.map((pair) => pair.dealFingerprint).filter(Boolean));
+      if (fingerprints.size !== 1 || blockPairs.length !== evaluationLevels.length) {
+        for (const pair of blockPairs) {
+          pair.crossLevelMatched = false;
+          pair.complete = false;
+        }
+        failures.push({
+          group: `block-${blockIndex + 1}`,
+          block: blockIndex + 1,
+          seed,
+          leg: 'cross-level-block',
+          ok: false,
+          deadlock: false,
+          reason: '同一基础种子跨级牌未复用完全相同的实体牌面',
+        });
+      }
     }
   }
 } finally {
   globalThis.clearInterval(heartbeat);
   setUpdateCallback(null);
+  setAIDecisionObserver(null);
   globalThis.setTimeout = realSetTimeout;
   globalThis.clearTimeout = realClearTimeout;
   Math.random = realRandom;
 }
 
-const completedGames = games.filter((game) => game.ok);
 const completedPairs = pairs.filter((pair) => pair.complete);
+// 只有镜像两腿都成功且牌面/先手一致的种子，才进入任何胜负统计。
+// 单腿成功不能混入分子或分母，否则会破坏配对设计。
+const completedGames = pairs.flatMap((pair, index) => (
+  pair.complete ? games.slice(index * 2, index * 2 + 2) : []
+));
 const utilities = completedGames.map((game) => game.utility);
 const pairedUtilities = completedPairs.map((pair) => pair.utility);
+const pairedHeadRates = completedPairs.map((pair) => pair.candidateHeads / 2);
+const pairedDoubleUpDifferences = completedPairs.map((pair) => (
+  (pair.candidateDoubleUps - pair.comparisonDoubleUps) / 2
+));
+const blocks = Array.from({ length: groupCount }, (_, blockIndex) => {
+  const blockPairs = pairs.filter((pair) => pair.block === blockIndex + 1);
+  const expected = levelBlockDesign ? evaluationLevels.length : 1;
+  const complete = blockPairs.length === expected && blockPairs.every((pair) => pair.complete);
+  return {
+    block: blockIndex + 1,
+    seed: (baseSeed + blockIndex) >>> 0,
+    complete,
+    levelPairs: blockPairs.length,
+    utility: complete ? average(blockPairs.map((pair) => pair.utility)) : null,
+    candidateHeadRate: complete
+      ? average(blockPairs.map((pair) => pair.candidateHeads / 2)) : null,
+    doubleUpDifference: complete
+      ? average(blockPairs.map((pair) => (
+        (pair.candidateDoubleUps - pair.comparisonDoubleUps) / 2
+      ))) : null,
+  };
+});
+const completedBlocks = blocks.filter((block) => block.complete);
+// 跨级区组内的13个观测共享同一副基础牌，正式置信区间必须按 seed block
+// 重采样，不能把它们错误当作13个独立样本。
+const inferenceUtilities = levelBlockDesign
+  ? completedBlocks.map((block) => block.utility)
+  : pairedUtilities;
+const inferenceHeadRates = levelBlockDesign
+  ? completedBlocks.map((block) => block.candidateHeadRate)
+  : pairedHeadRates;
+const inferenceDoubleUpDifferences = levelBlockDesign
+  ? completedBlocks.map((block) => block.doubleUpDifference)
+  : pairedDoubleUpDifferences;
 const candidateHeads = completedGames.filter((game) => game.candidateHead).length;
 const comparisonHeads = completedGames.filter((game) => game.comparisonHead).length;
 const candidateDoubleUps = completedGames.filter((game) => game.candidateDoubleUp).length;
@@ -476,13 +843,64 @@ const durations = games.map((game) => game.durationMs).filter(Number.isFinite);
 const actions = completedGames.map((game) => game.actions);
 const headRate = completedGames.length ? candidateHeads / completedGames.length : null;
 const cappedHeadRate = headRate == null ? null : Math.min(0.999999, Math.max(0.000001, headRate));
+const byLevel = Object.fromEntries(evaluationLevels.map((level) => {
+  const levelGames = completedGames.filter((game) => game.level === level);
+  const levelPairs = completedPairs.filter((pair) => pair.level === level);
+  const heads = levelGames.filter((game) => game.candidateHead).length;
+  const comparisonLevelHeads = levelGames.filter((game) => game.comparisonHead).length;
+  const doubles = levelGames.filter((game) => game.candidateDoubleUp).length;
+  const comparisonDoubles = levelGames.filter((game) => game.comparisonDoubleUp).length;
+  return [String(level), {
+    label: level === 14 ? 'A' : String(level),
+    seedGroups: levelPairs.length,
+    games: levelGames.length,
+    candidateHeads: heads,
+    comparisonHeads: comparisonLevelHeads,
+    candidateHeadRate: rounded(levelGames.length ? heads / levelGames.length : null),
+    candidateDoubleUps: doubles,
+    comparisonDoubleUps: comparisonDoubles,
+    candidateUtilityPerGame: rounded(average(levelGames.map((game) => game.utility))),
+  }];
+}));
+const firstDivergences = completedGames
+  .map((game) => game.firstDivergence)
+  .filter(Boolean);
+const divergenceBySeat = Object.fromEntries(Array.from({ length: 4 }, (_, seat) => [
+  String(seat), firstDivergences.filter((item) => item.seat === seat).length,
+]));
+const continuousRounds = completedGames.flatMap((game) => game.roundResults || []);
+const hybridTotals = completedGames.reduce((total, game) => {
+  const report = game.hybrid || createHybridCounters();
+  total.turns += report.turns || 0;
+  total.applied += report.applied || 0;
+  total.changed += report.changed || 0;
+  total.samples += report.samples || 0;
+  total.nodes += report.nodes || 0;
+  for (const [key, value] of Object.entries(report.reasons || {})) {
+    total.reasons[key] = (total.reasons[key] || 0) + value;
+  }
+  for (const [key, value] of Object.entries(report.rejected || {})) {
+    total.rejected[key] = (total.rejected[key] || 0) + value;
+  }
+  return total;
+}, createHybridCounters());
 
 if (!jsonOnly) console.log('\n');
 console.log(JSON.stringify({
   config: {
-    seedGroups: groupCount,
+    seedGroups: plannedPairs,
+    baseDealBlocks: groupCount,
     baseSeed,
-    gamesPlanned: groupCount * 2,
+    gamesPlanned: plannedPairs * 2,
+    evaluationLevels,
+    evaluationDesign: levelBlockDesign ? 'same-deal-cross-level-blocks' : 'legacy-level-cycle',
+    levelAssignment: levelBlockDesign
+      ? 'every base deal is replayed at every evaluation level'
+      : 'seed groups cycle evenly through evaluationLevels',
+    continuousMatch,
+    outcomeUnit: continuousMatch ? 'match win (+1/-1)' : 'round upgrade utility (+1..+3)',
+    traceDivergence,
+    summaryOnly,
     candidate: CANDIDATE.name,
     comparison: COMPARISON.name,
     baseline: COMPARISON.name,
@@ -490,12 +908,15 @@ console.log(JSON.stringify({
     comparisonPolicyProfile: COMPARISON.policyProfile,
     candidateFeatures: CANDIDATE.policyFeatures,
     comparisonFeatures: COMPARISON.policyFeatures,
+    candidateThresholds: CANDIDATE.policyThresholds,
+    comparisonThresholds: COMPARISON.policyThresholds,
     difficulty: 'master',
     deterministic: true,
   },
   completion: {
     gamesCompleted: completedGames.length,
     mirrorPairsCompleted: completedPairs.length,
+    baseDealBlocksCompleted: completedBlocks.length,
     mirrorMismatches: failures.filter((failure) => failure.leg === 'mirror').length,
     failures: failures.length,
     deadlocks: failures.filter((failure) => failure.deadlock).length,
@@ -505,12 +926,17 @@ console.log(JSON.stringify({
     candidateUpgradeUtilityPerGame: rounded(average(utilities)),
     candidatePairedUtilityPerSeed: rounded(average(pairedUtilities)),
     candidatePairedUtilityBootstrap95: roundedPair(
-      bootstrapMeanCI(pairedUtilities, baseSeed),
+      bootstrapMeanCI(inferenceUtilities, baseSeed),
     ),
+    candidateBlockedUtilityPerDeal: rounded(average(inferenceUtilities)),
     candidateHeads,
     comparisonHeads,
     baselineHeads: comparisonHeads,
     candidateHeadRate: rounded(headRate),
+    candidateHeadPairedBootstrap95: roundedPair(
+      bootstrapMeanCI(inferenceHeadRates, baseSeed ^ 0x13579BDF),
+    ),
+    // 保留旧字段供现有脚本读取；配对镜像赛的正式不确定性应看上面的 bootstrap。
     candidateHeadWilson95: roundedPair(wilsonInterval(candidateHeads, completedGames.length)),
     candidateElo: cappedHeadRate == null
       ? null
@@ -518,6 +944,44 @@ console.log(JSON.stringify({
     candidateDoubleUps,
     comparisonDoubleUps,
     baselineDoubleUps: comparisonDoubleUps,
+    candidateDoubleUpDifferencePerGame: rounded(average(pairedDoubleUpDifferences)),
+    candidateDoubleUpDifferencePairedBootstrap95: roundedPair(
+      bootstrapMeanCI(inferenceDoubleUpDifferences, baseSeed ^ 0x2468ACE0),
+    ),
+  },
+  byLevel,
+  divergence: {
+    enabled: traceDivergence,
+    gamesWithFirstDivergence: firstDivergences.length,
+    rate: rounded(completedGames.length
+      ? firstDivergences.length / completedGames.length : null),
+    bySeat: divergenceBySeat,
+    samples: firstDivergences.slice(0, 40),
+  },
+  hybrid: {
+    ...hybridTotals,
+    appliedRate: rounded(hybridTotals.turns ? hybridTotals.applied / hybridTotals.turns : null),
+    changedRate: rounded(hybridTotals.turns ? hybridTotals.changed / hybridTotals.turns : null),
+    averageSamplesPerTurn: rounded(hybridTotals.turns
+      ? hybridTotals.samples / hybridTotals.turns : null),
+    averageNodesPerAppliedTurn: rounded(hybridTotals.applied
+      ? hybridTotals.nodes / hybridTotals.applied : null),
+  },
+  continuousMatch: {
+    enabled: continuousMatch,
+    matches: continuousMatch ? completedGames.length : 0,
+    rounds: continuousRounds.length,
+    averageRoundsPerMatch: rounded(continuousMatch
+      ? average(completedGames.map((game) => game.rounds)) : null),
+    maxRounds: continuousRounds.length
+      ? Math.max(...completedGames.map((game) => game.rounds)) : null,
+    tributeRounds: continuousRounds.filter((round) => round.tribute).length,
+    aAttempts: continuousRounds.filter((round) => round.aAttempt).length,
+    aFailures: continuousRounds.filter((round) => round.aFailed).length,
+    aResets: continuousRounds.filter((round) => round.aReset).length,
+    candidateRoundUpgradeUtility: continuousRounds.reduce(
+      (sum, round) => sum + round.candidateUtility, 0,
+    ),
   },
   performance: {
     totalSeconds: rounded((performance.now() - startedAt) / 1000, 2),
@@ -526,8 +990,9 @@ console.log(JSON.stringify({
     averageActions: rounded(average(actions), 1),
     maxActions: actions.length ? Math.max(...actions) : null,
   },
-  pairs,
+  ...(summaryOnly ? {} : { pairs, blocks }),
   failures,
 }, null, 2));
 
-if (failures.length || completedPairs.length !== groupCount) process.exitCode = 1;
+if (failures.length || completedPairs.length !== plannedPairs
+  || completedBlocks.length !== groupCount) process.exitCode = 1;

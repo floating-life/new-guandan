@@ -253,7 +253,9 @@ export function sanitizeUserSettings(settings) {
   const {
     aiPolicyBySeat,
     aiPolicyFeaturesBySeat,
+    aiPolicyThresholdsBySeat,
     aiDifficultyBySeat,
+    aiDecisionEngineBySeat,
     ...rest
   } = settings;
   return rest;
@@ -264,6 +266,7 @@ export function loadSettings() {
     difficulty: 'normal',
     aiSpeed: 'normal',
     llmPolicyMode: 'local',
+    localAiEngine: 'expert',
     coachMode: false,
     autoHint: false,
     reducedMotion: false,
@@ -273,6 +276,7 @@ export function loadSettings() {
     const raw = storage().getItem(SETTINGS_KEY);
     const parsed = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
     if (!['local', 'auto', 'cloud'].includes(parsed.llmPolicyMode)) parsed.llmPolicyMode = 'local';
+    if (!['expert', 'hybrid'].includes(parsed.localAiEngine)) parsed.localAiEngine = 'expert';
     return parsed;
   } catch {
     return defaults;

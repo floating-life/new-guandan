@@ -22,6 +22,12 @@ assert(html.includes('id="declarationChips"') && ui.includes('renderDeclarationC
 assert(html.includes('id="endHands"') && ui.includes('renderEndHands'), '每副结束自动亮出未出完AI手牌');
 assert(html.includes('<option value="master">大师</option>'), '难度选择提供大师模式');
 assert(html.includes('大师模式') && html.includes('不读取其他玩家未公开手牌'), '规则说明公开大师模式与公平信息边界');
+assert(html.includes('id="selLocalEngine"') && html.includes('value="hybrid"')
+  && html.includes('混合搜索（实验）'), '提供显式的专家策略/混合搜索本地引擎开关');
+assert(ui.includes("applySettings(state, { localAiEngine: engine })")
+  && ui.includes('公平信息集模拟'), '本地引擎开关接入设置并说明公平采样与安全回退');
+assert(ui.includes('混合搜索：') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
+  '逐手复盘展示混合层是否改选、采样数和模拟节点数');
 assert(/--card-w:\s*48px/.test(css), '手机牌张缩小以避免横向裁切');
 
 console.log('无障碍契约');

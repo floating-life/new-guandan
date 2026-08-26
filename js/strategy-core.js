@@ -4,7 +4,9 @@
  */
 import { isJoker, isWild, removeCards, soloPower } from './cards.js';
 import { HandType, formatHand, parseHand } from './rules.js';
-import { inferPublicThreats, publicCoordinationScore } from './ai-route.js';
+import {
+  inferPublicThreats, publicCoordinationScore, relevantEnemyPassCount,
+} from './ai-route.js';
 
 export function isStrategicBomb(hand) {
   return !!hand && [HandType.BOMB, HandType.FLUSH_STRAIGHT, HandType.JOKER_BOMB]
@@ -39,6 +41,183 @@ export function downstreamEnemyNeedsBlock(lastHand, ctx) {
   if (lastHand.type === HandType.SINGLE) return count > 0 && count <= 2;
   if (isStrategicBomb(lastHand)) return false;
   return count > 0 && count <= 6 && count === lastHand.size;
+}
+
+export const RESPONSE_DAMAGE_WEIGHT = Object.freeze({
+  split_bomb: 1000,
+  split_flush_straight: 700,
+  split_straight: 400,
+  split_group: 250,
+  split_pair: 180,
+});
+
+/**
+ * AI、教练和真人评分共用的接牌结构成本。这里故意只使用本家手牌产生的
+ * 策略标签，不读取任何一家暗牌。
+ */
+export function strategicResponseDamage(play, level) {
+  const tags = play?.strategy?.tags || [];
+  let damage = tags.reduce(
+    (sum, tag) => sum + (RESPONSE_DAMAGE_WEIGHT[tag] || 0),
+    0,
+  );
+  if (!isStrategicBomb(play?.hand) && (play?.cards || []).some((card) => isWild(card, level))) {
+    damage += 450;
+  }
+  if (!isStrategicBomb(play?.hand)) {
+    damage += (play?.cards || []).filter((card) => isJoker(card)).length * 160;
+  }
+  return damage;
+}
+
+/**
+ * 团队名次优先的“延迟一手出完”。它不是普遍惜炸：已经产生名次、对手只剩
+ * 一两张、自己领出、对家已收官，均立即出完。只在整手强控制仍可等待、且
+ * 对家仍需要争头游/二游时保留一次反压机会。
+ */
+export function assessTeamFinishDelay(finishPlay, ctx) {
+  const disabled = ctx?.policyFeatures?.teamFinishDelay === false;
+  const hand = ctx?.hand || ctx?.handBefore || [];
+  const finishOrder = ctx?.finishOrder || [];
+  const teams = ctx?.teams || [0, 1, 0, 1];
+  const seat = Number(ctx?.seat);
+  const partner = (seat + 2) % 4;
+  const inactive = disabled
+    || !finishPlay?.hand
+    || !ctx?.lastHand
+    || !hand.length
+    || finishPlay.cards?.length !== hand.length
+    || hand.length > 6
+    || !isStrategicBomb(finishPlay.hand)
+    || finishOrder.length > 0
+    || finishOrder.includes(partner);
+  if (inactive) return { shouldDelay: false, tag: null, reason: '' };
+
+  const enemies = activeEnemies(ctx);
+  const activeEnemyMin = enemies.length
+    ? Math.min(...enemies.map((enemy) => enemy.count)) : 99;
+  if (activeEnemyMin <= 2) return { shouldDelay: false, tag: null, reason: '' };
+
+  const lastIsTeammate = ctx.lastSeat != null
+    && ctx.lastSeat !== seat
+    && teams[ctx.lastSeat] === teams[seat];
+  if (lastIsTeammate) {
+    return {
+      shouldDelay: true,
+      tag: 'team_finish_delay',
+      activeEnemyMin,
+      reason: `对家正在控牌，保留整手${formatHand(finishPlay.hand)}等待反压，避免为抢个人名次打断团队牌路`,
+    };
+  }
+
+  const lastIsEnemy = ctx.lastSeat != null
+    && !finishOrder.includes(ctx.lastSeat)
+    && teams[ctx.lastSeat] !== teams[seat];
+  const partnerCount = Number(ctx.handCounts?.[partner] ?? 99);
+  const premiumReserve = finishPlay.hand.type === HandType.FLUSH_STRAIGHT
+    || finishPlay.hand.type === HandType.JOKER_BOMB
+    || (finishPlay.hand.type === HandType.BOMB && (finishPlay.hand.size || 0) >= 5);
+  if (lastIsEnemy
+    && premiumReserve
+    && !isStrategicBomb(ctx.lastHand)
+    && partnerCount > 5
+    && activeEnemyMin >= 6) {
+    return {
+      shouldDelay: true,
+      tag: 'team_finish_delay',
+      activeEnemyMin,
+      partnerCount,
+      reason: `整手${formatHand(finishPlay.hand)}仍是可一手收官的强控制；先放过普通牌等待诱炸后反制，为对家争取团队名次`,
+    };
+  }
+  return { shouldDelay: false, tag: null, reason: '' };
+}
+
+/** 仅用公开张数判断当前普通接牌是否已进入必须提高拦截权重的区间。 */
+export function assessOrdinaryResponsePressure(ctx) {
+  if (ctx?.policyFeatures?.emergencyOrdinaryBlock === false || !ctx?.lastHand) {
+    return { active: false, hard: false, activeEnemyMin: 99, lastEnemyCount: 99 };
+  }
+  const teams = ctx.teams || [0, 1, 0, 1];
+  const finishOrder = ctx.finishOrder || [];
+  const seat = Number(ctx.seat);
+  const lastIsEnemy = ctx.lastSeat != null
+    && ctx.lastSeat !== seat
+    && !finishOrder.includes(ctx.lastSeat)
+    && teams[ctx.lastSeat] !== teams[seat];
+  if (!lastIsEnemy) {
+    return { active: false, hard: false, activeEnemyMin: 99, lastEnemyCount: 99 };
+  }
+  const enemies = activeEnemies(ctx);
+  const activeEnemyMin = enemies.length
+    ? Math.min(...enemies.map((enemy) => enemy.count)) : 99;
+  const lastEnemyCount = Number(ctx.handCounts?.[ctx.lastSeat] ?? 99);
+  const lastSize = Number(ctx.lastHand?.size) || 0;
+  const hard = lastEnemyCount <= 5 || activeEnemyMin <= 3;
+  const softEnabled = ctx.policyFeatures?.softOrdinaryPressure === true;
+  const soft = softEnabled && !hard && (
+    lastEnemyCount <= 10
+    || (activeEnemyMin <= 10 && lastSize >= 2)
+  );
+  return {
+    active: hard || soft,
+    hard,
+    activeEnemyMin,
+    lastEnemyCount,
+    lastSize,
+  };
+}
+
+/**
+ * 十张压力区优先保留结构损失不超过一套同花顺的普通接法；五张硬残局即使
+ * 必须条件性拆炸，也先选损伤最小、点数最低的同型普通牌，而不是机械过牌。
+ * entries 可传 AI 的 scored plays，也可传评价器的 {play,strategy} 数组。
+ */
+export function selectPressureOrdinaryResponse(entries, ctx) {
+  const pressure = assessOrdinaryResponsePressure(ctx);
+  if (!pressure.active || !Array.isArray(entries)) return null;
+  const hand = ctx.hand || ctx.handBefore || [];
+  const normalized = entries.map((entry) => {
+    const play = entry?.play || entry;
+    const strategy = entry?.strategy || play?.strategy || null;
+    return {
+      play: strategy && play?.strategy !== strategy ? { ...play, strategy } : play,
+      sourcePlay: play,
+      strategy,
+    };
+  }).filter(({ play }) => play?.hand
+    && !isStrategicBomb(play.hand)
+    && play.hand.type === ctx.lastHand?.type);
+  const damageLimit = pressure.hard
+    ? Number.POSITIVE_INFINITY
+    : RESPONSE_DAMAGE_WEIGHT.split_flush_straight;
+  const ranked = normalized.map((item) => ({
+    ...item,
+    damage: strategicResponseDamage(item.play, ctx.level),
+    finishes: item.play.cards?.length === hand.length,
+    usesPremium: item.play.cards?.some((card) => (
+      isJoker(card) || isWild(card, ctx.level) || card.rank === ctx.level
+    )),
+  })).filter((item) => item.damage <= damageLimit
+      && (pressure.hard || !item.usesPremium))
+    .sort((left, right) => (
+      Number(right.finishes) - Number(left.finishes)
+      || left.damage - right.damage
+      || (left.play.hand.power || 0) - (right.play.hand.power || 0)
+      || (right.strategy?.score || right.play.score || 0)
+        - (left.strategy?.score || left.play.score || 0)
+    ));
+  if (!ranked.length) return null;
+  const selected = ranked[0];
+  return {
+    play: selected.sourcePlay,
+    strategy: selected.strategy,
+    damage: selected.damage,
+    pressure,
+    reason: pressure.hard
+      ? `当前对手仅剩${pressure.lastEnemyCount}张，需用结构损失最小的普通同型牌及时拦截`
+      : `对手方已进入${pressure.activeEnemyMin}张压力区，保留最低损伤普通接法，避免继续无条件放行`,
+  };
 }
 
 function activeEnemies(ctx) {
@@ -348,6 +527,7 @@ function summarizePublicHistory(ctx) {
         targetType: null,
         lastPlayer: null,
         lastType: null,
+        lastPower: null,
         lastSize: 0,
         lastCardsShed: 0,
         hasPlay: false,
@@ -362,6 +542,8 @@ function summarizePublicHistory(ctx) {
       trick.targetType = item.hand.type;
       trick.lastPlayer = seat;
       trick.lastType = item.hand.type;
+      trick.lastPower = item.hand.power != null && Number.isFinite(Number(item.hand.power))
+        ? Number(item.hand.power) : null;
       trick.lastSize = Number(item.hand.size) || item.cards?.length || 0;
       const before = Number(item.countsBefore?.[seat]);
       const after = Number(item.countsAfter?.[seat]);
@@ -380,6 +562,7 @@ function summarizePublicHistory(ctx) {
     singleCount: 0,
     allSingles: false,
     cardsShed: 0,
+    singlePowers: [],
   };
   const latest = controlledTricks[controlledTricks.length - 1];
   if (latest) {
@@ -390,12 +573,65 @@ function summarizePublicHistory(ctx) {
       if (trick.lastPlayer !== controlStreak.seat) break;
       controlStreak.count += 1;
       controlStreak.cardsShed += trick.lastCardsShed || trick.lastSize || 0;
-      if (trick.lastType === HandType.SINGLE) controlStreak.singleCount += 1;
-      else controlStreak.allSingles = false;
+      if (trick.lastType === HandType.SINGLE) {
+        controlStreak.singleCount += 1;
+        controlStreak.singlePowers.push(trick.lastPower);
+      } else controlStreak.allSingles = false;
     }
   }
   return {
     leadTypes, passTypes, recentControllers, controlStreak,
+  };
+}
+
+/**
+ * 只使用公开牌史识别“同一对手连续清理单张”的压力。
+ * 三圈连续清理低点单张时不再要求对手先进入十张残局，否则全对子/三张牌面会被
+ * 对手用最小单张稳定利用。A、级牌、王等高控制不属于“清小单”，不能机械强拦。
+ */
+export function analyzeSingleRunPressure(ctx, history = null) {
+  const mode = ctx.mode || (ctx.lastHand ? 'beat' : 'lead');
+  const lastSeat = Number(ctx.lastSeat);
+  const teams = ctx.teams || [0, 1, 0, 1];
+  const finishOrder = ctx.finishOrder || [];
+  const inactive = mode !== 'beat'
+    || ctx.lastHand?.type !== HandType.SINGLE
+    || !Number.isInteger(lastSeat)
+    || lastSeat < 0 || lastSeat > 3
+    || lastSeat === ctx.seat
+    || finishOrder.includes(lastSeat)
+    || teams[lastSeat] === teams[ctx.seat];
+  if (inactive) {
+    return {
+      active: false, hard: false, enemySeat: null, enemyCount: 99, streakCount: 0,
+    };
+  }
+
+  const resolvedHistory = history?.controlStreak ? history : summarizePublicHistory(ctx);
+  const streak = resolvedHistory.controlStreak || {};
+  const enemyCount = Number(ctx.handCounts?.[lastSeat] ?? 99);
+  const ownCount = Number((ctx.hand || ctx.handBefore || []).length || 0);
+  const streakCount = streak.seat === lastSeat && streak.allSingles
+    ? Number(streak.singleCount) || 0 : 0;
+  const currentPower = Number(ctx.lastHand?.power) || 0;
+  const recentPowers = (streak.singlePowers || [])
+    .slice(0, Math.max(3, streakCount))
+    .filter((power) => Number.isFinite(Number(power)))
+    .map(Number);
+  const recentLowCount = recentPowers.slice(0, 3)
+    .filter((power) => power > 0 && power <= 11).length;
+  const midgameLowRun = streakCount >= 3 && currentPower <= 11 && recentLowCount >= 2;
+  const shortHandRun = streakCount >= 2
+    && (enemyCount <= 10 || ownCount <= 10)
+    && currentPower <= 12;
+  const active = midgameLowRun || shortHandRun;
+  return {
+    active,
+    hard: active && (enemyCount <= 5 || ownCount <= 8 || streakCount >= 4),
+    enemySeat: lastSeat,
+    enemyCount,
+    streakCount,
+    currentPower,
   };
 }
 
@@ -479,6 +715,13 @@ export function evaluateStrategicPlay(play, ctx) {
   const upstream = (ctx.seat + 3) % 4;
   const partner = (ctx.seat + 2) % 4;
   const partnerFinished = (ctx.finishOrder || []).includes(partner);
+  const featureEnabled = (key) => {
+    if (ctx.policyFeatures?.controlV2 === false) return false;
+    // partnerCover 的跨级独立消融为负；只有显式实验臂才开启，避免评价层
+    // 在没有策略配置时又把它误当成正式规则。
+    if (key === 'partnerCover') return ctx.policyFeatures?.partnerCover === true;
+    return ctx.policyFeatures?.[key] !== false;
+  };
   const result = {
     score: 0,
     tags: [],
@@ -936,7 +1179,13 @@ export function evaluateStrategicPlay(play, ctx) {
     );
   }
 
-  const partnerPasses = history.passTypes[partner].get(play.hand.type) || 0;
+  // 只有对家面对敌方控制牌时的过牌，才能作为“可能接不住该牌型”的软证据。
+  // 对家面对本方牌权时主动礼让，不能反过来降低后续送型评分。
+  const partnerPasses = relevantEnemyPassCount(
+    publicModel?.history,
+    partner,
+    play.hand,
+  );
   if (mode === 'lead' && !partnerFinished && partnerCount <= 8 && partnerPasses >= 2) {
     addExpertScore(
       result,
@@ -950,7 +1199,11 @@ export function evaluateStrategicPlay(play, ctx) {
   }
 
   const enemyPassEvidence = enemies.reduce(
-    (sum, enemy) => sum + (history.passTypes[enemy.seat].get(play.hand.type) || 0),
+    (sum, enemy) => sum + relevantEnemyPassCount(
+      publicModel?.history,
+      enemy.seat,
+      play.hand,
+    ),
     0,
   );
   if (mode === 'lead' && enemyPassEvidence >= 3 && !isStrategicBomb(play.hand)) {
@@ -967,42 +1220,61 @@ export function evaluateStrategicPlay(play, ctx) {
 
   const lastTwoControllers = history.recentControllers.slice(-2);
   const controllingEnemy = enemies.find((enemy) => enemy.seat === ctx.lastSeat);
+  const controlStreak = history.controlStreak || {};
+  const classicOpponentRun = controllingEnemy?.count <= 10
+    && lastTwoControllers.length === 2
+    && lastTwoControllers.every((seat) => seat === ctx.lastSeat);
+  const highShedRunBlock = featureEnabled('highShedRunBlock')
+    && controllingEnemy?.count <= 12
+    && handBefore.length <= 12
+    // 对家已经进入十张内时，抢回牌权反而可能打断其收官；这里只处理
+    // 对家仍较长、无法依靠短手接力的防守缺口。
+    && partnerCount >= 12
+    && controlStreak.seat === ctx.lastSeat
+    && Number(controlStreak.count) >= 2
+    && Number(controlStreak.cardsShed) >= 6
+    && !isStrategicBomb(play.hand)
+    && !result.tags.some((tag) => ['split_bomb', 'split_flush_straight'].includes(tag))
+    && !play.cards.some((card) => (
+      isJoker(card) || isWild(card, level) || card.rank === level
+    ));
   if (mode === 'beat' && ctx.lastSeat != null
     && ctx.teams?.[ctx.lastSeat] !== ctx.teams?.[ctx.seat]
-    && controllingEnemy?.count <= 10
-    && lastTwoControllers.length === 2
-    && lastTwoControllers.every((seat) => seat === ctx.lastSeat)) {
+    && (classicOpponentRun || highShedRunBlock)) {
     addExpertScore(
       result,
       ctx,
-      isStrategicBomb(play.hand) ? 38 : 30,
+      highShedRunBlock ? 260 : (isStrategicBomb(play.hand) ? 38 : 30),
       'defense',
-      6,
+      highShedRunBlock ? 12 : 6,
       'stop_opponent_run',
-      '对手已连续取得公开牌权，本手提高拦截优先级',
+      highShedRunBlock
+        ? `对手连续控圈已公开减牌${controlStreak.cardsShed}张，用最低损伤普通牌截断其牌路`
+        : '对手已连续取得公开牌权，本手提高拦截优先级',
     );
   }
 
-  const streak = history.controlStreak;
-  const runningEnemy = enemies.find((enemy) => enemy.seat === ctx.lastSeat);
-  const repeatedSingleThreat = mode === 'beat'
-    && ctx.lastHand?.type === HandType.SINGLE
-    && runningEnemy?.count <= 10
-    && streak.seat === ctx.lastSeat
-    && streak.allSingles
-    && streak.singleCount >= 2
-    // 对手剩 5 张以内时，两圈连续走单就已足以形成明确收尾威胁；
-    // 其他中盘情形仍要求三圈或本家进入十张残局，避免无谓拆牌。
-    && (streak.singleCount >= 3
-      || handBefore.length <= 10
-      || (runningEnemy.count <= 5 && streak.singleCount >= 2));
-  if (repeatedSingleThreat && play.hand.type === HandType.SINGLE) {
+  const singleRunPressure = analyzeSingleRunPressure(
+    { ...ctx, hand: handBefore, mode },
+    history,
+  );
+  const catastrophicSingleSplit = result.tags.includes('split_bomb')
+    || result.tags.includes('split_flush_straight');
+  const premiumSingleResource = play.cards.some((card) => (
+    isJoker(card) || card.rank === ctx.level
+  ));
+  const allowPremiumEmergency = singleRunPressure.hard
+    && singleRunPressure.enemyCount <= 3;
+  if (singleRunPressure.active
+    && play.hand.type === HandType.SINGLE
+    && !catastrophicSingleSplit
+    && (!premiumSingleResource || allowPremiumEmergency)) {
     const splitTag = result.tags.includes('split_pair')
       ? 'split_pair' : result.tags.includes('split_group') ? 'split_group' : null;
     // 继续整手过牌会让对手免费清理所有单张。先使用独立单张，
     // 没有时才拆最小对子，再次才考虑三张；炸弹仍不在此处拆。
     const interceptScore = splitTag === 'split_pair'
-      ? 300 : splitTag === 'split_group' ? 190 : 180;
+      ? 330 : splitTag === 'split_group' ? 235 : 260;
     addExpertScore(
       result,
       ctx,
@@ -1011,10 +1283,10 @@ export function evaluateStrategicPlay(play, ctx) {
       splitTag ? 10 : 12,
       'stop_single_run',
       splitTag === 'split_pair'
-        ? `对手已连续走单${streak.singleCount}圈且剩${runningEnemy.count}张，条件性拆最小对子拦截`
+        ? `对手已连续走单${singleRunPressure.streakCount}圈且剩${singleRunPressure.enemyCount}张，条件性拆最小对子拦截`
         : splitTag === 'split_group'
-          ? `对手已连续走单${streak.singleCount}圈且剩${runningEnemy.count}张，无对子可拆时才从三张中拦截`
-          : `对手已连续走单${streak.singleCount}圈且剩${runningEnemy.count}张，优先用独立单张中断其牌路`,
+          ? `对手已连续走单${singleRunPressure.streakCount}圈且剩${singleRunPressure.enemyCount}张，无对子可拆时才从三张中拦截`
+          : `对手已连续走单${singleRunPressure.streakCount}圈且剩${singleRunPressure.enemyCount}张，优先用独立单张中断其牌路`,
     );
   }
 
@@ -1081,6 +1353,108 @@ export function evaluateStrategicPlay(play, ctx) {
     }
   }
 
+  // 安全接牌底线：只对低牌、同型、自然成组且完全不破坏现有结构的普通牌生效。
+  // 它不是“见牌必接”；K/A、王、级牌、逢人配以及任何拆顺/拆组/拆炸仍由
+  // 原有资源门控决定。这样可堵住 AI 把独立 7/J 等累赘散牌也全部放过的漏洞。
+  const lastIsEnemy = mode === 'beat' && ctx.lastSeat != null
+    && ctx.teams?.[ctx.lastSeat] !== ctx.teams?.[ctx.seat];
+  const lastIsTeammate = mode === 'beat' && ctx.lastSeat != null
+    && ctx.lastSeat !== ctx.seat
+    && ctx.teams?.[ctx.lastSeat] === ctx.teams?.[ctx.seat];
+  const sameSimpleType = isSimple(play.hand)
+    && play.hand.type === ctx.lastHand?.type;
+  const structureDamage = result.tags.some((tag) => [
+    'split_bomb', 'split_flush_straight', 'split_straight', 'split_group', 'split_pair',
+  ].includes(tag));
+  const naturalGroup = sameSimpleType
+    && naturalRankCount(handBefore, play.hand.mainRank, level) === play.cards.length
+    && !play.cards.some((card) => isJoker(card) || isWild(card, level));
+  const cheapNaturalControl = play.hand.type === HandType.SINGLE
+    && naturalGroup
+    && !structureDamage
+    && result.remaining.length > 0
+    && (ctx.lastHand?.power || 0) <= 10
+    && (play.hand.power || 0) <= 12;
+  const lastEnemyCount = lastIsEnemy
+    ? Number(ctx.handCounts?.[ctx.lastSeat] ?? 99) : 99;
+  const urgentCheapControl = lastEnemyCount <= 10 || singleRunPressure.active;
+  if (featureEnabled('cheapControl') && lastIsEnemy && cheapNaturalControl) {
+    if (urgentCheapControl) {
+      addExpertScore(
+        result,
+        ctx,
+        52,
+        'defense',
+        7,
+        'cheap_control_take',
+        `对手仅剩${lastEnemyCount}张或已形成连续牌路，可用不拆结构的自然${formatHand(play.hand)}低成本截断`,
+      );
+    } else if (expertWeight(ctx) > 0) {
+      // 仅保留可解释标签，不改变候选分；中盘是否接牌仍交给原有路线、资源
+      // 与过牌门控，避免10→J这类“自然散单”被误升级成强制动作。
+      result.tags.push('cheap_control_option');
+      result.reasons.push(
+        `可用不拆结构的自然${formatHand(play.hand)}试探，但中盘仍需与保存牌权比较`,
+      );
+    }
+  }
+
+  // 五张硬残局不能再被“惜炸/保同花顺”的硬门无条件覆盖；十张压力区则只
+  // 放宽到损失不超过一套同花顺的普通同型接法。该标签同时供 AI、云端硬
+  // 边界和真人评价使用，确保三者对同一手牌给出一致结论。
+  const ordinaryPressure = assessOrdinaryResponsePressure({
+    ...ctx, hand: handBefore, mode,
+  });
+  const ordinaryPressureDamage = strategicResponseDamage(
+    { ...play, strategy: result },
+    level,
+  );
+  const ordinaryPressureUsesPremium = play.cards.some(
+    (card) => isJoker(card) || isWild(card, level) || card.rank === level,
+  );
+  const pressureEligible = ctx.policyFeatures?.emergencyOrdinaryBlock !== false
+    && ordinaryPressure.active
+    && lastIsEnemy
+    && !isStrategicBomb(play.hand)
+    && play.hand.type === ctx.lastHand?.type
+    && (ordinaryPressure.hard
+      || (ordinaryPressureDamage <= RESPONSE_DAMAGE_WEIGHT.split_flush_straight
+        && !ordinaryPressureUsesPremium));
+  if (pressureEligible) {
+    const interceptScore = ordinaryPressure.hard
+      ? Math.min(560, 260 + ordinaryPressureDamage * 0.25)
+      : Math.min(245, 110 + ordinaryPressureDamage * 0.18);
+    addExpertScore(
+      result,
+      ctx,
+      interceptScore,
+      'defense',
+      ordinaryPressure.hard ? 18 : 10,
+      'urgent_ordinary_block',
+      ordinaryPressure.hard
+        ? `当前对手仅剩${ordinaryPressure.lastEnemyCount}张，普通同型接牌即使需要条件性拆组，也优先于继续无条件放行`
+        : `对手方已进入${ordinaryPressure.activeEnemyMin}张压力区，保留最低损伤的普通同型接法以争夺牌权`,
+    );
+  }
+
+  // 默认仍让对家控牌；仅当下一位对手已进入五张内、对家尚未收官，而且有
+  // 完全安全的自然牌可抬高门槛时才覆盖硬让牌。不能通过随机降低让牌率实现。
+  if (featureEnabled('partnerCover') && lastIsTeammate && ctx.lastSeat === partner
+    && downstreamEnemy?.count <= 5
+    && partnerCount > 5
+    && (ctx.lastHand?.power || 0) <= 9
+    && cheapNaturalControl) {
+    addExpertScore(
+      result,
+      ctx,
+      78,
+      'cooperation',
+      9,
+      'partner_cover',
+      `下家仅剩${downstreamEnemy.count}张，用不拆结构的${formatHand(play.hand)}安全抬高对家牌，降低对手顺走概率`,
+    );
+  }
+
   if (isStrategicBomb(play.hand)) {
     const targetEnemy = enemies.find((enemy) => enemy.seat === ctx.lastSeat);
     const otherEnemyCritical = enemies.some((enemy) => (
@@ -1088,12 +1462,25 @@ export function evaluateStrategicPlay(play, ctx) {
     ));
     const targetImmediate = !!targetEnemy && (targetEnemy.count <= 4
       || targetEnemy.count === ctx.lastHand?.size);
+    const enemyTeamAlreadyHead = (ctx.finishOrder || []).some((finishedSeat) => (
+      ctx.teams?.[finishedSeat] !== ctx.teams?.[ctx.seat]
+    ));
     const retainsAnotherControl = strongControlCount(result.remaining, level) > 0;
     const quickClose = result.createsTwoStepFinish || result.remaining.length <= 3;
+    // 防双下是止损，强度高于争双上；后者只有对手已到三张内，且炸后仍有
+    // 收官路线或另一控制时才升级为硬拦截。五张区只进入原有三路比较，
+    // 不能仅因“可能双上”就无条件交掉唯一炸弹。
+    const doubleUpCritical = partnerFinished && !!targetEnemy
+      && targetEnemy.count <= 3 && (quickClose || retainsAnotherControl);
+    const doubleDownCritical = enemyTeamAlreadyHead && !!targetEnemy
+      && targetEnemy.count <= 4;
+    const placementCritical = featureEnabled('placementControl')
+      && (doubleUpCritical || doubleDownCritical);
     const bombHasSurvivalGain = quickClose || retainsAnotherControl || otherEnemyCritical;
     const preserveForThird = mode === 'beat'
       && partnerFinished
       && !!targetEnemy
+      && !placementCritical
       && !bombHasSurvivalGain;
 
     if (preserveForThird) {
@@ -1106,6 +1493,21 @@ export function evaluateStrategicPlay(play, ctx) {
         'survival_preserve_control',
         '对家已头游，可允许当前对手争二游；保留唯一强控制去压另一名对手，才能保住三游、避免末游',
       );
+    } else if (placementCritical) {
+      const tag = partnerFinished ? 'double_up_block' : 'avoid_double_down';
+      addExpertScore(
+        result,
+        ctx,
+        partnerFinished ? 82 : 140,
+        'endgame',
+        14,
+        tag,
+        partnerFinished
+          ? `对家已头游且当前对手仅剩${targetEnemy.count}张，及时夺权才有机会争二游并形成双上`
+          : `对手一方已头游且其对家仅剩${targetEnemy.count}张，必须夺权避免被双上`,
+      );
+      // shouldBomb、云端硬边界和解释层沿用统一的紧急炸弹入口。
+      if (!result.tags.includes('timely_bomb')) result.tags.push('timely_bomb');
     } else if (targetImmediate || otherEnemyCritical || result.createsTwoStepFinish) {
       addExpertScore(
         result,
@@ -1212,6 +1614,21 @@ export function evaluateStrategicPlay(play, ctx) {
           -3,
           'unseen_controls',
           `公开牌池仍有${higherOptions}种更高同型可能，中盘谨慎裸打大牌`,
+        );
+      }
+      if (featureEnabled('publicLockLead') && mode === 'lead'
+        && downstreamEnemy?.count <= 5
+        && (partnerFinished || partnerCount > 5)
+        && higherOptions === 0
+        && result.remaining.length > 0) {
+        addExpertScore(
+          result,
+          ctx,
+          56,
+          'defense',
+          8,
+          'public_lock_lead',
+          `下家仅剩${downstreamEnemy.count}张，且公开牌池最多只余一种更高同型可能，可用已数清的大牌锁住其牌路`,
         );
       }
     } else if (played.length) {

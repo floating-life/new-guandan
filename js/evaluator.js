@@ -8,9 +8,14 @@ import {
   generateLegalPlays, HandType, formatHand, parseHand, handSignature,
 } from './rules.js';
 import {
-  countDisjointStraights, countPotentialBombs, createStrategicMemo, downstreamEnemyNeedsBlock,
-  evaluateStrategicPlay, selectEmergencyBlock, strategicCandidateScore, wholeHandPlay,
+  analyzeSingleRunPressure, countDisjointStraights, countPotentialBombs, createStrategicMemo,
+  downstreamEnemyNeedsBlock, evaluateStrategicPlay, selectEmergencyBlock,
+  strategicCandidateScore, wholeHandPlay, assessTeamFinishDelay,
+  selectPressureOrdinaryResponse,
 } from './strategy-core.js';
+import {
+  createBeatModel, inferPublicThreats, publicPartnerProtectionValue,
+} from './ai-route.js';
 
 const GRADE = [
   { min: 90, label: '神来之笔', star: 5, color: '#f5c542' },
@@ -49,6 +54,7 @@ export function evaluatePlay(ctx) {
     tributeContext = null,
     difficulty = 'master',
     leadAfterOwnBomb = false,
+    policyFeatures = null,
   } = ctx;
 
   const tips = [];
@@ -66,7 +72,7 @@ export function evaluatePlay(ctx) {
   if (action === 'pass') {
     return evaluatePass({
       legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
-      finishOrder, assessment, level, playedCards, publicHistory, difficulty,
+      finishOrder, assessment, level, playedCards, publicHistory, difficulty, policyFeatures,
     });
   }
 
@@ -101,6 +107,7 @@ export function evaluatePlay(ctx) {
     tributeContext,
     difficulty,
     policyProfile: 'expert',
+    policyFeatures,
     strategyWeight: 1,
     leadAfterOwnBomb,
     strategyMemo: createStrategicMemo(handBefore, level),
@@ -327,6 +334,7 @@ export function evaluatePlay(ctx) {
 function evaluatePass({
   legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
   finishOrder, assessment, level, playedCards = [], publicHistory = [], difficulty = 'master',
+  policyFeatures = null,
 }) {
   const setScore = (target, dimension, tag, message) => {
     const delta = target - score;
@@ -372,6 +380,113 @@ function evaluatePass({
       };
     }
 
+    const downstream = (seat + 1) % 4;
+    if (legal.length && policyFeatures?.p3 !== false) {
+      const p3Ctx = {
+        hand: handBefore,
+        level,
+        lastHand,
+        lastSeat,
+        seat,
+        teams,
+        handCounts,
+        finishOrder,
+        playedCards,
+        publicHistory,
+        policyProfile: 'expert',
+        policyFeatures,
+      };
+      p3Ctx.publicModel = inferPublicThreats(p3Ctx);
+      const p3BeatModel = createBeatModel(p3Ctx);
+      const p3Memo = createStrategicMemo(handBefore, level);
+      const p3Cover = legal.map((play) => ({
+        play,
+        strategy: evaluateStrategicPlay(play, {
+          ...p3Ctx,
+          mode: 'beat',
+          difficulty,
+          strategyWeight: 1,
+          strategyMemo: p3Memo,
+        }),
+      })).filter(({ play, strategy }) => (
+        !isBombType(play.hand)
+        && !play.cards.some((card) => isWild(card, level) || isJoker(card))
+        && !strategy.tags.some((tag) => [
+          'split_bomb', 'split_flush_straight', 'split_straight', 'split_group',
+          'split_pair', 'preserve_wild', 'wild_simple_use', 'wild_as_single',
+        ].includes(tag))
+      )).map((item) => ({
+        ...item,
+        signal: publicPartnerProtectionValue(item.play, p3Ctx, p3BeatModel),
+      })).filter((item) => item.signal?.eligible)
+        .sort((left, right) => (
+          right.signal.reduction - left.signal.reduction
+          || left.play.hand.power - right.play.hand.power
+          || right.strategy.score - left.strategy.score
+        ))[0];
+      if (p3Cover) {
+        setScore(
+          42,
+          'cooperation',
+          'missed_partner_cover',
+          `公开应手模型显示下家接走对家牌权的风险可降低约${Math.round(p3Cover.signal.reduction * 100)}%；有不拆结构、不用王或逢人配的最低成本护牌时，不宜机械让牌。`,
+        );
+        return {
+          ...makeResult(score, tips, '错失公开风险护牌', assessment),
+          betterAlternative: {
+            cards: p3Cover.play.cards,
+            hand: p3Cover.play.hand,
+            label: formatHand(p3Cover.play.hand),
+          },
+        };
+      }
+    }
+
+    if (legal.length && handCounts[downstream] <= 5 && handCounts[lastSeat] > 5) {
+      const coverMemo = createStrategicMemo(handBefore, level);
+      const partnerCover = legal.map((play) => ({
+        play,
+        strategy: evaluateStrategicPlay(play, {
+          hand: handBefore,
+          level,
+          mode: 'beat',
+          lastHand,
+          lastSeat,
+          seat,
+          teams,
+          handCounts,
+          finishOrder,
+          playedCards,
+          publicHistory,
+          difficulty,
+          policyProfile: 'expert',
+          policyFeatures,
+          strategyWeight: 1,
+          strategyMemo: coverMemo,
+        }),
+      })).filter(({ strategy }) => strategy.tags.includes('partner_cover'))
+        .sort((left, right) => (
+          left.play.hand.power - right.play.hand.power
+          || right.strategy.score - left.strategy.score
+        ))[0];
+      if (partnerCover) {
+        setScore(
+          38,
+          'cooperation',
+          'missed_partner_cover',
+          `下家只剩 ${handCounts[downstream]} 张；此时可用不拆结构的普通牌安全抬高对家牌，降低对手顺走概率。`,
+        );
+        return {
+          ...makeResult(score, tips, '错失安全护牌', assessment),
+          betterAlternative: {
+            cards: partnerCover.play.cards,
+            hand: partnerCover.play.hand,
+            label: formatHand(partnerCover.play.hand),
+          },
+        };
+      }
+    }
+
     const finish = legal.filter((p) => p.cards.length === handBefore.length);
     if (finish.length) {
       const strongFinish = finish.find((p) => isBombType(p.hand));
@@ -383,12 +498,16 @@ function evaluatePass({
 
       // 对家正在控牌，整手同花顺/炸弹既可等待反压，也可在出完后让对家接风。
       // 只要对手尚未进入一两张的紧急残局，这是一种合理的主动战术，而非错失出完。
-      if (strongFinish && handBefore.length <= 6 && !activeEnemyAboutToWin) {
+      const finishDelay = strongFinish ? assessTeamFinishDelay(strongFinish, {
+        hand: handBefore, level, lastHand, lastSeat, seat, teams, handCounts,
+        finishOrder, policyFeatures,
+      }) : { shouldDelay: false };
+      if (finishDelay.shouldDelay && !activeEnemyAboutToWin) {
         setScore(
           88,
           'cooperation',
           null,
-          `对家正在控牌，保留一手走完的${formatHand(strongFinish.hand)}等待反压，并为出完后让对家接风创造机会，战术合理。`,
+          `${finishDelay.reason}；后续出完仍可形成接风配合。`,
         );
         recordImpact(
           assessment,
@@ -449,15 +568,16 @@ function evaluatePass({
     const strongFinish = finish.find((play) => isBombType(play.hand));
     // 整手炸弹/同花顺可以直接走完，但在对手尚不紧急时，放过普通牌等待诱炸，
     // 能先消耗对方核心资源再反制，属于合理但有风险的团队战术。
-    if (strongFinish
-      && handBefore.length <= 6
-      && !isBombType(lastHand)
-      && !enemyAboutToWin) {
+    const finishDelay = strongFinish ? assessTeamFinishDelay(strongFinish, {
+      hand: handBefore, level, lastHand, lastSeat, seat, teams, handCounts,
+      finishOrder, policyFeatures,
+    }) : { shouldDelay: false };
+    if (finishDelay.shouldDelay && !enemyAboutToWin) {
       setScore(
         84,
         'resources',
         null,
-        `保留整手${formatHand(strongFinish.hand)}放过普通牌，等待对手交炸后反制，具有诱炸价值。`,
+        `${finishDelay.reason}，具有诱炸与团队名次价值。`,
       );
       recordImpact(
         assessment,
@@ -500,12 +620,123 @@ function evaluatePass({
         publicHistory,
         difficulty,
         policyProfile: 'expert',
+        policyFeatures,
         strategyWeight: 1,
         strategyMemo,
       }),
     }));
   const ordinaryResponses = assessedResponses
     .filter(({ play }) => !isBombType(play.hand));
+  const placementBlock = assessedResponses.find(({ strategy }) => (
+    strategy.tags.includes('double_up_block')
+      || strategy.tags.includes('avoid_double_down')
+  ));
+  if (placementBlock) {
+    const ownPartnerHead = placementBlock.strategy.tags.includes('double_up_block');
+    setScore(
+      28,
+      'endgame',
+      ownPartnerHead ? 'missed_double_up' : 'risk_double_down',
+      ownPartnerHead
+        ? '对家已经头游，当前对手进入五张内收官区；继续过牌会主动放弃争二游和双上的机会。'
+        : '对手一方已经头游，其对家进入五张内收官区；继续过牌可能直接被双上。',
+    );
+    return {
+      ...makeResult(score, tips, ownPartnerHead ? '错失双上拦截' : '双下风险', assessment),
+      betterAlternative: {
+        cards: placementBlock.play.cards,
+        hand: placementBlock.play.hand,
+        label: formatHand(placementBlock.play.hand),
+      },
+    };
+  }
+  const singleRunPressure = analyzeSingleRunPressure({
+    hand: handBefore,
+    level,
+    mode: 'beat',
+    lastHand,
+    lastSeat,
+    seat,
+    teams,
+    handCounts,
+    finishOrder,
+    publicHistory,
+  });
+  const singleRunResponses = assessedResponses
+    .filter(({ play, strategy }) => play.hand.type === HandType.SINGLE
+      && strategy.tags.includes('stop_single_run'))
+    .sort((left, right) => {
+      const damage = (item) => {
+        const tags = item.strategy.tags;
+        return Number(tags.includes('split_bomb')) * 1000
+          + Number(tags.includes('split_flush_straight')) * 700
+          + Number(tags.includes('split_straight')) * 400
+          + Number(tags.includes('split_group')) * 250
+          + Number(tags.includes('split_pair')) * 180;
+      };
+      return damage(left) - damage(right)
+        || left.play.hand.power - right.play.hand.power
+        || right.strategy.score - left.strategy.score;
+    });
+  if (singleRunPressure.active && singleRunResponses.length) {
+    const best = singleRunResponses[0].play;
+    setScore(
+      singleRunPressure.hard ? 25 : 38,
+      'defense',
+      'missed_response',
+      `对手已连续${singleRunPressure.streakCount}圈走单，继续整手过牌会被稳定清理单张；应以结构损失最小的单张及时截断。`,
+    );
+    return {
+      ...makeResult(score, tips, '连续单张防守不足', assessment),
+      betterAlternative: {
+        cards: best.cards,
+        hand: best.hand,
+        label: formatHand(best.hand),
+      },
+    };
+  }
+  const cheapControlResponse = assessedResponses
+    .filter(({ strategy }) => strategy.tags.includes('cheap_control_take'))
+    .sort((left, right) => (
+      left.play.hand.power - right.play.hand.power
+      || right.strategy.score - left.strategy.score
+    ))[0];
+  if (cheapControlResponse) {
+    setScore(
+      45,
+      'defense',
+      'missed_response',
+      '有不拆组合、不用王和逢人配的自然小牌可以低成本接管；完全放过会让对手免费清理散牌。',
+    );
+    return {
+      ...makeResult(score, tips, '低成本可接未接', assessment),
+      betterAlternative: {
+        cards: cheapControlResponse.play.cards,
+        hand: cheapControlResponse.play.hand,
+        label: formatHand(cheapControlResponse.play.hand),
+      },
+    };
+  }
+  const pressureOrdinary = selectPressureOrdinaryResponse(assessedResponses, {
+    hand: handBefore, level, mode: 'beat', lastHand, lastSeat, seat, teams,
+    handCounts, finishOrder, policyFeatures,
+  });
+  if (pressureOrdinary) {
+    setScore(
+      pressureOrdinary.pressure.hard ? 30 : 45,
+      'defense',
+      'missed_pressure_response',
+      `${pressureOrdinary.reason}；此时继续过牌会让对手方低成本推进。`,
+    );
+    return {
+      ...makeResult(score, tips, '压力区防守不足', assessment),
+      betterAlternative: {
+        cards: pressureOrdinary.play.cards,
+        hand: pressureOrdinary.play.hand,
+        label: formatHand(pressureOrdinary.play.hand),
+      },
+    };
+  }
   const ordinaryResponsesCostly = ordinaryResponses.length > 0
     && ordinaryResponses.every(({ strategy }) => strategy.score <= -100
       && strategy.tags.some((tag) => ['split_straight', 'split_bomb'].includes(tag)));
@@ -677,6 +908,7 @@ function evalStructure(handBefore, cards, level, playedHand = null, sharedStrate
   const remain = removeCards(handBefore, cards);
   const actualHand = playedHand || parseHand(cards, level);
   const productiveRestructure = sharedStrategy?.tags?.includes('productive_restructure');
+  const urgentOrdinaryBlock = sharedStrategy?.tags?.includes('urgent_ordinary_block');
 
   const straightLoss = Math.max(
     0,
@@ -684,6 +916,7 @@ function evalStructure(handBefore, cards, level, playedHand = null, sharedStrate
   );
   if (straightLoss > 0
     && !productiveRestructure
+    && !urgentOrdinaryBlock
     && ![HandType.STRAIGHT, HandType.FLUSH_STRAIGHT].includes(actualHand?.type)) {
     events.push({
       dimension: 'structure',
@@ -696,7 +929,8 @@ function evalStructure(handBefore, cards, level, playedHand = null, sharedStrate
   // 是否拆了炸弹
   const beforeBombs = countPotentialBombs(handBefore, level);
   const afterBombs = countPotentialBombs(remain, level);
-  if (afterBombs < beforeBombs && !isBombType(actualHand) && !productiveRestructure) {
+  if (afterBombs < beforeBombs && !isBombType(actualHand)
+    && !productiveRestructure && !urgentOrdinaryBlock) {
     events.push({
       dimension: 'structure',
       delta: -15,

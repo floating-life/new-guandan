@@ -7,6 +7,8 @@
 import { Worker } from 'node:worker_threads';
 import { createDeck } from './cards.js';
 import { chooseAIPlay } from './ai.js';
+import { createPublicAIObservation } from './ai-observation.js';
+import { HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA } from './ai-hybrid.js';
 
 let passed = 0;
 let failed = 0;
@@ -23,7 +25,7 @@ function assert(condition, message) {
 
 const workerHref = new URL('./ai.worker.js', import.meta.url).href;
 
-function runWorkerDecision(ctx) {
+function runWorkerRequest(message) {
   const bootstrap = `
     import { parentPort } from 'node:worker_threads';
     const handlers = {};
@@ -51,7 +53,7 @@ function runWorkerDecision(ctx) {
       clearTimeout(timer);
       reject(error);
     });
-    worker.postMessage({ id: 1, ctx });
+    worker.postMessage({ id: 1, ...message });
   });
 }
 
@@ -71,11 +73,25 @@ const ctx = {
   policyProfile: 'expert',
 };
 
-runWorkerDecision(ctx).then((decision) => {
-  const direct = chooseAIPlay(ctx);
+const zeroModel = {
+  id: 'worker-thread-zero',
+  schema: HYBRID_VALUE_SCHEMA,
+  layers: [{
+    weights: [new Array(HYBRID_VALUE_FEATURES.length).fill(0)],
+    bias: [0],
+    activation: 'linear',
+  }],
+};
+
+runWorkerRequest({ type: 'configure-hybrid-model', model: zeroModel }).then((configured) => {
+  assert(configured.ok && configured.active && configured.modelId === 'worker-thread-zero',
+    'Worker 协议可校验并装载专用价值模型');
+  return runWorkerRequest({ ctx: { ...ctx, opponentHands: [['禁止泄漏']] } });
+}).then((decision) => {
+  const direct = chooseAIPlay(createPublicAIObservation(ctx));
   assert(decision && decision.action === 'play', 'Worker 返回有效出牌决策');
   assert(JSON.stringify(decision) === JSON.stringify(direct),
-    '确定性决策在 Worker 与主线程逐字节一致');
+    '确定性公平观察决策在 Worker 与主线程逐字节一致');
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }).catch((error) => {

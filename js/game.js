@@ -17,6 +17,7 @@ import {
   setAIDifficulty, getAIDifficulty, recommendPlay, getAIConsultation, AI_DIFFICULTY_LABEL,
 } from './ai.js';
 import { requestAIDecision } from './ai.worker-client.js';
+import { createPublicAIObservation } from './ai-observation.js';
 import { requestLLMDecision, LLM_POLICY_MODE } from './llm.js';
 import { evaluatePlay, summarizeSession, analyzeHandStructure } from './evaluator.js';
 import {
@@ -47,10 +48,18 @@ const AI_SPEED_MS = {
 
 // 真实对局按 AI 速度给本地搜索一个思考预算（限时加深）；deterministic 对局
 // 返回 0，让 A/B 镜像赛与单测保持逐字节可复现。
+export function resolveAISearchBudget(settings = {}) {
+  if (settings?.deterministicAI) return 0;
+  const speed = settings?.aiSpeed || 'normal';
+  const speedBudget = { slow: 600, normal: 250, fast: 60 }[speed] || 250;
+  // “快”只应缩短桌面等待，不能把大师模式悄悄降成49ms左右的残缺搜索。
+  // 250ms仍明显快于普通动画间隔，同时足以完成基础P1应手树；慢档可继续
+  // 利用空闲时间加宽搜索，但大师快档与中档保持同一最低强度。
+  return settings?.difficulty === 'master' ? Math.max(250, speedBudget) : speedBudget;
+}
+
 function aiSearchBudget(state) {
-  if (state?.settings?.deterministicAI) return 0;
-  const speed = state?.settings?.aiSpeed || 'normal';
-  return { slow: 600, normal: 250, fast: 60 }[speed] || 250;
+  return resolveAISearchBudget(state?.settings || {});
 }
 
 let _aiRequestSerial = 0;
@@ -349,11 +358,14 @@ export function applySettings(state, partial) {
   const cleanPartial = sanitizeUserSettings(partial || {});
   const previousLLMMode = state.settings?.llmPolicyMode;
   const previousDifficulty = state.settings?.difficulty;
+  const previousLocalEngine = state.settings?.localAiEngine;
   const llmModeChanged = cleanPartial.llmPolicyMode
     && cleanPartial.llmPolicyMode !== previousLLMMode;
   const difficultyChanged = cleanPartial.difficulty
     && cleanPartial.difficulty !== previousDifficulty;
-  const decisionSettingsChanged = llmModeChanged || difficultyChanged;
+  const localEngineChanged = cleanPartial.localAiEngine
+    && cleanPartial.localAiEngine !== previousLocalEngine;
+  const decisionSettingsChanged = llmModeChanged || difficultyChanged || localEngineChanged;
   const restartAI = decisionSettingsChanged
     && state.aiThinking
     && state.phase === PHASE.PLAYING
@@ -1094,6 +1106,7 @@ function advanceAfterPass(state) {
 
 let _aiTimer = null;
 let _onUpdate = null;
+let _aiDecisionObserver = null;
 
 function cloneCard(card) {
   return card ? {
@@ -1158,6 +1171,30 @@ export function resumeMatch(state) {
 
 export function setUpdateCallback(fn) {
   _onUpdate = fn;
+}
+
+/**
+ * 只读评测钩子：向黑盒 A/B 框架暴露 AI 当手的白名单决策输入和最终动作。
+ * 不传 state/hands/初始牌面；观察器异常会被隔离，绝不影响正式牌局。
+ */
+export function setAIDecisionObserver(fn) {
+  _aiDecisionObserver = typeof fn === 'function' ? fn : null;
+}
+
+function observeAIDecision(state, context, decision) {
+  if (!_aiDecisionObserver) return;
+  try {
+    _aiDecisionObserver({
+      round: state.round,
+      turn: state.trickLog.length + 1,
+      trickNumber: state.trickNumber,
+      seat: context.seat,
+      context,
+      decision,
+    });
+  } catch {
+    // 评测遥测不得改变出牌流程。
+  }
 }
 
 function notify(state = null, { persist = true } = {}) {
@@ -1229,11 +1266,11 @@ export function getPublicTributeContext(state, seat) {
   };
 }
 
-function aiDecisionContext(state, seat) {
+export function aiDecisionContext(state, seat) {
   const seatDifficulty = state.settings?.aiDifficultyBySeat?.[seat]
     || state.settings?.difficulty
     || 'normal';
-  return {
+  return createPublicAIObservation({
     seat,
     hand: state.hands[seat],
     level: state.currentLevel,
@@ -1249,8 +1286,12 @@ function aiDecisionContext(state, seat) {
     deterministic: !!state.settings?.deterministicAI,
     policyProfile: state.settings?.aiPolicyBySeat?.[seat] || 'expert',
     policyFeatures: state.settings?.aiPolicyFeaturesBySeat?.[seat] || null,
+    policyThresholds: state.settings?.aiPolicyThresholdsBySeat?.[seat] || null,
     leadAfterOwnBomb: isLeadAfterOwnBomb(state, seat),
-  };
+    decisionEngine: state.settings?.aiDecisionEngineBySeat?.[seat]
+      || state.settings?.localAiEngine
+      || 'expert',
+  });
 }
 
 function llmCardCode(card) {
@@ -1567,10 +1608,15 @@ async function runAI(state) {
   let decision = null;
   let consultation = null;
   let cloudAttempted = false;
+  let localDecisionLatencyMs = null;
+  let localDecisionSource = null;
   try {
     setAIDifficulty(state.settings?.difficulty || 'normal');
     if (preflight.eligible) {
+      const localStartedAt = Date.now();
       consultation = getAIConsultation(context);
+      localDecisionLatencyMs = Date.now() - localStartedAt;
+      localDecisionSource = 'consultation';
       if (!consultation?.candidates?.length) throw new Error('本地没有可提交的合法候选牌');
       const consultationGate = llmConsultationGate(state, seat, consultation, preflight);
       cloudEligible = consultationGate.eligible;
@@ -1728,17 +1774,30 @@ async function runAI(state) {
     // 云端未参与、失败或返回不合法时，复用已经完成的本地咨询，避免整套策略重算。
     if (!decision) {
       try {
-        decision = consultation
-          ? resolveLocalConsultation(consultation, state, seat, cloudAttempted ? '云端回退本地 AI' : '本地 AI')
-          : await requestAIDecision(context, {
-              timeoutMs: Math.max(2000, (context.timeBudgetMs || 250) + 1500),
-            });
+        if (consultation) {
+          decision = resolveLocalConsultation(
+            consultation, state, seat, cloudAttempted ? '云端回退本地 AI' : '本地 AI',
+          );
+        } else {
+          const localStartedAt = Date.now();
+          decision = await requestAIDecision(context, {
+            timeoutMs: Math.max(2000, (context.timeBudgetMs || 250) + 1500),
+          });
+          localDecisionLatencyMs = Date.now() - localStartedAt;
+          localDecisionSource = 'worker';
+        }
       } catch (error) {
         state.llmLastError = String(error?.message || error || '本地 AI 决策失败').slice(0, 160);
         decision = state.lastHand ? { action: 'pass', reason: '本地 AI 暂时无法接牌' } : null;
       }
     }
     if (!isCurrent()) return;
+    const localDecision = {
+      budgetMs: context.timeBudgetMs || 0,
+      latencyMs: Number.isFinite(localDecisionLatencyMs) ? localDecisionLatencyMs : null,
+      source: localDecisionSource,
+    };
+    observeAIDecision(state, context, decision);
     if (!decision || decision.action === 'pass') {
       if (!state.lastHand) {
         // 必须出 — 兜底出最小单张
@@ -1752,6 +1811,8 @@ async function runAI(state) {
         reason: decision?.reason || 'AI 选择过牌',
         projectedTricks: decision?.projectedTricks ?? null,
         llm: decision?.llm || null,
+        hybrid: decision?.hybrid || null,
+        localDecision,
       });
       advanceAfterPass(state);
       return;
@@ -1761,6 +1822,8 @@ async function runAI(state) {
       reason: decision.reason || '',
       projectedTricks: decision.projectedTricks ?? null,
       llm: decision.llm || null,
+      hybrid: decision.hybrid || null,
+      localDecision,
     });
     advanceAfterPlay(state);
   } catch (error) {
@@ -1935,6 +1998,7 @@ function endRound(state) {
     roundSummary: summarySnapshot(state.roundSummary),
     llmReport: llmReportSnapshot(state.llmReport),
     difficulty: state.settings?.difficulty || 'normal',
+    localAiEngine: state.settings?.localAiEngine || 'expert',
     time: new Date().toISOString(),
   };
   state.lastReplay = replay;

@@ -296,6 +296,7 @@ function renderTop() {
 
   const s = state.settings || loadSettings();
   const d = $('#selDifficulty');
+  const localEngine = $('#selLocalEngine');
   const sp = $('#selSpeed');
   const c = $('#chkCoach');
   const large = $('#chkLargeText');
@@ -304,6 +305,9 @@ function renderTop() {
   const llmStatus = $('#llmStatus');
   const llmPrompt = $('#llmPrompt');
   if (d && d.value !== s.difficulty) d.value = s.difficulty || 'normal';
+  if (localEngine && localEngine.value !== (s.localAiEngine || 'expert')) {
+    localEngine.value = s.localAiEngine || 'expert';
+  }
   if (sp && sp.value !== s.aiSpeed) sp.value = s.aiSpeed || 'normal';
   if (llmMode && llmMode.value !== (s.llmPolicyMode || LLM_POLICY_MODE.LOCAL)) {
     llmMode.value = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
@@ -1149,7 +1153,8 @@ function openReplay(preferId) {
     const fo = (r.finishOrder || []).map((s, i) => `${placeNames[i]}游 ${['你', '下家', '对家', '上家'][s]}`).join(' · ');
     let html = `
       <p><strong>第 ${r.round} 副</strong> · 打 ${LEVEL_LABEL[r.level] || r.level}
-      · 难度 ${escapeHtml(AI_DIFFICULTY_LABEL[r.difficulty] || r.difficulty || '-') } · 升 ${r.up} 级
+      · 难度 ${escapeHtml(AI_DIFFICULTY_LABEL[r.difficulty] || r.difficulty || '-') }
+      · 本地引擎 ${r.localAiEngine === 'hybrid' ? '混合搜索（实验）' : '专家策略'} · 升 ${r.up} 级
       · ${r.winTeam === 0 ? '我方' : '对方'}胜</p>
       <p>${new Date(r.endedAt || r.time).toLocaleString('zh-CN')}</p>
       <p>${escapeHtml(fo)}</p>
@@ -1172,6 +1177,12 @@ function openReplay(preferId) {
         <strong>第 ${current.trickNumber || '-'} 圈 · ${escapeHtml(current.text)}</strong>
         ${current.countsAfter ? `<p>剩余张数：你 ${current.countsAfter[0]} / 下家 ${current.countsAfter[1]} / 对家 ${current.countsAfter[2]} / 上家 ${current.countsAfter[3]}</p>` : ''}
         ${current.decisionMeta?.reason ? `<p>AI 思路：${escapeHtml(current.decisionMeta.reason)}</p>` : ''}
+        ${current.decisionMeta?.hybrid ? `<p>混合搜索：${current.decisionMeta.hybrid.changedDecision
+          ? `改选 ${escapeHtml(current.decisionMeta.hybrid.localCandidateId || '-')} → ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || '-')}`
+          : `保留 ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || current.decisionMeta.hybrid.localCandidateId || '专家首选')}`}
+          · ${Number(current.decisionMeta.hybrid.samples) || 0} 个可能牌面
+          · ${Number(current.decisionMeta.hybrid.nodes) || 0} 个模拟节点
+          · ${escapeHtml(current.decisionMeta.hybrid.reason || '安全回退')}</p>` : ''}
         ${ev ? `<p>你的评价：<strong>${ev.score} · ${escapeHtml(ev.grade)}</strong>${ev.assisted ? '<span class="assist-badge">使用辅助</span>' : ''}${ev.forced ? '<span class="assist-badge">被迫操作</span>' : ''}</p>
           <ul>${(ev.tips || []).map((tip) => `<li>${escapeHtml(tip)}</li>`).join('')}</ul>` : ''}
       </div>`;
@@ -1367,6 +1378,13 @@ function setupChrome() {
   $('#selDifficulty').onchange = (e) => {
     applySettings(state, { difficulty: e.target.value });
     flash(`AI 难度：${e.target.options[e.target.selectedIndex].text}`);
+  };
+  $('#selLocalEngine').onchange = (e) => {
+    const engine = e.target.value === 'hybrid' ? 'hybrid' : 'expert';
+    applySettings(state, { localAiEngine: engine });
+    flash(engine === 'hybrid'
+      ? '混合搜索已启用：大师关键残局进行公平信息集模拟，异常自动回退专家策略'
+      : '已切换为稳定专家策略');
   };
   $('#selSpeed').onchange = (e) => {
     applySettings(state, { aiSpeed: e.target.value });

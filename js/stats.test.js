@@ -58,8 +58,11 @@ assert(stats.mistakeCounts.waste_wild === 1, '结构化失误标签进入累计�
 assert(stats.difficulty.hard.rounds === 1 && stats.difficulty.hard.evalCount === 3, '统计按难度分桶');
 
 console.log('大师难度设置与统计');
-saveSettings({ ...loadSettings(), difficulty: 'master' });
+saveSettings({ ...loadSettings(), difficulty: 'master', localAiEngine: 'hybrid' });
 assert(loadSettings().difficulty === 'master', '大师难度设置可持久化');
+assert(loadSettings().localAiEngine === 'hybrid', '实验性混合决策引擎可由用户显式持久化');
+saveSettings({ ...loadSettings(), localAiEngine: 'unknown-engine' });
+assert(loadSettings().localAiEngine === 'expert', '未知本地决策引擎安全回退专家策略');
 recordRoundResult({
   myPlace: 0,
   teamWon: true,
@@ -101,15 +104,19 @@ console.log('导入时剥离 A/B 实验座位策略字段');
       difficulty: 'hard',
       aiPolicyBySeat: ['baseline', 'no-p0', 'expert', 'expert'],
       aiPolicyFeaturesBySeat: [{ p0: false }, {}, {}, {}],
+      aiPolicyThresholdsBySeat: [null, { p0LeadGate: 0.9 }, null, null],
       aiDifficultyBySeat: ['master', 'easy', 'easy', 'easy'],
+      aiDecisionEngineBySeat: ['hybrid', 'expert', 'expert', 'expert'],
     },
   };
   assert(importTrainingData(dirtyPayload).ok, '含实验座位策略字段的训练数据可导入');
   const settings = loadSettings();
   assert(settings.aiPolicyBySeat === undefined
     && settings.aiPolicyFeaturesBySeat === undefined
-    && settings.aiDifficultyBySeat === undefined,
-    'importTrainingData 后 loadSettings 不含 aiPolicy/aiDifficulty 座位实验字段');
+    && settings.aiPolicyThresholdsBySeat === undefined
+    && settings.aiDifficultyBySeat === undefined
+    && settings.aiDecisionEngineBySeat === undefined,
+    'importTrainingData 后 loadSettings 不含策略、难度或引擎的座位实验字段');
   assert(settings.difficulty === 'hard', 'importTrainingData 仍合并合法设置字段');
 }
 

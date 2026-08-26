@@ -1,0 +1,1036 @@
+/**
+ * 混合决策实验层：专家候选 + 可插拔价值模型 + 公平信息集采样/受限终局模拟。
+ *
+ * 这里从不读取真实暗牌。每个隐藏牌面都由 108 张牌减去本家手牌、公开出牌与
+ * 已知贡还后重新采样；采样世界只用于估计候选期望，不会写回真实牌局。
+ */
+
+import {
+  RANKS, SUITS, isJoker, isWild, removeCards, soloPower,
+} from './cards.js';
+import {
+  HandType, generateLegalPlays, handSignature, parseHandVariants,
+} from './rules.js';
+import { inferRemainingPool } from './ai-route.js';
+import { createPublicAIObservation } from './ai-observation.js';
+
+export const HYBRID_ENGINE_VERSION = 1;
+export const HYBRID_VALUE_SCHEMA = 'guandan-candidate-v1';
+export const HYBRID_VALUE_FEATURES = Object.freeze([
+  'remaining_fraction', 'played_fraction', 'candidate_size', 'candidate_power',
+  'local_score', 'projected_tricks', 'is_pass', 'is_lead', 'is_bomb',
+  'is_flush_straight', 'uses_wild', 'uses_joker', 'uses_level', 'team_control',
+  'enemy_control', 'enemy_bomb', 'self_count', 'partner_count', 'downstream_count',
+  'upstream_count', 'enemy_min', 'partner_finished', 'enemy_finished',
+  'finishes_now', 'type_single', 'type_pair', 'type_triple', 'type_fullhouse',
+  'type_straight', 'type_triple_pair', 'type_plate', 'main_rank',
+]);
+
+const BOMB_TYPES = new Set([
+  HandType.BOMB, HandType.FLUSH_STRAIGHT, HandType.JOKER_BOMB,
+]);
+const IRREVERSIBLE_STRATEGY_TAGS = new Set([
+  'split_bomb', 'split_flush_straight', 'split_straight', 'split_group',
+  'split_pair', 'wild_as_single', 'wild_simple_use', 'preserve_wild',
+  'premium_tribute_opening', 'control_first',
+]);
+const MODEL_ACTIVATIONS = new Set(['linear', 'relu', 'tanh']);
+const MAX_MODEL_WEIGHTS = 100000;
+let activeValueModel = null;
+
+function clamp(value, low, high) {
+  return Math.max(low, Math.min(high, value));
+}
+
+function physicalKey(card) {
+  if (!card || !Number.isFinite(Number(card.rank)) || !card.suit) return '';
+  const deck = card.deckIndex != null && Number.isFinite(Number(card.deckIndex))
+    ? Number(card.deckIndex) : '?';
+  return `${Number(card.rank)}:${String(card.suit)}:${deck}`;
+}
+
+function faceKey(card) {
+  return `${Number(card?.rank)}:${String(card?.suit || '')}`;
+}
+
+function canonicalDeck() {
+  const cards = [];
+  for (let deckIndex = 0; deckIndex < 2; deckIndex++) {
+    for (const suit of SUITS) {
+      for (const rank of RANKS) {
+        cards.push({
+          id: `sim_${rank}_${suit}_${deckIndex}`,
+          rank,
+          suit,
+          deckIndex,
+        });
+      }
+    }
+    for (const rank of [16, 17]) {
+      cards.push({
+        id: `sim_${rank}_J_${deckIndex}`,
+        rank,
+        suit: 'J',
+        deckIndex,
+      });
+    }
+  }
+  return cards;
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index++) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function observationSeed(observation, extra = 0) {
+  const hand = (observation.hand || []).map(physicalKey).sort().join(',');
+  const played = (observation.playedCards || []).map(physicalKey).sort().join(',');
+  const history = (observation.publicHistory || []).slice(-12)
+    .map((item) => `${item.turn}:${item.seat}:${item.action}:${item.hand?.type || ''}:${item.hand?.power || 0}`)
+    .join(';');
+  return hashString([
+    observation.level, observation.seat, hand, played,
+    (observation.handCounts || []).join(','), history, extra,
+  ].join('|')) || 1;
+}
+
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6D2B79F5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shuffled(cards, random) {
+  const result = cards.slice();
+  for (let index = result.length - 1; index > 0; index--) {
+    const target = Math.floor(random() * (index + 1));
+    [result[index], result[target]] = [result[target], result[index]];
+  }
+  return result;
+}
+
+function takeKnownCard(pool, known) {
+  if (!known) return null;
+  const exact = known.deckIndex != null && Number.isFinite(Number(known.deckIndex));
+  let index = exact
+    ? pool.findIndex((card) => physicalKey(card) === physicalKey(known))
+    : -1;
+  if (index < 0) index = pool.findIndex((card) => faceKey(card) === faceKey(known));
+  if (index < 0) return null;
+  return pool.splice(index, 1)[0];
+}
+
+function removeVisibleCards(pool, cards) {
+  for (const card of cards || []) {
+    if (!takeKnownCard(pool, card)) return false;
+  }
+  return true;
+}
+
+function recentPassProbes(observation) {
+  const probes = [];
+  let target = null;
+  for (const item of observation.publicHistory || []) {
+    if (item.action === 'play' && item.hand) {
+      target = { hand: item.hand, seat: item.seat };
+    } else if (item.action === 'pass' && target && item.seat !== observation.seat) {
+      probes.push({ seat: item.seat, targetSeat: target.seat, hand: target.hand });
+    }
+  }
+  return probes.slice(-8);
+}
+
+function sampleBehaviorScore(hands, observation, probes) {
+  let score = 0;
+  const teams = observation.teams || [0, 1, 0, 1];
+  for (const probe of probes) {
+    const hand = hands[probe.seat] || [];
+    if (!hand.length || !probe.hand) continue;
+    // 当前仍持有的牌是过去手牌的子集；若现在仍可压，当时也具备这条路线。
+    // 过牌只是软证据：对家礼让不罚，对敌方保炸/保结构只作轻度降权。
+    const couldBeat = generateLegalPlays(hand, observation.level, probe.hand).length > 0;
+    if (!couldBeat) score += 0.08;
+    else if (teams[probe.seat] !== teams[probe.targetSeat]) score -= 0.28;
+  }
+  return score;
+}
+
+function buildOneInformationSet(observation, random, probes, attempts) {
+  let best = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const pool = canonicalDeck();
+    if (!removeVisibleCards(pool, observation.hand)
+      || !removeVisibleCards(pool, observation.playedCards)) {
+      return { ok: false, reason: 'visible_card_mismatch' };
+    }
+
+    const hands = Array.from({ length: 4 }, () => []);
+    hands[observation.seat] = observation.hand.map((card) => ({ ...card }));
+    const inferred = inferRemainingPool(observation);
+    for (let seat = 0; seat < 4; seat++) {
+      if (seat === observation.seat) continue;
+      for (const known of inferred.knownBySeat?.[seat] || []) {
+        const card = takeKnownCard(pool, known);
+        if (!card) return { ok: false, reason: 'tribute_card_mismatch' };
+        hands[seat].push(card);
+      }
+    }
+
+    const needBySeat = new Array(4).fill(0);
+    let totalNeed = 0;
+    for (let seat = 0; seat < 4; seat++) {
+      if (seat === observation.seat) continue;
+      const target = Math.max(0, Number(observation.handCounts?.[seat]) || 0);
+      if (hands[seat].length > target) return { ok: false, reason: 'known_card_overflow' };
+      needBySeat[seat] = target - hands[seat].length;
+      totalNeed += needBySeat[seat];
+    }
+    if (pool.length !== totalNeed) {
+      return {
+        ok: false,
+        reason: 'remaining_pool_mismatch',
+        poolCount: pool.length,
+        requiredCount: totalNeed,
+      };
+    }
+
+    const unknown = shuffled(pool, random);
+    let cursor = 0;
+    // 从当前行动者的下家开始轮转发牌，避免固定座位总拿到洗牌数组同一区段。
+    for (let offset = 1; offset <= 4; offset++) {
+      const seat = (observation.seat + offset) % 4;
+      if (seat === observation.seat) continue;
+      const count = needBySeat[seat];
+      hands[seat].push(...unknown.slice(cursor, cursor + count));
+      cursor += count;
+    }
+    const behaviorScore = sampleBehaviorScore(hands, observation, probes);
+    if (!best || behaviorScore > best.behaviorScore) {
+      best = { ok: true, hands, behaviorScore };
+    }
+  }
+  return best || { ok: false, reason: 'sampling_failed' };
+}
+
+/**
+ * 公平地采样当前信息集。返回的是“可能牌面”，不是对真实暗牌的重建。
+ */
+export function samplePublicInformationSets(ctx, options = {}) {
+  const observation = createPublicAIObservation(ctx);
+  const sampleCount = clamp(Math.floor(Number(options.sampleCount) || 4), 1, 32);
+  const attempts = clamp(Math.floor(Number(options.behaviorAttempts) || 2), 1, 6);
+  const random = mulberry32(observationSeed(observation, options.seed || 0));
+  const probes = recentPassProbes(observation);
+  const samples = [];
+  let failure = null;
+  for (let index = 0; index < sampleCount; index++) {
+    const sample = buildOneInformationSet(observation, random, probes, attempts);
+    if (!sample.ok) {
+      failure = sample;
+      break;
+    }
+    samples.push(sample);
+  }
+  return {
+    ok: !failure && samples.length === sampleCount,
+    observation,
+    samples,
+    sampleCount: samples.length,
+    requestedSamples: sampleCount,
+    behaviorProbeCount: probes.length,
+    failure,
+  };
+}
+
+function normalizedCount(value) {
+  return clamp((Number(value) || 0) / 27, 0, 1);
+}
+
+function candidateCards(candidate) {
+  return Array.isArray(candidate?.cards) ? candidate.cards : [];
+}
+
+export function extractHybridValueFeatures(ctx, candidate) {
+  const observation = createPublicAIObservation(ctx);
+  const cards = candidateCards(candidate);
+  const hand = candidate?.hand || null;
+  const seat = observation.seat;
+  const partner = (seat + 2) % 4;
+  const downstream = (seat + 1) % 4;
+  const upstream = (seat + 3) % 4;
+  const enemies = [downstream, upstream]
+    .filter((enemy) => !observation.finishOrder.includes(enemy));
+  const enemyMin = enemies.length
+    ? Math.min(...enemies.map((enemy) => observation.handCounts[enemy])) : 0;
+  const remaining = Math.max(0, observation.hand.length - cards.length);
+  const type = hand?.type;
+  return Float64Array.from([
+    normalizedCount(remaining),
+    clamp((observation.playedCards?.length || 0) / 108, 0, 1),
+    clamp(cards.length / 8, 0, 1),
+    clamp((Number(hand?.power) || 0) / 100, 0, 1),
+    clamp((Number(candidate?.localScore) || 0) / 1000, -2, 2),
+    clamp((Number(candidate?.projectedTricks) || 0) / 12, 0, 2),
+    Number(candidate?.action === 'pass'),
+    Number(!observation.lastHand),
+    Number(BOMB_TYPES.has(type)),
+    Number(type === HandType.FLUSH_STRAIGHT),
+    clamp(cards.filter((card) => isWild(card, observation.level)).length / 2, 0, 1),
+    clamp(cards.filter(isJoker).length / 4, 0, 1),
+    clamp(cards.filter((card) => card.rank === observation.level).length / 8, 0, 1),
+    clamp(Number(candidate?.responseSearch?.teamControl) || 0, 0, 1),
+    clamp(Number(candidate?.responseSearch?.enemyControl) || 0, 0, 1),
+    clamp(Number(candidate?.responseSearch?.enemyBomb) || 0, 0, 1),
+    normalizedCount(observation.handCounts[seat]),
+    normalizedCount(observation.handCounts[partner]),
+    normalizedCount(observation.handCounts[downstream]),
+    normalizedCount(observation.handCounts[upstream]),
+    normalizedCount(enemyMin),
+    Number(observation.finishOrder.includes(partner)),
+    Number(enemies.length < 2),
+    Number(candidate?.action === 'play' && cards.length === observation.hand.length),
+    Number(type === HandType.SINGLE),
+    Number(type === HandType.PAIR),
+    Number(type === HandType.TRIPLE),
+    Number(type === HandType.FULLHOUSE),
+    Number(type === HandType.STRAIGHT),
+    Number(type === HandType.TRIPLE_PAIR),
+    Number(type === HandType.PLATE),
+    clamp((Number(hand?.mainRank) || 0) / 17, 0, 1),
+  ]);
+}
+
+function normalizeLayer(layer, inputSize) {
+  if (!layer || !Array.isArray(layer.weights) || !Array.isArray(layer.bias)) return null;
+  const outputSize = layer.weights.length;
+  if (!outputSize || outputSize > 128 || layer.bias.length !== outputSize) return null;
+  const weights = [];
+  for (const row of layer.weights) {
+    if (!Array.isArray(row) || row.length !== inputSize) return null;
+    const values = row.map(Number);
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    weights.push(values);
+  }
+  const bias = layer.bias.map(Number);
+  if (bias.some((value) => !Number.isFinite(value))) return null;
+  const activation = MODEL_ACTIVATIONS.has(layer.activation) ? layer.activation : 'linear';
+  return { inputSize, outputSize, weights, bias, activation };
+}
+
+export function validateHybridValueModel(model) {
+  if (!model || typeof model !== 'object') return { ok: false, reason: 'model_missing' };
+  if (model.schema !== HYBRID_VALUE_SCHEMA) return { ok: false, reason: 'schema_mismatch' };
+  if (!Array.isArray(model.layers) || !model.layers.length || model.layers.length > 4) {
+    return { ok: false, reason: 'invalid_layers' };
+  }
+  let inputSize = HYBRID_VALUE_FEATURES.length;
+  let weightCount = 0;
+  const layers = [];
+  for (const layer of model.layers) {
+    const normalized = normalizeLayer(layer, inputSize);
+    if (!normalized) return { ok: false, reason: 'invalid_layer_shape' };
+    weightCount += normalized.inputSize * normalized.outputSize + normalized.outputSize;
+    if (weightCount > MAX_MODEL_WEIGHTS) return { ok: false, reason: 'model_too_large' };
+    layers.push(normalized);
+    inputSize = normalized.outputSize;
+  }
+  if (inputSize !== 1) return { ok: false, reason: 'output_must_be_scalar' };
+  return {
+    ok: true,
+    model: {
+      id: String(model.id || 'unnamed-value-model').slice(0, 80),
+      schema: HYBRID_VALUE_SCHEMA,
+      layers,
+      weightCount,
+    },
+  };
+}
+
+export function configureHybridValueModel(model) {
+  if (model == null) {
+    activeValueModel = null;
+    return { ok: true, active: false, modelId: null };
+  }
+  const validation = validateHybridValueModel(model);
+  if (!validation.ok) return { ...validation, active: !!activeValueModel };
+  activeValueModel = validation.model;
+  return { ok: true, active: true, modelId: activeValueModel.id };
+}
+
+export function getHybridValueModelStatus() {
+  return activeValueModel
+    ? { configured: true, modelId: activeValueModel.id, schema: activeValueModel.schema }
+    : { configured: false, modelId: null, schema: HYBRID_VALUE_SCHEMA };
+}
+
+function activate(value, activation) {
+  if (activation === 'relu') return Math.max(0, value);
+  if (activation === 'tanh') return Math.tanh(value);
+  return value;
+}
+
+export function evaluateHybridValueModel(model, features) {
+  const normalized = model?.layers?.[0]?.inputSize != null
+    ? { ok: true, model }
+    : validateHybridValueModel(model);
+  if (!normalized.ok) return null;
+  let values = Array.from(features || []);
+  if (values.length !== HYBRID_VALUE_FEATURES.length) return null;
+  for (const layer of normalized.model.layers) {
+    const next = new Array(layer.outputSize).fill(0);
+    for (let output = 0; output < layer.outputSize; output++) {
+      let sum = layer.bias[output];
+      for (let input = 0; input < layer.inputSize; input++) {
+        sum += layer.weights[output][input] * values[input];
+      }
+      next[output] = activate(sum, layer.activation);
+    }
+    values = next;
+  }
+  return Number.isFinite(values[0]) ? values[0] : null;
+}
+
+function nextSeatWith(state, from, predicate) {
+  for (let offset = 1; offset <= 4; offset++) {
+    const seat = (from + offset) % 4;
+    if (predicate(seat)) return seat;
+  }
+  return null;
+}
+
+function activeSeats(state) {
+  return state.hands.map((hand, seat) => ({ seat, count: hand.length }))
+    .filter((item) => item.count > 0)
+    .map((item) => item.seat);
+}
+
+function finishSeat(state, seat) {
+  if (!state.finishOrder.includes(seat)) state.finishOrder.push(seat);
+}
+
+function completeFinishOrder(state) {
+  const missing = [0, 1, 2, 3].filter((seat) => !state.finishOrder.includes(seat));
+  missing.sort((left, right) => state.hands[left].length - state.hands[right].length || left - right);
+  state.finishOrder.push(...missing);
+}
+
+function terminalTeam(state) {
+  for (const team of [0, 1]) {
+    const seats = [0, 1, 2, 3].filter((seat) => state.teams[seat] === team);
+    if (seats.every((seat) => state.finishOrder.includes(seat))) return team;
+  }
+  return null;
+}
+
+function teamUpgradeUtility(finishOrder, teams, rootTeam) {
+  if (!finishOrder.length) return 0;
+  const winner = teams[finishOrder[0]];
+  const partnerSeat = finishOrder.find((seat) => seat !== finishOrder[0] && teams[seat] === winner);
+  const partnerPlace = finishOrder.indexOf(partnerSeat);
+  const upgrade = partnerPlace === 1 ? 3 : partnerPlace === 2 ? 2 : 1;
+  return winner === rootTeam ? upgrade : -upgrade;
+}
+
+function isBomb(hand) {
+  return BOMB_TYPES.has(hand?.type);
+}
+
+function rolloutStructureCost(play, fullHand, level) {
+  const cards = play.cards || [];
+  let cost = cards.filter((card) => isWild(card, level)).length * 8;
+  cost += cards.filter(isJoker).length * 4;
+  if (isBomb(play.hand) && cards.length < fullHand.length) cost += 32;
+  if ([HandType.SINGLE, HandType.PAIR, HandType.TRIPLE].includes(play.hand?.type)) {
+    const rank = play.hand.mainRank;
+    const before = fullHand.filter((card) => card.rank === rank && !isWild(card, level)).length;
+    if (before > cards.length) cost += (before - cards.length) * 5;
+  }
+  return cost;
+}
+
+function chooseRolloutPlay(state, seat) {
+  const hand = state.hands[seat];
+  const plays = generateLegalPlays(hand, state.level, state.lastHand);
+  if (!plays.length) return null;
+  const finishing = plays.filter((play) => play.cards.length === hand.length);
+  if (finishing.length) {
+    return finishing.sort((left, right) => (
+      Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+      || left.hand.power - right.hand.power
+    ))[0];
+  }
+
+  if (state.lastHand && state.lastSeat != null
+    && state.teams[state.lastSeat] === state.teams[seat]) return null;
+
+  const lastEnemyCount = state.lastSeat != null
+    && state.teams[state.lastSeat] !== state.teams[seat]
+    ? state.hands[state.lastSeat].length : 99;
+  const ordinary = plays.filter((play) => !isBomb(play.hand));
+  const pool = ordinary.length
+    ? ordinary
+    : (lastEnemyCount <= 4 || hand.length <= 8 ? plays : []);
+  if (!pool.length) return null;
+
+  return pool.slice().sort((left, right) => {
+    const leftRemain = hand.length - left.cards.length;
+    const rightRemain = hand.length - right.cards.length;
+    const leftCost = rolloutStructureCost(left, hand, state.level);
+    const rightCost = rolloutStructureCost(right, hand, state.level);
+    if (!state.lastHand) {
+      return leftRemain - rightRemain
+        || leftCost - rightCost
+        || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+        || left.hand.power - right.hand.power
+        || handSignature(left.hand).localeCompare(handSignature(right.hand));
+    }
+    return leftCost - rightCost
+      || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+      || left.hand.power - right.hand.power
+      || handSignature(left.hand).localeCompare(handSignature(right.hand));
+  })[0];
+}
+
+function respondersForCurrentTrick(state) {
+  const active = activeSeats(state);
+  if (state.lastSeat == null) return [];
+  if (state.hands[state.lastSeat].length > 0) {
+    return active.filter((seat) => seat !== state.lastSeat);
+  }
+  const waitingPartner = (state.lastSeat + 2) % 4;
+  return active.filter((seat) => seat !== waitingPartner);
+}
+
+function closeTrickIfComplete(state) {
+  if (!state.lastHand || state.lastSeat == null) return false;
+  const responders = respondersForCurrentTrick(state);
+  if (!responders.every((seat) => state.passed.has(seat))) return false;
+  const last = state.lastSeat;
+  const partner = (last + 2) % 4;
+  const leader = state.hands[last].length > 0
+    ? last
+    : state.hands[partner].length > 0
+      ? partner
+      : nextSeatWith(state, last, (seat) => state.hands[seat].length > 0);
+  state.lastHand = null;
+  state.lastSeat = null;
+  state.passed.clear();
+  state.currentSeat = leader;
+  return true;
+}
+
+function nextResponder(state, from) {
+  const responders = new Set(respondersForCurrentTrick(state));
+  return nextSeatWith(state, from, (seat) => (
+    state.hands[seat].length > 0
+    && responders.has(seat)
+    && !state.passed.has(seat)
+  ));
+}
+
+function historicalPasses(observation) {
+  const passed = new Set();
+  const history = observation.publicHistory || [];
+  let lastPlayIndex = -1;
+  for (let index = history.length - 1; index >= 0; index--) {
+    if (history[index].action === 'play') {
+      lastPlayIndex = index;
+      break;
+    }
+  }
+  if (lastPlayIndex < 0) return passed;
+  for (let index = lastPlayIndex + 1; index < history.length; index++) {
+    if (history[index].action === 'pass' && history[index].seat != null) {
+      passed.add(history[index].seat);
+    }
+  }
+  return passed;
+}
+
+function resolveCandidateCards(candidate, hand) {
+  if (candidate.action === 'pass') return [];
+  const byId = new Map(hand.map((card) => [String(card.id), card]));
+  const cards = candidateCards(candidate).map((card) => byId.get(String(card.id))).filter(Boolean);
+  return cards.length === candidateCards(candidate).length ? cards : null;
+}
+
+function cutoffUtility(state, rootTeam) {
+  let own = 0;
+  let enemy = 0;
+  let ownFinished = 0;
+  let enemyFinished = 0;
+  for (let seat = 0; seat < 4; seat++) {
+    if (state.teams[seat] === rootTeam) {
+      own += state.hands[seat].length;
+      ownFinished += Number(state.finishOrder.includes(seat));
+    } else {
+      enemy += state.hands[seat].length;
+      enemyFinished += Number(state.finishOrder.includes(seat));
+    }
+  }
+  const control = state.lastSeat == null ? 0
+    : state.teams[state.lastSeat] === rootTeam ? 0.18 : -0.18;
+  return clamp((enemy - own) / 18 + (ownFinished - enemyFinished) * 0.7 + control, -2.5, 2.5);
+}
+
+function applyRootCandidate(state, candidate, observation) {
+  const seat = observation.seat;
+  if (candidate.action === 'pass') {
+    state.passed.add(seat);
+    if (!closeTrickIfComplete(state)) {
+      state.currentSeat = nextResponder(state, seat);
+    }
+    return true;
+  }
+  const cards = resolveCandidateCards(candidate, state.hands[seat]);
+  if (!cards) return false;
+  state.hands[seat] = removeCards(state.hands[seat], cards);
+  state.lastHand = candidate.hand;
+  state.lastSeat = seat;
+  state.passed.clear();
+  if (!state.hands[seat].length) finishSeat(state, seat);
+  if (terminalTeam(state) != null) return true;
+  state.currentSeat = nextResponder(state, seat);
+  if (state.currentSeat == null) closeTrickIfComplete(state);
+  return true;
+}
+
+function simulateCandidate(sample, observation, candidate, limits) {
+  const state = {
+    hands: sample.hands.map((hand) => hand.map((card) => ({ ...card }))),
+    teams: observation.teams.slice(),
+    level: observation.level,
+    finishOrder: observation.finishOrder.slice(),
+    lastHand: observation.lastHand,
+    lastSeat: observation.lastSeat,
+    passed: historicalPasses(observation),
+    currentSeat: null,
+  };
+  if (!applyRootCandidate(state, candidate, observation)) {
+    return { ok: false, utility: null, plies: 0, reason: 'candidate_card_mismatch' };
+  }
+  const rootTeam = state.teams[observation.seat];
+  let plies = 0;
+
+  while (plies < limits.maxPlies && limits.nodes.value < limits.nodeBudget) {
+    if (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs) {
+      return { ok: true, utility: cutoffUtility(state, rootTeam), plies, timedOut: true };
+    }
+    const winner = terminalTeam(state);
+    if (winner != null || state.finishOrder.length >= 3) {
+      completeFinishOrder(state);
+      return {
+        ok: true,
+        utility: teamUpgradeUtility(state.finishOrder, state.teams, rootTeam),
+        plies,
+        terminal: true,
+      };
+    }
+    if (state.currentSeat == null) {
+      if (!closeTrickIfComplete(state)) {
+        state.currentSeat = nextSeatWith(state, observation.seat, (seat) => state.hands[seat].length > 0);
+      }
+      if (state.currentSeat == null) break;
+    }
+    const seat = state.currentSeat;
+    const play = chooseRolloutPlay(state, seat);
+    limits.nodes.value += 1;
+    plies += 1;
+    if (!play) {
+      state.passed.add(seat);
+      if (!closeTrickIfComplete(state)) state.currentSeat = nextResponder(state, seat);
+      continue;
+    }
+    state.hands[seat] = removeCards(state.hands[seat], play.cards);
+    state.lastHand = play.hand;
+    state.lastSeat = seat;
+    state.passed.clear();
+    if (!state.hands[seat].length) finishSeat(state, seat);
+    state.currentSeat = nextResponder(state, seat);
+    if (state.currentSeat == null) closeTrickIfComplete(state);
+  }
+  return {
+    ok: true,
+    utility: cutoffUtility(state, rootTeam),
+    plies,
+    truncated: true,
+  };
+}
+
+function performanceNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function criticalHybridSituation(observation) {
+  const activeCounts = observation.handCounts.filter((count, seat) => (
+    count > 0 && !observation.finishOrder.includes(seat)
+  ));
+  const total = activeCounts.reduce((sum, count) => sum + count, 0);
+  const enemies = observation.handCounts.filter((count, seat) => (
+    count > 0
+    && observation.teams[seat] !== observation.teams[observation.seat]
+    && !observation.finishOrder.includes(seat)
+  ));
+  const enemyMin = enemies.length ? Math.min(...enemies) : 99;
+  const partner = (observation.seat + 2) % 4;
+  return {
+    active: total <= 42
+      || observation.hand.length <= 10
+      || enemyMin <= 7
+      || (observation.handCounts[partner] > 0 && observation.handCounts[partner] <= 5),
+    total,
+    enemyMin,
+  };
+}
+
+function centeredAdjustments(values, cap, scale) {
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return values.map(() => 0);
+  const mean = finite.reduce((sum, value) => sum + value, 0) / finite.length;
+  return values.map((value) => Number.isFinite(value)
+    ? clamp((value - mean) * scale, -cap, cap)
+    : 0);
+}
+
+function candidateBaseScores(candidates, localCandidateId) {
+  const playScores = candidates.map((candidate) => Number(candidate.localScore))
+    .filter(Number.isFinite);
+  const top = playScores.length ? Math.max(...playScores) : 0;
+  // localCandidateId 是专家层经过“资源安全池、搭档礼让、硬残局”等门控后的
+  // 最终选择，不一定是未经门控的 raw score 第一名。增强层必须把该结论当
+  // 作基线锚点，否则会把专家明确排除的领炸/领王重新捡回来。
+  const localAnchor = top + 8;
+  return candidates.map((candidate) => {
+    if (candidate.id === localCandidateId) return localAnchor;
+    if (Number.isFinite(Number(candidate.localScore))) return Number(candidate.localScore);
+    return top - 10;
+  });
+}
+
+function candidateResourceUse(candidate, observation) {
+  const cards = candidateCards(candidate);
+  return {
+    bomb: BOMB_TYPES.has(candidate?.hand?.type),
+    jokers: cards.filter(isJoker).length,
+    wilds: cards.filter((card) => isWild(card, observation.level)).length,
+    levels: cards.filter((card) => card.rank === observation.level).length,
+    finishes: candidate?.action === 'play' && cards.length === observation.hand.length,
+    irreversibleTags: (candidate?.tags || []).filter((tag) => (
+      IRREVERSIBLE_STRATEGY_TAGS.has(tag)
+    )),
+  };
+}
+
+/**
+ * 专家安全筛选：混合层只在可逆、资源等级相近的候选之间重排。
+ * 这不是重复打分；它阻止低样本 rollout 用“多走几张”的短视收益绕过
+ * 专家层已经明确作出的不领炸、不先交王、不浪费逢人配和不拆结构门控。
+ */
+function hybridCandidateSafety(candidate, localCandidate, observation) {
+  if (candidate.id === localCandidate.id) return { eligible: true, reason: 'expert_anchor' };
+  if (candidate.action === 'pass') {
+    if (localCandidate.action === 'play') {
+      return { eligible: false, reason: 'no_new_pass_override' };
+    }
+    const enemyMin = observation.handCounts.reduce((best, count, seat) => (
+      observation.teams[seat] !== observation.teams[observation.seat]
+        && !observation.finishOrder.includes(seat)
+        && count > 0 ? Math.min(best, count) : best
+    ), 99);
+    return enemyMin > 6
+      ? { eligible: true, reason: 'reversible_pass' }
+      : { eligible: false, reason: 'urgent_enemy_no_pass_override' };
+  }
+  const current = candidateResourceUse(candidate, observation);
+  const local = candidateResourceUse(localCandidate, observation);
+  const candidateRoute = Number(candidate.projectedTricks);
+  const localRoute = Number(localCandidate.projectedTricks);
+  const endgameRouteImproves = observation.hand.length <= 10
+    && Number.isFinite(candidateRoute)
+    && Number.isFinite(localRoute)
+    && candidateRoute < localRoute;
+  if (current.finishes) return { eligible: true, reason: 'finish_now' };
+  if (current.bomb && !local.bomb) {
+    return { eligible: false, reason: 'premium_control_escalation' };
+  }
+  if (current.jokers > local.jokers) {
+    return { eligible: false, reason: 'extra_joker_spend' };
+  }
+  if (current.wilds > local.wilds) {
+    return { eligible: false, reason: 'extra_wild_spend' };
+  }
+  if (current.levels > local.levels) {
+    return { eligible: false, reason: 'extra_level_spend' };
+  }
+  const localTags = new Set(local.irreversibleTags);
+  const newDamage = current.irreversibleTags.find((tag) => !localTags.has(tag));
+  // 十张内若专家自己的路线估计确认“拆后严格少一手”，可把普通结构重组
+  // 交给信息集模拟复核；炸弹、王、逢人配等不可逆资源仍由上面的硬门保护。
+  if (newDamage && !endgameRouteImproves) {
+    return { eligible: false, reason: `new_${newDamage}` };
+  }
+  const candidateScore = Number(candidate.localScore);
+  const localScore = Number(localCandidate.localScore);
+  if (Number.isFinite(candidateScore) && Number.isFinite(localScore)
+    && candidateScore < localScore - 16 && !endgameRouteImproves) {
+    return { eligible: false, reason: 'expert_score_floor' };
+  }
+  return { eligible: true, reason: 'safe_rerank' };
+}
+
+export function evaluateInformationSetCandidates(ctx, candidates, options = {}) {
+  const observation = createPublicAIObservation(ctx);
+  const critical = criticalHybridSituation(observation);
+  if (!critical.active) {
+    return { applied: false, reason: 'not_critical', observation, candidateResults: [] };
+  }
+  const sampling = samplePublicInformationSets(observation, {
+    sampleCount: options.sampleCount,
+    behaviorAttempts: options.behaviorAttempts,
+    seed: options.seed,
+  });
+  if (!sampling.ok) {
+    return {
+      applied: false,
+      reason: sampling.failure?.reason || 'sampling_failed',
+      observation,
+      sampling,
+      candidateResults: [],
+    };
+  }
+  const nodes = { value: 0 };
+  const limits = {
+    maxPlies: clamp(Math.floor(Number(options.maxPlies) || 96), 16, 180),
+    nodeBudget: clamp(Math.floor(Number(options.nodeBudget) || 2400), 100, 12000),
+    // Number(null) 为 0；若把“无墙钟限制”的 null 当作 0，循环会在第一步前
+    // 立即判定超时。只有调用方明确提供有限数值时才启用截止时间。
+    deadlineMs: options.deadlineMs != null && Number.isFinite(Number(options.deadlineMs))
+      ? Number(options.deadlineMs) : null,
+    nodes,
+  };
+  const candidateResults = candidates.map((candidate) => {
+    const outcomes = [];
+    const failures = {};
+    let terminalCount = 0;
+    let truncatedCount = 0;
+    for (const sample of sampling.samples) {
+      if (nodes.value >= limits.nodeBudget
+        || (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs)) break;
+      const outcome = simulateCandidate(sample, observation, candidate, limits);
+      if (!outcome.ok || !Number.isFinite(outcome.utility)) {
+        const reason = outcome.reason || 'invalid_utility';
+        failures[reason] = (failures[reason] || 0) + 1;
+        continue;
+      }
+      outcomes.push(outcome.utility);
+      terminalCount += Number(outcome.terminal === true);
+      truncatedCount += Number(outcome.truncated === true || outcome.timedOut === true);
+    }
+    const utility = outcomes.length
+      ? outcomes.reduce((sum, value) => sum + value, 0) / outcomes.length : null;
+    return {
+      candidateId: candidate.id,
+      utility,
+      completedSamples: outcomes.length,
+      terminalCount,
+      truncatedCount,
+      failures,
+    };
+  });
+  const completeCandidates = candidateResults.filter((item) => item.completedSamples > 0).length;
+  return {
+    applied: completeCandidates === candidates.length && candidates.length > 1,
+    reason: completeCandidates === candidates.length ? 'completed' : 'budget_exhausted',
+    observation,
+    sampling,
+    critical,
+    candidateResults,
+    nodes: nodes.value,
+  };
+}
+
+function decisionFromCandidate(candidate, observation) {
+  if (!candidate || candidate.action === 'pass') return { action: 'pass' };
+  const cards = resolveCandidateCards(candidate, observation.hand);
+  if (!cards) return null;
+  // 云端/混合候选为控制体积只携带紧凑 hand，但 signature 保留了逢人配、
+  // 顺子和同花顺的完整声明。执行前必须用本家实体牌重建完整牌型，不能把
+  // 缺少 meta.sequence / meta.suit 的紧凑对象直接写进正式牌局状态。
+  const variants = parseHandVariants(cards, observation.level);
+  const declared = variants.find((hand) => handSignature(hand) === candidate.signature);
+  if (!declared) return null;
+  return {
+    action: 'play',
+    cards,
+    hand: declared,
+    signature: handSignature(declared),
+    projectedTricks: candidate.projectedTricks ?? null,
+  };
+}
+
+/**
+ * 在专家层已经给出的安全候选中进行混合重排。任何错误、预算耗尽、模型缺失或
+ * 采样不一致都返回原专家动作，保证这是增强层而不是新的单点故障。
+ */
+export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
+  const observation = createPublicAIObservation(ctx);
+  const localCandidate = (consultation?.candidates || []).find(
+    (candidate) => candidate.id === consultation?.localCandidateId,
+  );
+  const fallback = (reason, extra = {}) => ({
+    decision: consultation?.action ? {
+      action: consultation.action,
+      ...(consultation.cards ? {
+        cards: consultation.cards,
+        hand: consultation.hand,
+        signature: consultation.signature || handSignature(consultation.hand),
+      } : {}),
+      reason: consultation.reason || '专家策略回退',
+      projectedTricks: consultation.projectedTricks ?? null,
+      hybrid: {
+        version: HYBRID_ENGINE_VERSION,
+        applied: false,
+        reason,
+        localCandidateId: consultation?.localCandidateId || null,
+        finalCandidateId: consultation?.localCandidateId || null,
+        changedDecision: false,
+        model: getHybridValueModelStatus(),
+        ...extra,
+      },
+    } : null,
+    telemetry: { applied: false, reason, ...extra },
+  });
+
+  if (!consultation || !localCandidate) return fallback('missing_local_candidate');
+  const allCandidates = consultation.candidates || [];
+  // 专家最终选择优先进入池，再补入原排序靠前候选。本地模拟不受云端最多
+  // 3 个候选的传输限制，但仍限制为 6 个，控制浏览器端时间与组合爆炸。
+  const consideredCandidates = [
+    localCandidate,
+    ...allCandidates.filter((candidate) => candidate.id !== localCandidate.id),
+  ];
+  const safety = consideredCandidates.map((candidate) => ({
+    candidate,
+    ...hybridCandidateSafety(candidate, localCandidate, observation),
+  }));
+  const candidateLimit = clamp(Math.floor(Number(options.candidateLimit) || 6), 2, 8);
+  const candidates = safety.filter((item) => item.eligible)
+    .map((item) => item.candidate)
+    .slice(0, candidateLimit);
+  const rejected = safety.filter((item) => !item.eligible);
+  const rejectedCandidates = rejected.slice(0, 64).map((item) => ({
+    id: item.candidate.id,
+    reason: item.reason,
+  }));
+  const rejectionSummary = rejected.reduce((summary, item) => {
+    summary[item.reason] = (summary[item.reason] || 0) + 1;
+    return summary;
+  }, {});
+  if (candidates.length < 2 || consultation.cloudConstraint !== 'soft_rerank') {
+    return fallback('hard_constraint_or_single_candidate', {
+      rejectedCandidates,
+      rejectedCandidateCount: rejected.length,
+      rejectionSummary,
+    });
+  }
+
+  const baseScores = candidateBaseScores(candidates, consultation.localCandidateId);
+  const model = options.valueModel || activeValueModel;
+  const rawModelValues = candidates.map((candidate) => (
+    model ? evaluateHybridValueModel(model, extractHybridValueFeatures(observation, candidate)) : null
+  ));
+  const modelAdjustments = centeredAdjustments(rawModelValues, 18, 12);
+  const informationSet = evaluateInformationSetCandidates(observation, candidates, {
+    sampleCount: options.sampleCount,
+    behaviorAttempts: options.behaviorAttempts,
+    maxPlies: options.maxPlies,
+    nodeBudget: options.nodeBudget,
+    deadlineMs: options.deadlineMs,
+    seed: options.seed,
+  });
+  const utilityById = new Map(
+    (informationSet.candidateResults || []).map((item) => [item.candidateId, item.utility]),
+  );
+  const rolloutResultById = new Map(
+    (informationSet.candidateResults || []).map((item) => [item.candidateId, item]),
+  );
+  const rawUtilities = candidates.map((candidate) => utilityById.get(candidate.id));
+  const rolloutAdjustments = informationSet.applied
+    ? centeredAdjustments(rawUtilities, 24, 12)
+    : candidates.map(() => 0);
+  const modelApplied = rawModelValues.some(Number.isFinite);
+  if (!informationSet.applied && !modelApplied) {
+    return fallback(informationSet.reason || 'no_enhancement_evidence', {
+      samples: informationSet.sampling?.sampleCount || 0,
+      nodes: informationSet.nodes || 0,
+    });
+  }
+
+  const scores = candidates.map((candidate, index) => ({
+    candidate,
+    baseScore: baseScores[index],
+    modelValue: rawModelValues[index],
+    modelAdjustment: modelAdjustments[index],
+    rolloutUtility: rawUtilities[index] ?? null,
+    rolloutAdjustment: rolloutAdjustments[index],
+    rolloutResult: rolloutResultById.get(candidate.id) || null,
+    finalScore: baseScores[index] + modelAdjustments[index] + rolloutAdjustments[index],
+    local: candidate.id === consultation.localCandidateId,
+  })).sort((left, right) => (
+    right.finalScore - left.finalScore
+    || Number(right.local) - Number(left.local)
+    || String(left.candidate.id).localeCompare(String(right.candidate.id))
+  ));
+
+  const selected = scores[0];
+  const decision = decisionFromCandidate(selected.candidate, observation);
+  if (!decision) {
+    return fallback('selected_candidate_invalid', {
+      samples: informationSet.sampling?.sampleCount || 0,
+      nodes: informationSet.nodes || 0,
+    });
+  }
+  const changed = selected.candidate.id !== consultation.localCandidateId;
+  decision.reason = changed
+    ? `混合决策：专家安全候选经${model ? '专用价值模型与' : ''}公平信息集模拟后改选`
+    : `混合决策：信息集模拟认可专家首选`;
+  decision.hybrid = {
+    version: HYBRID_ENGINE_VERSION,
+    applied: informationSet.applied || modelApplied,
+    reason: informationSet.reason,
+    localCandidateId: consultation.localCandidateId,
+    finalCandidateId: selected.candidate.id,
+    changedDecision: changed,
+    samples: informationSet.sampling?.sampleCount || 0,
+    nodes: informationSet.nodes || 0,
+    model: model
+      ? { configured: true, modelId: model.id || 'inline-model', schema: model.schema }
+      : getHybridValueModelStatus(),
+    candidates: scores.map((item) => ({
+      id: item.candidate.id,
+      baseScore: Math.round(item.baseScore * 10) / 10,
+      modelValue: Number.isFinite(item.modelValue)
+        ? Math.round(item.modelValue * 1000) / 1000 : null,
+      rolloutUtility: Number.isFinite(item.rolloutUtility)
+        ? Math.round(item.rolloutUtility * 1000) / 1000 : null,
+      completedSamples: item.rolloutResult?.completedSamples || 0,
+      failures: item.rolloutResult?.failures || {},
+      finalScore: Math.round(item.finalScore * 10) / 10,
+    })),
+    rejectedCandidates,
+    rejectedCandidateCount: rejected.length,
+    rejectionSummary,
+  };
+  return { decision, telemetry: decision.hybrid };
+}
