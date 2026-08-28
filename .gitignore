@@ -23,3 +23,12 @@ Thumbs.db
 # A/B / 消融实验输出（不入库）
 ab_*.json
 ab_*.err
+
+# 第三方公开对局只保存在本机；来源页未授予本仓库再分发许可
+训练数据/*
+!训练数据/README.md
+
+# 自对弈、训练和 A/B 运行产物默认不入库；明确晋级的回执模型可单独提交
+data/*
+!data/*promoted*.json
+!data/*.promoted.json

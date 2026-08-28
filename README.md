@@ -22,7 +22,7 @@
 .\start-lan.ps1
 ```
 
-`127.0.0.1` 是本机回环地址：只有当前电脑能访问，手机和其他电脑无法连接，也不需要开放 Windows 防火墙。服务仅开放 `index.html`、`css/`、`js/` 和健康检查，不会公开 README 或项目目录。
+`127.0.0.1` 是本机回环地址：只有当前电脑能访问，手机和其他电脑无法连接，也不需要开放 Windows 防火墙。服务仅开放页面静态资源、健康检查，以及供本页使用的本机 LLM 配置/健康/决策 API；不会公开 README、训练数据或项目目录。
 
 直接双击 `index.html` 可能因浏览器模块策略无法加载，必须先运行启动入口。
 
@@ -35,7 +35,8 @@
 | 升级与胜负 | 双上 +3、头三 +2、头末 +1；打 A 过关；三次不过 A 回 2 |
 | 进贡还贡 | 单下/双下、抗贡、首出权；有 ≤10 非级牌时严格从中还贡 |
 | 多难度 AI | 简单、普通、困难、大师；大师模式在困难前瞻基础上强化公开牌史记忆、牌型规划、搭档配合、残局控制和候选比较，且不读取其他玩家未公开手牌 |
-| 混合决策（实验） | 公平观察 → 规则候选 → 专家安全筛选 → 可插拔价值模型 → 信息集采样/终局模拟 → 团队升级收益；异常原样回退专家策略 |
+| 公平搜索（实验） | PIMC 混合搜索或成对根 PIMC：公平观察 → 规则候选 → 专家安全筛选 → 公开信息集采样 → 同世界成对 rollout → 团队升级收益；异常原样回退专家策略 |
+| 对手建模（实验） | 只从你的公开出牌/过牌频率学习牌型倾向；大师 AI 仅在领出时作 ±12 分内的候选排序，不读取暗牌 |
 | 教练模式 | 推荐主出法、理由、预计剩余手数及备选；查看与采用分为两个动作 |
 | 五维评价 | 配合、资源、结构、残局、防守；显示扣分依据、错误标签和更优参考 |
 | 训练口径 | 分开统计综合均分、无辅助均分、辅助决策和被迫操作 |
@@ -67,9 +68,10 @@
 - P0 公开余牌模型按座位使用已出牌、张数、贡还和过牌证据估算同型可接概率；P1 在安全候选内展开“下家应手→对家接回→上家反压”的一层公开应手树，并按团队升级/保名次价值重排。
 - P2 把炸弹、普通接法和过牌放进同一净收益，并计入被更大炸弹反压；P3 补齐“下家过→对家直接接手→上家反压”，只在公开风险显著下降且零结构损伤时抬牌保护对家；P4 在十四张内的残局/名次关键区做受节点和墙钟约束的两层公开情景 rollout；P5 对 P1/P3/P4 的相关牌权分做有界、零均值融合，避免重复叠分。
 - P0-P5 都不读取或采样真实暗牌；`no-p0` 至 `no-p5` 可逐项消融，`p1-only` 用于比较 P2-P5 联合增益。旧的“只因下家短就机械抬牌”仍保持关闭，与新版 P3 的公开风险护牌不是同一个策略。
-- 顶部“本地引擎”默认使用稳定的“专家策略”。显式切到“混合搜索（实验）”后，仅在大师难度关键残局启用：先用公平白名单隔离真实暗牌，再从完整的规则生成候选中保留专家安全候选；随后对未知牌池做多次合规假想发牌，并用受节点/墙钟约束的模拟比较团队升级收益。
+- 顶部“本地引擎”默认使用稳定的“专家策略”。“混合搜索（实验）”保留原有 PIMC：每个安全候选在多个公平假想牌面上比较；“成对根 PIMC（实验）”让全部候选在相同假想牌面完成一次成对 rollout。它不声称 UCB 或树内增量搜索；每一条 iteration 都是一次实际 rollout。成对根 PIMC 至少要求每个候选 3 次有效访问和 2 个完整成对世界，只有候选收益下置信界超过专家首选上置信界时才允许改选。
 - 混合层不能把专家已经决定的普通接牌改成过牌，也不能恢复专家已排除的领炸、先交王、额外消耗级牌/逢人配或新增结构破坏。采样失败、超时、证据不足、牌型声明不一致或只剩一个安全候选时，最终动作保持专家首选。
-- `guandan-candidate-v1` 提供固定 32 维候选特征与最多四层稠密价值模型的校验/推理接口；当前仓库**没有冒充附带训练好的神经网络权重**。模型缺失时只使用信息集模拟，未来权重必须由独立自我对弈数据训练，并通过未见种子门禁后才能发布。
+- `guandan-candidate-v1` 提供固定 32 维候选特征与最多四层稠密价值模型的校验/推理接口；当前仓库**没有冒充附带训练好的神经网络权重**。`guandan-selfplay-trajectory-v2` 训练数据使用递归白名单，并重算候选归属、规则合法性、牌型声明、32维特征及终局团队收益；旧版轨迹不能混入。线性训练器只产生 `experimental_unvalidated` 模型，并记录训练数据 SHA-256 与种子清单；网页只接受带完整发布回执、完成全13级、至少500组未见种子镜像、全部计划局与区组完成、零失败且升级收益置信下界为正的 `promoted` 模型。模型仅在搜索证据充分的关键局面参与，不会绕过专家和搜索门禁。
+- 每副结束后，系统把你已公开的领出类型、面对各座位/牌型的应手与过牌、实际应手牌型和公开用炸按余牌压力平滑汇总。旧 v1 画像会自动迁移到 v2。只有总样本达到 12 次且分项证据足够时，大师 AI 领出才获得最多 ±12 分软偏置；过牌绝不会被推断成“手里有炸”，规则和安全门始终优先。
 - “独立散单接管”只在对手十张内或连续走单压力成立时升级为硬拦截。
 - 真实复盘防线把“团队名次下延迟整手强控出完”和“对手五张内最低损伤普通接牌”接入 AI、教练与评分同一核心；十张软压力在未见种子镜像赛中显著负向，因此默认关闭，仅保留 `with-soft-ordinary-pressure` 实验臂。
 - 不读取对手或对家未公开手牌；局末自动亮牌仅用于复盘。
@@ -99,12 +101,30 @@
 - 更换端口、浏览器或浏览器用户资料后，数据彼此独立；可通过统计弹窗导出/导入。
 - 本项目没有网络账号、云同步或多人联网对战。
 
+### 外部对局训练数据
+
+- `tools/download_njupt_archives.py` 会从南邮比赛结果页发现全部 RAR，保留原包和 SHA-256，逐包安全解压；不会运行来源中的 `replay.py`。
+- `tools/import_njupt_data.py` 使用受限 pickle 原语解释器导入 `.data/.ros/.data_R1_R2`，不调用 `pickle.load()`。
+- `tools/import_botzone_guandan.py` 可导入 Botzone 月度 ZIP；当官方归档主机不可用时，可限速读取匿名公开比赛页，并保留 HTML、来源 URL 和哈希。
+- 当前本机快照包含南邮 139 局和 Botzone 最近 100 个来源对局；结构化写入 230 局，其中 229 局结构完整。严格重放通过的轨迹也只作为隔离候选，统一保持 `trainingEligible=false`；动作不唯一的接风适配轨迹同样不可训练。
+- 外部档案含四家完整手牌，只能在规则重放后转换为“行动座位手牌 + 当时公开信息”的公平观察，绝不能直接接入对局 AI。
+- 来源页未明确授予本仓库再分发许可，因此 `训练数据/` 默认不提交到公开仓库。完整目录、异常明细和复现命令见 `训练数据/README.md`。
+- 自对弈、训练和 A/B 运行产物同样默认不提交；只有经过门禁生成的晋级模型回执才应按发布评审单独加入版本库。
+
 ## 自动测试
 
 ```bash
+# Windows 统一入口；加 -FullData 才校验本机大数据与外部隔离产物
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\verify.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\verify.ps1 -FullData
+
 node js/rules.test.js
 node js/ai.test.js
 node js/ai.hybrid.test.js
+node js/opponent-model.test.js
+node js/value-model-gate.test.js
+node js/ai.worker.test.js
+node js/ai.worker.integration.test.js
 node js/game.test.js
 node js/stats.test.js
 node js/ui.static.test.js
@@ -116,6 +136,7 @@ node js/ai.ab.simulation.js 30 20260801 expert baseline --levels=all
 node js/ai.ab.simulation.js 30 20260811 expert no-p0 --levels=2,3,4,5,6,7,8,9,10,J,Q,K,A
 node js/ai.ab.simulation.js 20 20260825 expert p1-legacy --levels=all --level-blocks
 node js/ai.ab.simulation.js 20 20260826 hybrid-v1 expert --levels=all --level-blocks --summary-only
+node js/ai.ab.simulation.js 20 20260826 root-pimc-v1 expert --levels=all --level-blocks --summary-only
 node js/ai.ab.simulation.js 3 20260925 expert p1-legacy --levels=all --level-blocks --trace-divergence
 node js/ai.ab.simulation.js 20 20260825 expert no-p1 --levels=2,A --continuous-match
 node js/ai.ablation.simulation.js 20 20260811 --levels=all --level-blocks
@@ -123,11 +144,32 @@ node js/ai.exploit.simulation.js 100 20260814 --levels=all --gate
 node js/ai.policy.calibration.js 4 20 20260825 --levels=all
 node js/ai.ab.simulation.js 20 20261210 expert p1-only --levels=all --level-blocks --summary-only --json
 node tools/replay_ai_audit.mjs "C:\路径\掼蛋训练数据_YYYY-MM-DD.json" 8
+node tools/selfplay_dataset.mjs 20 20260901 data/selfplay.jsonl
+# 长任务中断后从最近完整牌局继续
+node tools/selfplay_dataset.mjs 20 20260901 data/selfplay.jsonl --resume
+node tools/validate_value_dataset.mjs data/selfplay.jsonl
+python tools/train_value_model.py data/selfplay.jsonl data/value-model.json 350
+node tools/validate_value_model.mjs data/value-model.json
+# 正式模型 A/B 的 40 个评测种子必须与训练清单不重叠；脚本会在首局前拒绝重叠。
+node js/ai.ab.simulation.js 40 920000 root-pimc-v1 expert --levels=all --level-blocks --summary-only --json --value-model=data/value-model.json --report=data/value-model-ab.json
+# 连续赛必须是与训练集、主 A/B 都不重叠的完整 8 场证据。
+node js/ai.ab.simulation.js 4 931000 root-pimc-v1 expert --levels=2 --continuous-match --summary-only --json --value-model=data/value-model.json --report=data/value-model-continuous.json --checkpoint=data/value-model-continuous.checkpoint.json
+node tools/promote_value_model.mjs data/value-model.json data/value-model-ab.json data/value-model.promoted.json --continuous-report=data/value-model-continuous.json
+node tools/validate_external_replay_policy.mjs --trajectory "训练数据/验证/external-trajectory-v2.jsonl" --status "训练数据/验证/external-replay-status.json"
+python tools/test_import_botzone_guandan.py
+python tools/test_import_njupt_data.py
+python tools/download_njupt_archives.py --self-test
 ```
 
-测试覆盖逢人配多解、牌型声明、AI 前瞻与评价、还贡约束、状态恢复、统计口径、响应式/无障碍契约，以及完整一副自动对局与复盘结构。A/B 脚本按相同种子交换两种策略的座位，只把两腿都完成且牌面/先手一致的镜像组计入结果，并报告升级净效用、头游、双上、配对 bootstrap 区间、死局、耗时和 2 至 A 分层。`--level-blocks` 会把每副基础牌在全部指定级牌下重复评测，并按基础牌区组而非13个相关观测做 bootstrap；20个基础牌区组、13级、双腿正好是520局。`--trace-divergence` 在同一本家牌和公开信息上影子比较两种策略，只记录每局首个分歧，不执行影子动作。`--continuous-match` 通过正式状态机一直打到过 A，覆盖进贡、还贡、升级和三次 A 失败回2。`ai.ablation.simulation.js` 对 P0-P5 分别做单变量消融，并另测 P2-P5 联合增益；控权 V2 仍拆为五个旧实验臂。`ai.policy.calibration.js` 先在训练种子中比较预注册幅度臂，再用不重叠的未见种子留出集决定 `promote/hold`，只输出报告、不自动改权重。`ai.exploit.simulation.js` 用同牌镜像比较正式大师策略与“连续最小单张”冲刺代理。模块存在交互，结果不能机械相加；小样本只作烟雾测试，正式调参结论至少使用20个未见基础牌区组（520局）并同时检查连续整场结果。
+测试覆盖逢人配多解、牌型声明、AI 前瞻与评价、还贡约束、状态恢复、统计口径、响应式/无障碍契约，以及完整一副自动对局与复盘结构。A/B 脚本按相同种子交换两种策略的座位，只把两腿都完成且牌面/先手一致的镜像组计入结果，并报告升级净效用、头游、双上、配对 bootstrap 区间、死局、耗时和 2 至 A 分层。`--level-blocks` 会把每副基础牌在全部指定级牌下重复评测，并按基础牌区组而非13个相关观测做 bootstrap；40个基础牌区组、13级、双腿为1040局/520组镜像，达到价值模型发布门禁。`--value-model` 会在启动前检查评测种子与训练种子无重叠，并把跨运行时一致的模型权重 SHA-256、评估种子清单和训练数据来源写入报告；`promote_value_model.mjs` 会核对权重摘要、完整发布回执、训练/评估种子不重叠、覆盖、样本、安全性和收益置信区间。小样本只作烟雾测试，不会晋级模型。
 
-2026-08-26 的混合决策框架完成两组独立未见种子烟雾赛：`20260831` 的 10/10 局相对专家策略升级效用 `+0.1/局`、头游 `5:5`、双上 `2:2`；`20260901` 的 20/20 局升级效用 `+0.15/局`、头游 `11:9`、双上 `4:4`。两组均为 0 失败、0 死锁；第二组 940 个混合回合中 31 次完成模拟、2 次实际改选。它们只证明链路生效且暂未见明显退化，远不足以证明强度显著提升；因此“专家策略”仍为默认，正式晋级仍需至少 20 个基础牌区组/520 局及真人复盘共同通过。
+M2 首个干净批次已用 `20260901–20260940` 生成并通过严格校验（40 副、3,859 条轨迹）；生成器按副增量写入并保留 `guandan-selfplay-checkpoint-v1`，校验器逐行读取，训练器分块计算数据 SHA-256。对应模型 `data/value-model-20260901-experimental.json` 只用于离线评测，未通过正式 A/B 门禁前不会被网页加载。
+
+该模型随后完成正式 1,040 局 A/B（40 个基础牌区组、13 级、双腿换座）：520/520 镜像组，0 失败、0 死锁、0 镜像偏差；相对专家升级效用 `+0.010/局`，配对 bootstrap 95% 为 `-0.008～+0.029`，下界跨 0。因此历史门禁只生成 `validated` 回执而非 `promoted` 模型，网页继续使用专家默认策略。
+
+2026-08-28 已用语义权重摘要重新建立 `root-pimc-v1` 的独立连续赛：`baseSeed=931000–931003`，8/8 场、4/4 镜像组、0 失败/死锁/镜像偏差，覆盖 113 轮、92 个贡还轮和 11 个 ≥120 动作长轮。旧 1,040 局主 A/B 的报告绑定的是早期文件摘要，不能与语义摘要模型或这份新连续赛拼接成发布回执；而且其收益下界本就跨 0。故当前没有可加载的 `promoted` 模型，专家策略仍是预期默认值。
+
+2026-08-26 的混合决策框架完成两组独立未见种子烟雾赛：`20260831` 的 10/10 局相对专家策略升级效用 `+0.1/局`、头游 `5:5`、双上 `2:2`；`20260901` 的 20/20 局升级效用 `+0.15/局`、头游 `11:9`、双上 `4:4`。两组均为 0 失败、0 死锁；第二组 940 个混合回合中 31 次完成模拟、2 次实际改选。它们只证明链路生效且暂未见明显退化，远不足以证明强度显著提升；因此“专家策略”仍为默认，正式晋级需至少 39 个完整基础牌区组（13 级共 507 组镜像/1014 局；推荐按上方命令取 40 区组、520 组镜像/1040 局）及真人复盘共同通过。
 
 2026-08-25 的 P2-P5 未见种子留出验证使用 `seed=20261210`：520/520 局完成，0 失败、0 死锁、0 镜像偏差；相对 `p1-only` 的升级效用为 `+0.025/局`（基础牌区组 bootstrap 95%：`-0.031～+0.083`），头游 `260:260`，双上 `125:123`。它满足当前“无明显退化”的安全发布门槛，但区间仍跨 0，只能表述为安全中性偏正，不能表述为已证明显著变强。
 
@@ -142,7 +184,9 @@ js/cards.js                # 牌张、牌组与排序
 js/rules.js                # 多解规则引擎
 js/ai.js                   # 多难度 AI 与有界前瞻
 js/ai-observation.js       # AI 公平公开信息白名单与泄漏审计
-js/ai-hybrid.js            # 专家安全候选、价值模型接口与信息集终局模拟
+js/ai-hybrid.js            # 专家安全候选、PIMC/成对根 PIMC、价值模型接口与信息集终局模拟
+js/value-model-gate.js     # 价值模型 experimental/validated/promoted 发布门禁
+js/opponent-model.js       # 仅公开行动统计、跨局持久化的真人对手模型 v2
 js/ai-route.js             # 公开余牌、座位应手树与受限残局 rollout
 js/ai.policy.calibration.js # P5 离线选型与未见种子发布门禁
 js/evaluator.js            # 五维出牌评价
@@ -154,6 +198,15 @@ lan_server.py              # 仅绑定 127.0.0.1 的受限静态服务
 start-lan.ps1              # 本机服务启动器
 tools/llm_smoke.py         # 真实本机网关/云端决策烟雾测试
 tools/replay_ai_audit.mjs  # 导出数据的逐手公开信息 AI 反事实审计
+tools/selfplay_dataset.mjs # 公平自对弈轨迹数据生成器（手动执行）
+tools/validate_value_dataset.mjs # 训练数据暗牌边界校验
+tools/train_value_model.py # 本机线性价值模型训练器（实验）
+tools/validate_value_model.mjs # 浏览器模型接口校验
+tools/promote_value_model.mjs # 绑定未见种子A/B报告的模型晋级工具
+tools/download_njupt_archives.py # 南邮公开竞赛数据下载与安全解压
+tools/import_njupt_data.py # 南邮 pickle 原语安全导入器
+tools/import_botzone_guandan.py # Botzone ZIP/公开回放导入器
+训练数据/README.md         # 本机外部数据快照、门禁和授权说明
 启动本机版.cmd              # 推荐的 Windows 双击入口
 启动内网版.cmd              # 兼容入口，同样仅限本机
 README.md
@@ -206,6 +259,7 @@ python .\tools\llm_smoke.py
 ## 当前边界
 
 - 大师难度仍是本机启发式评分与有限前瞻，不代表职业级或深度强化学习模型。
-- 混合搜索已经具备公平观察、假想发牌、受限模拟、团队收益和价值模型接口，但当前轻量 rollout 不是完整 ISMCTS，也没有经过自我对弈训练的专用权重；它仍属于可消融的实验引擎。
+- 成对根 PIMC 已实现“相同世界基础覆盖 + 置信改选”的受限版本，但不是 UCB 树搜索或 DanZero 式全树深度强化学习；没有达到 `promoted` 强制门禁的训练权重不会进入正式对局。
+- 完整 DanZero/深度强化学习仍需要外部 GPU 自对弈训练、专用策略/价值网络、模型导出和大量对抗评测；本项目现在具备公平数据契约、模型接口、离线训练起点与加载入口，尚不能宣称达到职业/竞赛级强度。
 - `127.0.0.1` 只允许当前电脑访问。
 - 如果未来需要真实账号登录、跨设备同步或真人联网对战，需要新增后端、数据库和认证系统。
