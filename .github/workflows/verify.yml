@@ -16,6 +16,11 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 20
+    env:
+      # GitHub Windows runners otherwise inherit a cp1252 console.  The
+      # verification suite intentionally prints Chinese diagnostic messages.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
