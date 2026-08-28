@@ -13,9 +13,23 @@ import {
 } from './rules.js';
 import { inferRemainingPool } from './ai-route.js';
 import { createPublicAIObservation } from './ai-observation.js';
+import {
+  VALUE_MODEL_STATUS, isPromotedValueModel, valueModelStatus,
+} from './value-model-gate.js';
 
 export const HYBRID_ENGINE_VERSION = 1;
 export const HYBRID_VALUE_SCHEMA = 'guandan-candidate-v1';
+/**
+ * 信息集增强的两个可验证搜索模式：
+ * - pimc-v1：每个候选在每个公平采样世界各 rollout 一次（现有基线）。
+ * - paired-root-pimc-v1：在相同假想世界成对覆盖全部候选，并用完整世界数
+ *   和有效访问数约束改选。世界仍来自当前公开信息集，不会把真实暗牌传入
+ *   模拟器。它不是树搜索：每次 iteration 都对应一次实际 rollout。
+ */
+export const HYBRID_SEARCH_MODES = Object.freeze({
+  PIMC: 'pimc-v1',
+  PAIRED_ROOT_PIMC: 'paired-root-pimc-v1',
+});
 export const HYBRID_VALUE_FEATURES = Object.freeze([
   'remaining_fraction', 'played_fraction', 'candidate_size', 'candidate_power',
   'local_score', 'projected_tricks', 'is_pass', 'is_lead', 'is_bomb',
@@ -40,6 +54,17 @@ let activeValueModel = null;
 
 function clamp(value, low, high) {
   return Math.max(low, Math.min(high, value));
+}
+
+function normalizeSearchMode(value) {
+  const mode = String(value || '').toLowerCase();
+  // 保留历史保存设置、旧 A/B 报告重放所用标识的读取兼容；运行时遥测
+  // 一律使用诚实的 paired-root-pimc-v1 名称。
+  if (mode === 'ismcts' || mode === 'ismcts-root' || mode === 'ismcts-root-v1'
+    || mode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC) {
+    return HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC;
+  }
+  return HYBRID_SEARCH_MODES.PIMC;
 }
 
 function physicalKey(card) {
@@ -353,25 +378,43 @@ export function validateHybridValueModel(model) {
       schema: HYBRID_VALUE_SCHEMA,
       layers,
       weightCount,
+      metadata: {
+        status: valueModelStatus(model),
+      },
     },
   };
 }
 
-export function configureHybridValueModel(model) {
+export function configureHybridValueModel(model, options = {}) {
   if (model == null) {
     activeValueModel = null;
-    return { ok: true, active: false, modelId: null };
+    return { ok: true, active: false, modelId: null, status: null };
   }
   const validation = validateHybridValueModel(model);
   if (!validation.ok) return { ...validation, active: !!activeValueModel };
+  const status = valueModelStatus(model);
+  if (!isPromotedValueModel(model) && options.allowExperimental !== true) {
+    return {
+      ok: false,
+      reason: 'model_not_promoted',
+      status,
+      requiredStatus: VALUE_MODEL_STATUS.PROMOTED,
+      active: !!activeValueModel,
+    };
+  }
   activeValueModel = validation.model;
-  return { ok: true, active: true, modelId: activeValueModel.id };
+  return { ok: true, active: true, modelId: activeValueModel.id, status };
 }
 
 export function getHybridValueModelStatus() {
   return activeValueModel
-    ? { configured: true, modelId: activeValueModel.id, schema: activeValueModel.schema }
-    : { configured: false, modelId: null, schema: HYBRID_VALUE_SCHEMA };
+    ? {
+        configured: true,
+        modelId: activeValueModel.id,
+        schema: activeValueModel.schema,
+        status: activeValueModel.metadata?.status || VALUE_MODEL_STATUS.EXPERIMENTAL,
+      }
+    : { configured: false, modelId: null, schema: HYBRID_VALUE_SCHEMA, status: null };
 }
 
 function activate(value, activation) {
@@ -672,7 +715,7 @@ function performanceNow() {
   return globalThis.performance?.now?.() ?? Date.now();
 }
 
-function criticalHybridSituation(observation) {
+function criticalHybridSituation(observation, searchMode = HYBRID_SEARCH_MODES.PIMC) {
   const activeCounts = observation.handCounts.filter((count, seat) => (
     count > 0 && !observation.finishOrder.includes(seat)
   ));
@@ -684,11 +727,21 @@ function criticalHybridSituation(observation) {
   ));
   const enemyMin = enemies.length ? Math.min(...enemies) : 99;
   const partner = (observation.seat + 2) % 4;
-  return {
-    active: total <= 42
+  const baseCritical = total <= 42
       || observation.hand.length <= 10
       || enemyMin <= 7
-      || (observation.handCounts[partner] > 0 && observation.handCounts[partner] <= 5),
+      || (observation.handCounts[partner] > 0 && observation.handCounts[partner] <= 5);
+  // 成对根 PIMC 的价值在“公开信息已足够收缩、但还来得及争牌权”的中残局。
+  // 仅对显式根模式放宽一档；原 PIMC 的触发范围不变，避免把较短的
+  // 基线 rollout 无证据地扩散到中盘。所有扩展分支仍受同一墙钟/节点预算。
+  const extendedRootCritical = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+    && (total <= 56
+      || observation.hand.length <= 13
+      || enemyMin <= 9
+      || (observation.handCounts[partner] > 0 && observation.handCounts[partner] <= 7));
+  return {
+    active: baseCritical || extendedRootCritical,
+    scope: baseCritical ? 'base' : extendedRootCritical ? 'root_extended' : 'none',
     total,
     enemyMin,
   };
@@ -789,11 +842,160 @@ function hybridCandidateSafety(candidate, localCandidate, observation) {
   return { eligible: true, reason: 'safe_rerank' };
 }
 
+function summarizeCandidateRollouts(candidateId, outcomes, failures, terminalCount, truncatedCount, visits = outcomes.length) {
+  const utility = outcomes.length
+    ? outcomes.reduce((sum, value) => sum + value, 0) / outcomes.length : null;
+  const variance = outcomes.length > 1 && Number.isFinite(utility)
+    ? outcomes.reduce((sum, value) => sum + ((value - utility) ** 2), 0) / (outcomes.length - 1)
+    : null;
+  const standardError = Number.isFinite(variance) && outcomes.length > 0
+    ? Math.sqrt(Math.max(0, variance) / outcomes.length) : null;
+  return {
+    candidateId,
+    utility,
+    completedSamples: outcomes.length,
+    visits: Math.max(0, Number(visits) || 0),
+    terminalCount,
+    truncatedCount,
+    variance,
+    standardError,
+    failures,
+  };
+}
+
+function runPIMCSearch(observation, sampling, candidates, limits) {
+  const candidateResults = candidates.map((candidate) => {
+    const outcomes = [];
+    const failures = {};
+    let terminalCount = 0;
+    let truncatedCount = 0;
+    for (const sample of sampling.samples) {
+      if (limits.nodes.value >= limits.nodeBudget
+        || (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs)) break;
+      const outcome = simulateCandidate(sample, observation, candidate, limits);
+      if (!outcome.ok || !Number.isFinite(outcome.utility)) {
+        const reason = outcome.reason || 'invalid_utility';
+        failures[reason] = (failures[reason] || 0) + 1;
+        continue;
+      }
+      outcomes.push(outcome.utility);
+      terminalCount += Number(outcome.terminal === true);
+      truncatedCount += Number(outcome.truncated === true || outcome.timedOut === true);
+    }
+    return summarizeCandidateRollouts(
+      candidate.id, outcomes, failures, terminalCount, truncatedCount, outcomes.length,
+    );
+  });
+  return {
+    searchMode: HYBRID_SEARCH_MODES.PIMC,
+    iterations: candidateResults.reduce((sum, item) => sum + item.visits, 0),
+    candidateResults,
+  };
+}
+
+function runPairedRootPIMCSearch(observation, sampling, candidates, limits, options) {
+  const stats = candidates.map((candidate) => ({
+    candidateId: candidate.id,
+    outcomes: [],
+    failures: {},
+    terminalCount: 0,
+    truncatedCount: 0,
+    attempts: 0,
+    visits: 0,
+    total: 0,
+    worldAttempts: new Array(sampling.samples.length).fill(0),
+    worldScored: new Array(sampling.samples.length).fill(false),
+  }));
+  const defaultIterations = Math.max(candidates.length * 2, sampling.samples.length * candidates.length);
+  const iterationBudget = clamp(
+    Math.floor(Number(options.iterationBudget) || defaultIterations),
+    candidates.length,
+    2000,
+  );
+  let iterations = 0;
+  let pairedWorlds = 0;
+  const canContinue = () => (
+    iterations < iterationBudget
+    && limits.nodes.value < limits.nodeBudget
+    && (limits.deadlineMs == null || performanceNow() < limits.deadlineMs)
+  );
+  const runAttempt = (candidateIndex, worldIndex) => {
+    const item = stats[candidateIndex];
+    item.attempts += 1;
+    item.worldAttempts[worldIndex] += 1;
+    iterations += 1;
+    // 每个候选在每个假想世界最多 rollout 一次；不把重复世界伪装成独立样本。
+    if (item.worldScored[worldIndex]) return;
+    const outcome = simulateCandidate(
+      sampling.samples[worldIndex],
+      observation,
+      candidates[candidateIndex],
+      limits,
+    );
+    if (!outcome.ok || !Number.isFinite(outcome.utility)) {
+      const reason = outcome.reason || 'invalid_utility';
+      item.failures[reason] = (item.failures[reason] || 0) + 1;
+      return;
+    }
+    item.worldScored[worldIndex] = true;
+    item.visits += 1;
+    item.total += outcome.utility;
+    item.outcomes.push(outcome.utility);
+    item.terminalCount += Number(outcome.terminal === true);
+    item.truncatedCount += Number(outcome.truncated === true || outcome.timedOut === true);
+  };
+
+  // 基础覆盖必须以“世界”为外层：同一个假想牌面依次评估所有候选，
+  // 且每个世界轮换首个候选。这样候选差异不会被未知牌面难度混淆。
+  const baseWorldBudget = Math.min(
+    sampling.samples.length,
+    Math.floor(iterationBudget / Math.max(1, candidates.length)),
+  );
+  let baseInterrupted = false;
+  for (let worldIndex = 0; worldIndex < baseWorldBudget; worldIndex++) {
+    let attemptedInWorld = 0;
+    for (let offset = 0; offset < candidates.length; offset++) {
+      if (!canContinue()) {
+        baseInterrupted = true;
+        break;
+      }
+      const candidateIndex = (worldIndex + offset) % candidates.length;
+      runAttempt(candidateIndex, worldIndex);
+      attemptedInWorld += 1;
+    }
+    if (attemptedInWorld === candidates.length) pairedWorlds += 1;
+    if (baseInterrupted) break;
+  }
+
+  const candidateResults = stats.map((item) => summarizeCandidateRollouts(
+    item.candidateId,
+    item.outcomes,
+    item.failures,
+    item.terminalCount,
+    item.truncatedCount,
+    item.visits,
+  )).map((summary, index) => ({
+    ...summary,
+    attempts: stats[index].attempts,
+    worldAttempts: stats[index].worldAttempts.slice(),
+  }));
+  return {
+    searchMode: HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC,
+    iterations,
+    iterationBudget,
+    pairedWorlds,
+    candidateResults,
+  };
+}
+
 export function evaluateInformationSetCandidates(ctx, candidates, options = {}) {
   const observation = createPublicAIObservation(ctx);
-  const critical = criticalHybridSituation(observation);
+  const searchMode = normalizeSearchMode(options.searchMode);
+  const critical = criticalHybridSituation(observation, searchMode);
   if (!critical.active) {
-    return { applied: false, reason: 'not_critical', observation, candidateResults: [] };
+    return {
+      applied: false, reason: 'not_critical', searchMode, observation, candidateResults: [],
+    };
   }
   const sampling = samplePublicInformationSets(observation, {
     sampleCount: options.sampleCount,
@@ -804,6 +1006,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     return {
       applied: false,
       reason: sampling.failure?.reason || 'sampling_failed',
+      searchMode,
       observation,
       sampling,
       candidateResults: [],
@@ -819,44 +1022,110 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
       ? Number(options.deadlineMs) : null,
     nodes,
   };
-  const candidateResults = candidates.map((candidate) => {
-    const outcomes = [];
-    const failures = {};
-    let terminalCount = 0;
-    let truncatedCount = 0;
-    for (const sample of sampling.samples) {
-      if (nodes.value >= limits.nodeBudget
-        || (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs)) break;
-      const outcome = simulateCandidate(sample, observation, candidate, limits);
-      if (!outcome.ok || !Number.isFinite(outcome.utility)) {
-        const reason = outcome.reason || 'invalid_utility';
-        failures[reason] = (failures[reason] || 0) + 1;
-        continue;
-      }
-      outcomes.push(outcome.utility);
-      terminalCount += Number(outcome.terminal === true);
-      truncatedCount += Number(outcome.truncated === true || outcome.timedOut === true);
-    }
-    const utility = outcomes.length
-      ? outcomes.reduce((sum, value) => sum + value, 0) / outcomes.length : null;
-    return {
-      candidateId: candidate.id,
-      utility,
-      completedSamples: outcomes.length,
-      terminalCount,
-      truncatedCount,
-      failures,
-    };
-  });
+  const search = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+    ? runPairedRootPIMCSearch(observation, sampling, candidates, limits, options)
+    : runPIMCSearch(observation, sampling, candidates, limits);
+  const { candidateResults } = search;
   const completeCandidates = candidateResults.filter((item) => item.completedSamples > 0).length;
+  const rootMinimumEffectiveVisits = clamp(
+    Math.floor(Number(options.minimumEffectiveVisits) || 3), 2, 12,
+  );
+  // 根搜索至少要有两个完整成对的假想世界。sampleCount=1 时
+  // 不可靠在同一世界重复 rollout 伪造信心。
+  const requiredPairedWorlds = Math.max(
+    2, Math.min(rootMinimumEffectiveVisits, sampling.samples.length),
+  );
+  const rootEvidenceSufficient = searchMode !== HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC || (
+    candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
+    && Number(search.pairedWorlds) >= requiredPairedWorlds
+  );
+  const completed = completeCandidates === candidates.length;
   return {
-    applied: completeCandidates === candidates.length && candidates.length > 1,
-    reason: completeCandidates === candidates.length ? 'completed' : 'budget_exhausted',
+    applied: completed && candidates.length > 1 && rootEvidenceSufficient,
+    reason: !completed ? 'budget_exhausted'
+      : rootEvidenceSufficient ? 'completed' : 'insufficient_search_evidence',
+    searchMode: search.searchMode,
+    iterations: search.iterations,
+    iterationBudget: search.iterationBudget || null,
+    pairedWorlds: search.pairedWorlds || 0,
+    minimumEffectiveVisits: searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+      ? rootMinimumEffectiveVisits : null,
+    requiredPairedWorlds: searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+      ? requiredPairedWorlds : null,
     observation,
     sampling,
     critical,
     candidateResults,
     nodes: nodes.value,
+  };
+}
+
+function rootRerankConfidence(informationSet, proposedCandidateId, localCandidateId, options = {}) {
+  if (informationSet?.searchMode !== HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC) {
+    return { required: false, allowed: true, reason: 'not_root_search' };
+  }
+  if (proposedCandidateId === localCandidateId) {
+    return { required: true, allowed: true, reason: 'expert_anchor_retained' };
+  }
+  const minimumEffectiveVisits = Number(informationSet.minimumEffectiveVisits) || 3;
+  const proposed = (informationSet.candidateResults || []).find(
+    (item) => item.candidateId === proposedCandidateId,
+  );
+  const local = (informationSet.candidateResults || []).find(
+    (item) => item.candidateId === localCandidateId,
+  );
+  if (!informationSet.applied || !proposed || !local
+    || proposed.visits < minimumEffectiveVisits || local.visits < minimumEffectiveVisits) {
+    return {
+      required: true,
+      allowed: false,
+      reason: 'insufficient_effective_visits',
+      minimumEffectiveVisits,
+      proposedVisits: proposed?.visits || 0,
+      localVisits: local?.visits || 0,
+    };
+  }
+  const proposedError = proposed.standardError;
+  const localError = local.standardError;
+  if (!Number.isFinite(proposed.utility) || !Number.isFinite(local.utility)
+    || !Number.isFinite(proposedError) || !Number.isFinite(localError)) {
+    return {
+      required: true,
+      allowed: false,
+      reason: 'uncertainty_unavailable',
+      minimumEffectiveVisits,
+    };
+  }
+  const confidenceZ = clamp(
+    Number.isFinite(Number(options.confidenceZ)) ? Number(options.confidenceZ) : 1,
+    0.25,
+    3,
+  );
+  const minimumUtilityGap = clamp(
+    Number.isFinite(Number(options.minimumUtilityGap)) ? Number(options.minimumUtilityGap) : 0.05,
+    0,
+    1,
+  );
+  const proposedLowerBound = proposed.utility - confidenceZ * proposedError;
+  const localUpperBound = local.utility + confidenceZ * localError;
+  const confidenceGap = proposedLowerBound - localUpperBound;
+  const allowed = confidenceGap >= minimumUtilityGap;
+  return {
+    required: true,
+    allowed,
+    reason: allowed ? 'confidence_margin_met' : 'confidence_margin_insufficient',
+    minimumEffectiveVisits,
+    confidenceZ,
+    minimumUtilityGap,
+    proposedVisits: proposed.visits,
+    localVisits: local.visits,
+    proposedUtility: proposed.utility,
+    localUtility: local.utility,
+    proposedStandardError: proposedError,
+    localStandardError: localError,
+    proposedLowerBound,
+    localUpperBound,
+    confidenceGap,
   };
 }
 
@@ -902,6 +1171,8 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
         version: HYBRID_ENGINE_VERSION,
         applied: false,
         reason,
+        searchMode: normalizeSearchMode(options.searchMode),
+        iterations: 0,
         localCandidateId: consultation?.localCandidateId || null,
         finalCandidateId: consultation?.localCandidateId || null,
         changedDecision: false,
@@ -946,19 +1217,25 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
   }
 
   const baseScores = candidateBaseScores(candidates, consultation.localCandidateId);
-  const model = options.valueModel || activeValueModel;
-  const rawModelValues = candidates.map((candidate) => (
-    model ? evaluateHybridValueModel(model, extractHybridValueFeatures(observation, candidate)) : null
-  ));
-  const modelAdjustments = centeredAdjustments(rawModelValues, 18, 12);
   const informationSet = evaluateInformationSetCandidates(observation, candidates, {
     sampleCount: options.sampleCount,
     behaviorAttempts: options.behaviorAttempts,
     maxPlies: options.maxPlies,
     nodeBudget: options.nodeBudget,
+    iterationBudget: options.iterationBudget,
+    minimumEffectiveVisits: options.minimumEffectiveVisits,
+    searchMode: options.searchMode,
     deadlineMs: options.deadlineMs,
     seed: options.seed,
   });
+  // 模型不是独立于搜索的全局启发式。只有当前关键局面的信息集搜索已获得
+  // 足够公平证据时才允许参与；not_critical、采样失败或根置信不足均原样
+  // 回退专家，保证网页“仅在关键局面启用”的说明与真实行为一致。
+  const model = informationSet.applied ? (options.valueModel || activeValueModel) : null;
+  const rawModelValues = candidates.map((candidate) => (
+    model ? evaluateHybridValueModel(model, extractHybridValueFeatures(observation, candidate)) : null
+  ));
+  const modelAdjustments = centeredAdjustments(rawModelValues, 18, 12);
   const utilityById = new Map(
     (informationSet.candidateResults || []).map((item) => [item.candidateId, item.utility]),
   );
@@ -993,7 +1270,17 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     || String(left.candidate.id).localeCompare(String(right.candidate.id))
   ));
 
-  const selected = scores[0];
+  const proposed = scores[0];
+  const rerankGate = rootRerankConfidence(
+    informationSet,
+    proposed.candidate.id,
+    consultation.localCandidateId,
+    options,
+  );
+  let selected = proposed;
+  if (!rerankGate.allowed) {
+    selected = scores.find((item) => item.candidate.id === consultation.localCandidateId) || proposed;
+  }
   const decision = decisionFromCandidate(selected.candidate, observation);
   if (!decision) {
     return fallback('selected_candidate_invalid', {
@@ -1002,16 +1289,26 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     });
   }
   const changed = selected.candidate.id !== consultation.localCandidateId;
-  decision.reason = changed
+  decision.reason = !rerankGate.allowed
+    ? '信息集搜索证据不足，保持专家首选'
+    : changed
     ? `混合决策：专家安全候选经${model ? '专用价值模型与' : ''}公平信息集模拟后改选`
     : `混合决策：信息集模拟认可专家首选`;
   decision.hybrid = {
     version: HYBRID_ENGINE_VERSION,
     applied: informationSet.applied || modelApplied,
-    reason: informationSet.reason,
+    reason: !rerankGate.allowed ? rerankGate.reason : informationSet.reason,
     localCandidateId: consultation.localCandidateId,
+    proposedCandidateId: proposed.candidate.id,
     finalCandidateId: selected.candidate.id,
     changedDecision: changed,
+    searchMode: informationSet.searchMode || HYBRID_SEARCH_MODES.PIMC,
+    iterations: informationSet.iterations || 0,
+    iterationBudget: informationSet.iterationBudget || null,
+    pairedWorlds: informationSet.pairedWorlds || 0,
+    minimumEffectiveVisits: informationSet.minimumEffectiveVisits || null,
+    requiredPairedWorlds: informationSet.requiredPairedWorlds || null,
+    rerankGate,
     samples: informationSet.sampling?.sampleCount || 0,
     nodes: informationSet.nodes || 0,
     model: model
@@ -1025,6 +1322,10 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
       rolloutUtility: Number.isFinite(item.rolloutUtility)
         ? Math.round(item.rolloutUtility * 1000) / 1000 : null,
       completedSamples: item.rolloutResult?.completedSamples || 0,
+      attempts: item.rolloutResult?.attempts || 0,
+      visits: item.rolloutResult?.visits || 0,
+      standardError: Number.isFinite(item.rolloutResult?.standardError)
+        ? Math.round(item.rolloutResult.standardError * 1000) / 1000 : null,
       failures: item.rolloutResult?.failures || {},
       finalScore: Math.round(item.finalScore * 10) / 10,
     })),

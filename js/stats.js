@@ -3,10 +3,15 @@
  * 所有写入均安全降级，隐私模式或空间不足时不会中断对局。
  */
 
+import {
+  emptyOpponentProfile, normalizeOpponentProfile, observePublicRound,
+} from './opponent-model.js';
+
 const KEY = 'guandan_skill_stats_v1';
 const SETTINGS_KEY = 'guandan_settings_v1';
 const REPLAY_KEY = 'guandan_replays_v1';
 const ACTIVE_MATCH_KEY = 'guandan_active_match_v2';
+const VALUE_MODEL_KEY = 'guandan_value_model_v1';
 const DATA_VERSION = 2;
 const REPLAY_LIMIT = 100;
 
@@ -92,6 +97,8 @@ const defaultStats = () => ({
   mistakeCounts: {},
   difficulty: emptyDifficulty(),
   llm: emptyLLMStats(),
+  // 仅含公开行动频率，不包含初始牌、终局余牌或任何电脑私有信息。
+  opponentModel: emptyOpponentProfile(),
   scoreTrend: [],
   matchWins: 0,
   matchLosses: 0,
@@ -114,6 +121,7 @@ function mergeStats(raw) {
     mistakeCounts: { ...(parsed.mistakeCounts || {}) },
     difficulty,
     llm: { ...base.llm, ...(parsed.llm || {}) },
+    opponentModel: normalizeOpponentProfile(parsed.opponentModel),
     scoreTrend: Array.isArray(parsed.scoreTrend) ? parsed.scoreTrend.slice(-100) : [],
   };
 }
@@ -143,6 +151,8 @@ export function recordRoundResult({
   matchWon,
   difficulty = 'normal',
   llmReport = null,
+  publicHistory = null,
+  userSeat = 0,
 }) {
   const s = loadStats();
   s.totalRounds += 1;
@@ -223,6 +233,13 @@ export function recordRoundResult({
   }
   s.llm = llm;
 
+  // 画像只从本副已经公开的逐手历史生成；回放暗牌、起手牌、教练评价均不参与。
+  if (Array.isArray(publicHistory) && publicHistory.length) {
+    s.opponentModel = observePublicRound(s.opponentModel, publicHistory, { userSeat });
+  } else {
+    s.opponentModel = normalizeOpponentProfile(s.opponentModel);
+  }
+
   s.scoreTrend.push({
     time: new Date().toISOString(),
     difficulty,
@@ -276,7 +293,7 @@ export function loadSettings() {
     const raw = storage().getItem(SETTINGS_KEY);
     const parsed = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
     if (!['local', 'auto', 'cloud'].includes(parsed.llmPolicyMode)) parsed.llmPolicyMode = 'local';
-    if (!['expert', 'hybrid'].includes(parsed.localAiEngine)) parsed.localAiEngine = 'expert';
+    if (!['expert', 'hybrid', 'ismcts'].includes(parsed.localAiEngine)) parsed.localAiEngine = 'expert';
     return parsed;
   } catch {
     return defaults;
@@ -285,6 +302,27 @@ export function loadSettings() {
 
 export function saveSettings(settings) {
   return safeSet(SETTINGS_KEY, settings);
+}
+
+/**
+ * 训练得到的本地候选价值模型单独保存，不混入用户战绩导入导出；模型仍可
+ * 通过其原始 JSON 文件迁移。具体合法性由 ai-hybrid 的同一校验器负责。
+ */
+export function loadLocalValueModel() {
+  try {
+    const raw = storage().getItem(VALUE_MODEL_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLocalValueModel(model) {
+  return safeSet(VALUE_MODEL_KEY, model);
+}
+
+export function clearLocalValueModel() {
+  return safeRemove(VALUE_MODEL_KEY);
 }
 
 /** 保存最近若干副复盘 */
@@ -347,16 +385,36 @@ export function importTrainingData(data) {
   if (!data || typeof data !== 'object' || !data.stats || !Array.isArray(data.replays)) {
     return { ok: false, reason: '文件不是有效的掼蛋训练数据' };
   }
-  const statsOk = safeSet(KEY, mergeStats(data.stats));
   // 剥离 A/B 模拟器实验字段，避免导入后正式对局某座被永久钉死 baseline/no-pX
-  const settingsOk = safeSet(SETTINGS_KEY, sanitizeUserSettings({
-    ...loadSettings(),
-    ...(data.settings || {}),
-  }));
-  const replayOk = safeSet(REPLAY_KEY, data.replays.slice(0, REPLAY_LIMIT));
-  return statsOk && settingsOk && replayOk
-    ? { ok: true }
-    : { ok: false, reason: '浏览器存储空间不足，导入未完成' };
+  const prepared = {
+    stats: mergeStats(data.stats),
+    settings: sanitizeUserSettings({
+      ...loadSettings(),
+      ...(data.settings || {}),
+    }),
+    replays: data.replays.slice(0, REPLAY_LIMIT),
+  };
+  // 导入是一个跨三个 key 的事务：先拍快照，再写入；任一写入失败都尽力
+  // 恢复全部旧值，避免出现“战绩已换但设置/复盘仍是旧版本”的半导入状态。
+  const target = storage();
+  const keys = [KEY, SETTINGS_KEY, REPLAY_KEY];
+  const previous = new Map();
+  try {
+    for (const key of keys) previous.set(key, target.getItem(key));
+    target.setItem(KEY, JSON.stringify(prepared.stats));
+    target.setItem(SETTINGS_KEY, JSON.stringify(prepared.settings));
+    target.setItem(REPLAY_KEY, JSON.stringify(prepared.replays));
+    return { ok: true };
+  } catch {
+    for (const key of keys) {
+      try {
+        const oldValue = previous.get(key);
+        if (oldValue == null) target.removeItem(key);
+        else target.setItem(key, oldValue);
+      } catch { /* best-effort rollback; caller still receives a failed import */ }
+    }
+    return { ok: false, reason: '浏览器存储空间不足，导入未完成，已回滚已有数据' };
+  }
 }
 
 export function clearStats() {

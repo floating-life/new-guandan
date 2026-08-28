@@ -7,7 +7,8 @@ import {
   getPublicTributeContext, resetLLMFallback, markLLMFallback, applySettings,
   aiDecisionContext, resolveAISearchBudget, PHASE,
 } from './game.js';
-import { loadSettings } from './stats.js';
+import { chooseAIPlay } from './ai.js';
+import { clearStats, loadSettings } from './stats.js';
 
 let passed = 0;
 let failed = 0;
@@ -462,6 +463,52 @@ console.log('混合决策设置与公平观察边界');
   applySettings(state, { localAiEngine: 'expert' });
   assert(state.aiRequestToken !== token && state.aiThinking === false,
     '切换本地决策引擎会作废正在计算的旧策略请求');
+
+  applySettings(state, { localAiEngine: 'ismcts' });
+  assert(aiDecisionContext(state, 3).decisionEngine === 'ismcts',
+    '正式决策上下文可把用户选择的成对根 PIMC 引擎传入电脑座位');
+}
+
+console.log('非大师难度不产生实验搜索载荷');
+{
+  const state = createMatch({
+    difficulty: 'hard',
+    aiSpeed: 'fast',
+    coachMode: false,
+    localAiEngine: 'ismcts',
+    deterministicAI: true,
+  });
+  state.phase = PHASE.PLAYING;
+  state.currentLevel = 2;
+  state.currentSeat = 1;
+  state.hands = [
+    [C(3), C(4), C(5), C(6)],
+    [C(8), C(8, 'H'), C(9), C(10)],
+    [C(11), C(12)],
+    [C(13), C(14)],
+  ];
+  state.handCounts = state.hands.map((hand) => hand.length);
+  const context = aiDecisionContext(state, 1);
+  assert(context.decisionEngine === 'ismcts' && context.difficulty === 'hard',
+    '困难难度仍可记录用户选择的实验引擎');
+  const decision = chooseAIPlay(context);
+  assert(decision?.action && decision.hybrid == null,
+    '困难 + 成对根 PIMC 不会实际运行混合搜索载荷');
+}
+
+console.log('恢复牌局时对手画像以统计为准');
+{
+  const state = createMatch({ difficulty: 'master', aiSpeed: 'fast', coachMode: false });
+  state.phase = PHASE.PLAYING;
+  state.round = 4;
+  state.opponentModel = { ...state.opponentModel, decisions: 99, leads: 40 };
+  assert(persistMatch(state), '带旧画像的进行中牌局可保存');
+  const cleared = clearStats();
+  const restored = restoreMatch();
+  assert(restored?.round === 4
+    && restored.opponentModel.decisions === cleared.opponentModel.decisions
+    && restored.opponentModel.leads === 0,
+  '清空统计后刷新页面不会从对局快照复活旧的 ±12 画像');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

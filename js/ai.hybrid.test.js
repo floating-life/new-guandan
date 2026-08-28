@@ -7,10 +7,13 @@ import {
 } from './ai-observation.js';
 import {
   HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA,
+  HYBRID_SEARCH_MODES,
   chooseHybridFromConsultation, configureHybridValueModel,
+  evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
   samplePublicInformationSets, validateHybridValueModel,
 } from './ai-hybrid.js';
+import { makePromotedValueModel } from './value-model.test-fixture.js';
 
 let passed = 0;
 let failed = 0;
@@ -113,16 +116,19 @@ console.log('可插拔专用价值模型契约');
 {
   const weights = new Array(HYBRID_VALUE_FEATURES.length).fill(0);
   weights[23] = 2; // finishes_now
-  const model = {
+  const model = makePromotedValueModel({
     id: 'unit-finish-value',
     schema: HYBRID_VALUE_SCHEMA,
     layers: [{ weights: [weights], bias: [0], activation: 'linear' }],
-  };
+  });
   const validation = validateHybridValueModel(model);
   assert(validation.ok && validation.model.weightCount === HYBRID_VALUE_FEATURES.length + 1,
     '固定特征架构与稠密层权重经过尺寸和有限值校验');
   const configured = configureHybridValueModel(model);
   assert(configured.ok && configured.modelId === 'unit-finish-value', '有效模型可原子启用');
+  const unpromoted = configureHybridValueModel({ ...model, metadata: { status: 'validated' } });
+  assert(!unpromoted.ok && unpromoted.reason === 'model_not_promoted' && unpromoted.active,
+    '未证明强于专家的validated模型不能替换当前晋级模型');
   const deck = createDeck();
   const ctx = { ...baseContext(deck), hand: [deck[0]], handCounts: [1, 27, 27, 27] };
   const candidate = {
@@ -213,6 +219,268 @@ console.log('关键残局混合重排与安全回退');
     && noNewPass.telemetry?.rejectedCandidates?.some((item) => (
       item.id === 'pass' && item.reason === 'no_new_pass_override'
     )), '混合层不能把专家已经决定的普通接牌重新改成过牌');
+}
+
+console.log('成对根 PIMC 公平根动作覆盖');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `root_${index}`,
+      action: 'play',
+      cards: [card],
+      hand,
+      signature: handSignature(hand),
+      localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0,
+    hand: own,
+    level: 7,
+    lastHand: null,
+    lastSeat: null,
+    handCounts: [2, 2, 2, 2],
+    teams: [0, 1, 0, 1],
+    finishOrder: [],
+    playedCards,
+    publicHistory: [],
+    difficulty: 'master',
+    deterministic: true,
+    decisionEngine: 'ismcts',
+    hands: [['secret'], ['another-secret']],
+  };
+  const options = {
+    searchMode: 'paired-root-pimc-v1', sampleCount: 3, behaviorAttempts: 1,
+    iterationBudget: 10, maxPlies: 48, nodeBudget: 1000, seed: 20260826,
+  };
+  const first = evaluateInformationSetCandidates(context, candidates, options);
+  const second = evaluateInformationSetCandidates({ ...context, hands: [['changed-secret']] }, candidates, options);
+  assert(first.applied && first.searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC,
+    '成对根 PIMC 在关键局面完成公平信息集根候选覆盖');
+  assert(first.iterations === candidates.length * 3
+    && first.candidateResults.every((item) => item.visits === 3),
+  '每条 iteration 都对应一次实际 rollout，不保留空转预算');
+  assert(first.pairedWorlds === 3
+    && first.candidateResults.every((item) => (
+      item.worldAttempts.slice(0, 3).every((attempts) => attempts >= 1)
+    )), '每个候选都在相同的三个假想世界完成基础覆盖');
+  assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults),
+    '成对根 PIMC 结果不受调用方误传暗牌字段影响，且固定种子可复现');
+  const legacyAlias = evaluateInformationSetCandidates(context, candidates, {
+    ...options, searchMode: 'ismcts-root-v1',
+  });
+  assert(legacyAlias.searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+    && JSON.stringify(legacyAlias.candidateResults) === JSON.stringify(first.candidateResults),
+  '历史 ismcts-root-v1 标识会兼容映射为成对根 PIMC');
+
+  const thinEvidence = evaluateInformationSetCandidates(context, candidates, {
+    ...options,
+    iterationBudget: 2,
+  });
+  assert(!thinEvidence.applied && thinEvidence.reason === 'insufficient_search_evidence'
+    && thinEvidence.pairedWorlds === 1
+    && thinEvidence.candidateResults.every((item) => item.attempts === 1),
+  '只有单个成对世界时保留搜索遥测，但不允许作为改选证据');
+  const oneWorldPimc = evaluateInformationSetCandidates(context, candidates, {
+    searchMode: 'pimc-v1', sampleCount: 1, behaviorAttempts: 1,
+    maxPlies: 48, nodeBudget: 1000, seed: 20260826,
+  });
+  assert(oneWorldPimc.applied && oneWorldPimc.minimumEffectiveVisits == null,
+  '最低访问与成对世界门禁只作用于成对根 PIMC，旧 PIMC 完成边界不变');
+
+  const midOwn = deck.slice(0, 14);
+  const midPlayed = deck.slice(56);
+  const midCandidates = midOwn.slice(0, 2).map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `mid_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const midContext = {
+    ...context, hand: midOwn, handCounts: [14, 14, 14, 14], playedCards: midPlayed,
+  };
+  const pimcMid = evaluateInformationSetCandidates(midContext, midCandidates, {
+    searchMode: 'pimc-v1', sampleCount: 2, seed: 91,
+  });
+  const rootMid = evaluateInformationSetCandidates(midContext, midCandidates, {
+    searchMode: 'paired-root-pimc-v1', sampleCount: 2, iterationBudget: 4,
+    minimumEffectiveVisits: 2, maxPlies: 32, nodeBudget: 500, seed: 91,
+  });
+  assert(pimcMid.reason === 'not_critical' && rootMid.critical.scope === 'root_extended'
+    && rootMid.applied,
+  '中残局扩展范围只对显式成对根 PIMC 生效，原 PIMC 触发边界保持不变');
+}
+
+console.log('成对根 PIMC 置信改选门禁');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `confidence_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const weights = new Array(HYBRID_VALUE_FEATURES.length).fill(0);
+  weights[31] = 100; // 故意用主点数把第二候选推到综合分首位。
+  const valueModel = validateHybridValueModel({
+    id: 'confidence-gate-probe',
+    schema: HYBRID_VALUE_SCHEMA,
+    layers: [{ weights: [weights], bias: [0], activation: 'linear' }],
+  }).model;
+  const result = chooseHybridFromConsultation({
+    seat: 0,
+    hand: own,
+    level: 7,
+    lastHand: null,
+    lastSeat: null,
+    handCounts: [2, 2, 2, 2],
+    teams: [0, 1, 0, 1],
+    finishOrder: [],
+    playedCards,
+    publicHistory: [],
+    difficulty: 'master',
+    deterministic: true,
+    decisionEngine: 'ismcts',
+  }, {
+    action: 'play',
+    cards: own[0],
+    hand: candidates[0].hand,
+    signature: candidates[0].signature,
+    reason: '专家首选',
+    candidates,
+    localCandidateId: candidates[0].id,
+    cloudConstraint: 'soft_rerank',
+  }, {
+    searchMode: 'paired-root-pimc-v1',
+    sampleCount: 3,
+    iterationBudget: 6,
+    minimumEffectiveVisits: 3,
+    minimumUtilityGap: 1,
+    confidenceZ: 3,
+    maxPlies: 48,
+    nodeBudget: 1000,
+    behaviorAttempts: 1,
+    seed: 20260826,
+    valueModel,
+  });
+  assert(result.telemetry?.proposedCandidateId === candidates[1].id
+    && result.decision?.signature === candidates[0].signature,
+  '价值分提议改选但搜索置信差不足时，最终保持专家首选');
+  assert(result.telemetry?.rerankGate?.required
+    && result.telemetry.rerankGate.allowed === false
+    && result.telemetry.rerankGate.reason === 'confidence_margin_insufficient'
+    && result.telemetry.candidates.every((item) => item.visits >= 3),
+  '改选门禁同时记录有效访问数、标准误与置信差');
+}
+
+console.log('成对根 PIMC 不伪造额外迭代');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `repeat_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master',
+    deterministic: true, decisionEngine: 'ismcts',
+  };
+  const shared = {
+    searchMode: 'paired-root-pimc-v1', sampleCount: 3, behaviorAttempts: 1,
+    maxPlies: 48, nodeBudget: 1000, seed: 20260826,
+  };
+  const paired = evaluateInformationSetCandidates(context, candidates, {
+    ...shared, iterationBudget: 6,
+  });
+  const leftover = evaluateInformationSetCandidates(context, candidates, {
+    ...shared, iterationBudget: 24,
+  });
+  assert(paired.applied && leftover.applied && leftover.iterations === paired.iterations,
+    '预算超过完整成对世界覆盖时不会伪造额外 iteration');
+  assert(paired.candidateResults.every((item, index) => {
+    const extra = leftover.candidateResults[index];
+    return item.visits === extra.visits
+      && item.attempts === extra.attempts
+      && item.visits === paired.pairedWorlds
+      && item.utility === extra.utility
+      && item.standardError === extra.standardError;
+  }), '额外预算不改变真实样本数、标准误或用于改选的均值');
+  assert(leftover.candidateResults.every((item) => item.worldAttempts.every((attempts) => attempts <= 1)),
+    '同一候选/世界不会被重复尝试并冒充新 rollout');
+
+  const weights = new Array(HYBRID_VALUE_FEATURES.length).fill(0);
+  weights[31] = 100;
+  const valueModel = validateHybridValueModel({
+    id: 'repeat-world-gate-probe',
+    schema: HYBRID_VALUE_SCHEMA,
+    layers: [{ weights: [weights], bias: [0], activation: 'linear' }],
+  }).model;
+  const gateOptions = {
+    ...shared, minimumEffectiveVisits: 3, minimumUtilityGap: 1, confidenceZ: 3, valueModel,
+  };
+  const leftoverGate = chooseHybridFromConsultation(context, {
+    action: 'play', cards: own[0], hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, { ...gateOptions, iterationBudget: 24 });
+  const pairedGate = chooseHybridFromConsultation(context, {
+    action: 'play', cards: own[0], hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, { ...gateOptions, iterationBudget: 6 });
+  assert(pairedGate.telemetry?.proposedCandidateId === candidates[1].id
+    && leftoverGate.telemetry?.rerankGate?.allowed === false
+    && leftoverGate.telemetry?.rerankGate?.allowed === pairedGate.telemetry?.rerankGate?.allowed
+    && leftoverGate.telemetry?.rerankGate?.reason === pairedGate.telemetry?.rerankGate?.reason,
+  '剩余预算不能把置信改选门从拒绝翻成允许');
+}
+
+console.log('晋级模型关键局面门禁');
+{
+  const deck = createDeck();
+  const ctx = baseContext(deck);
+  const candidateCards = [deck[0], deck[1]];
+  const candidates = candidateCards.map((card, index) => {
+    const hand = parseHand([card], ctx.level);
+    return {
+      id: `ordinary_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const weights = new Array(HYBRID_VALUE_FEATURES.length).fill(0);
+  weights[31] = 100;
+  const valueModel = validateHybridValueModel(makePromotedValueModel({
+    id: 'non-critical-probe', schema: HYBRID_VALUE_SCHEMA,
+    layers: [{ weights: [weights], bias: [0], activation: 'linear' }],
+  })).model;
+  const result = chooseHybridFromConsultation(ctx, {
+    action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, { searchMode: 'pimc-v1', sampleCount: 2, valueModel });
+  assert(result.decision?.signature === candidates[0].signature
+    && result.telemetry?.reason === 'not_critical' && !result.telemetry?.applied,
+  '晋级模型在非关键局面不能绕过搜索门禁改写专家动作');
 }
 
 console.log('混合候选执行前恢复完整牌型声明');

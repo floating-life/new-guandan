@@ -9,6 +9,7 @@ import { createDeck } from './cards.js';
 import { chooseAIPlay } from './ai.js';
 import { createPublicAIObservation } from './ai-observation.js';
 import { HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA } from './ai-hybrid.js';
+import { makePromotedValueModel } from './value-model.test-fixture.js';
 
 let passed = 0;
 let failed = 0;
@@ -73,7 +74,7 @@ const ctx = {
   policyProfile: 'expert',
 };
 
-const zeroModel = {
+const zeroModel = makePromotedValueModel({
   id: 'worker-thread-zero',
   schema: HYBRID_VALUE_SCHEMA,
   layers: [{
@@ -81,7 +82,7 @@ const zeroModel = {
     bias: [0],
     activation: 'linear',
   }],
-};
+});
 
 runWorkerRequest({ type: 'configure-hybrid-model', model: zeroModel }).then((configured) => {
   assert(configured.ok && configured.active && configured.modelId === 'worker-thread-zero',

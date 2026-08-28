@@ -23,11 +23,28 @@ assert(html.includes('id="endHands"') && ui.includes('renderEndHands'), '每副�
 assert(html.includes('<option value="master">大师</option>'), '难度选择提供大师模式');
 assert(html.includes('大师模式') && html.includes('不读取其他玩家未公开手牌'), '规则说明公开大师模式与公平信息边界');
 assert(html.includes('id="selLocalEngine"') && html.includes('value="hybrid"')
-  && html.includes('混合搜索（实验）'), '提供显式的专家策略/混合搜索本地引擎开关');
+  && html.includes('value="ismcts"') && html.includes('成对根 PIMC（实验）'), '提供专家、PIMC 混合搜索与成对根 PIMC 引擎开关');
 assert(ui.includes("applySettings(state, { localAiEngine: engine })")
-  && ui.includes('公平信息集模拟'), '本地引擎开关接入设置并说明公平采样与安全回退');
-assert(ui.includes('混合搜索：') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
+  && ui.includes('公平信息集模拟') && ui.includes('成对根 PIMC 已启用'), '本地引擎开关接入设置并说明公平采样、成对覆盖与安全回退');
+assert(ui.includes('localEngine.disabled') && ui.includes("实验搜索仅在大师难度运行"),
+  '非大师难度禁用实验搜索选择器，并说明当前不会启用');
+assert(ui.includes('混合搜索') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
   '逐手复盘展示混合层是否改选、采样数和模拟节点数');
+assert(ui.includes('成对根 PIMC') && ui.includes('次成对 rollout'),
+  '逐手复盘区分 PIMC 与成对根 PIMC，并展示真实 rollout 数');
+assert(html.includes('id="btnValueModel"') && html.includes('id="fileValueModel"')
+  && ui.includes('configureAIWorkerValueModel') && ui.includes('restoreValueModel'),
+ '界面可加载并在刷新后恢复经过本地校验的训练价值模型');
+assert(html.includes('500 组未见种子镜像赛') && ui.includes('model_not_promoted'),
+  '网页拒绝未晋级训练模型并明确展示发布门禁');
+assert(ui.includes('persistThenActivateValueModel') && ui.includes('未启用新模型'),
+  '模型保存失败时不会先启用新模型，并向用户说明当前状态');
+assert(ui.includes('实际用炸和相对座次') && ui.includes('不会把过牌当成'),
+  '统计页说明真人画像只使用公开的领牌、应手、用炸与座次证据');
+assert(ui.includes('state.opponentModel = cleared.opponentModel')
+  && ui.includes('state.opponentModel = getSkillStats().opponentModel')
+  && ui.includes('persistMatch(state)'),
+  '清空或导入统计后立即刷新本局真人画像并写入对局快照，不遗留旧策略偏置');
 assert(/--card-w:\s*48px/.test(css), '手机牌张缩小以避免横向裁切');
 
 console.log('无障碍契约');
@@ -55,6 +72,6 @@ assert(ui.includes("llmHealth.state === 'unverified'") && ui.includes('resetLLMF
 assert(!ui.includes('setUpdateCallback(() => {\n  persistMatch(state);'), '状态通知只保存一次，不在UI回调重复序列化存档');
 assert(ui.includes("llmPolicyMode || LLM_POLICY_MODE.LOCAL) !== LLM_POLICY_MODE.LOCAL"), '本地AI启动时不主动检测云端API');
 assert(html.includes('整局多次调用可能让第三方服务累计看到多名电脑玩家手牌'), '界面明确提示云端整局累计隐私范围');
-console.log(`\n结果: ${passed} passed, ${failed} failed`);
 assert(ui.includes('llmReportHtml') && ui.includes('p95LatencyMs'), '复盘展示云端 API 调用报告');
+console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

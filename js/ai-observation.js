@@ -5,6 +5,8 @@
  * 即使调用方误传 state.hands、初始牌面、终局余牌或复盘对象，也不会进入 AI。
  */
 
+import { normalizeOpponentProfile } from './opponent-model.js';
+
 function finiteNumber(value, fallback = null) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -138,8 +140,10 @@ export function createPublicAIObservation(ctx = {}) {
     policyProfile: ctx.policyProfile === 'baseline' ? 'baseline' : 'expert',
     policyFeatures: scalarMap(ctx.policyFeatures, 'boolean'),
     policyThresholds: scalarMap(ctx.policyThresholds, 'number'),
+    opponentModel: normalizeOpponentProfile(ctx.opponentModel),
     leadAfterOwnBomb: ctx.leadAfterOwnBomb === true,
-    decisionEngine: ctx.decisionEngine === 'hybrid' ? 'hybrid' : 'expert',
+    decisionEngine: ['hybrid', 'ismcts'].includes(ctx.decisionEngine)
+      ? ctx.decisionEngine : 'expert',
   };
 }
 

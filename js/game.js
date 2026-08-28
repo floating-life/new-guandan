@@ -346,6 +346,8 @@ export function createMatch(preserveSettings = null) {
     llmLastLatencyMs: null,
     llmStatus: 'unknown',
     llmReport: createLLMReport(settings.llmPolicyMode),
+    // 由历史公开出牌归纳的真人画像；不持有任何本副暗牌。
+    opponentModel: loadStats().opponentModel,
     // 设置
     settings: { ...settings },
     coachTip: null,
@@ -1160,6 +1162,8 @@ export function restoreMatch() {
   state.llmFallbackActive = state.llmCircuit.permanent;
   state.llmReport.fallbackActive = state.llmFallbackActive;
   setAIDifficulty(state.settings.difficulty || 'normal');
+  // 画像以统计库为准。清空/导入后即使旧快照仍带 ±12 偏置，也不能复活。
+  state.opponentModel = loadStats().opponentModel;
   return state;
 }
 
@@ -1288,6 +1292,7 @@ export function aiDecisionContext(state, seat) {
     policyFeatures: state.settings?.aiPolicyFeaturesBySeat?.[seat] || null,
     policyThresholds: state.settings?.aiPolicyThresholdsBySeat?.[seat] || null,
     leadAfterOwnBomb: isLeadAfterOwnBomb(state, seat),
+    opponentModel: state.opponentModel,
     decisionEngine: state.settings?.aiDecisionEngineBySeat?.[seat]
       || state.settings?.localAiEngine
       || 'expert',
@@ -2011,7 +2016,7 @@ function endRound(state) {
   });
   saveReplay(replay);
 
-  recordRoundResult({
+  const updatedStats = recordRoundResult({
     myPlace,
     teamWon,
     evalHistory: state.evalHistory,
@@ -2019,7 +2024,10 @@ function endRound(state) {
     matchWon,
     difficulty: state.settings?.difficulty || 'normal',
     llmReport: state.llmReport,
+    publicHistory: publicActionHistory(state),
+    userSeat: 0,
   });
+  state.opponentModel = updatedStats.opponentModel;
 
   notify(state);
 }

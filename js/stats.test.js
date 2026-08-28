@@ -3,6 +3,7 @@ import {
   clearStats, recordRoundResult, loadStats, avgScore, unassistedAvgScore,
   exportTrainingData, importTrainingData, loadSettings, saveSettings,
   clearReplays, loadReplays, saveReplay,
+  loadLocalValueModel, saveLocalValueModel,
 } from './stats.js';
 
 let passed = 0;
@@ -49,6 +50,17 @@ recordRoundResult({
     permanentFailures: 0,
     backoffSkips: 3,
   },
+  publicHistory: [
+    {
+      turn: 1, trickNumber: 1, seat: 1, action: 'play',
+      hand: { type: 'single', mainRank: 8, size: 1, power: 8 },
+      countsBefore: [12, 12, 12, 12], countsAfter: [12, 11, 12, 12],
+    },
+    {
+      turn: 2, trickNumber: 1, seat: 0, action: 'pass',
+      countsBefore: [12, 11, 12, 12], countsAfter: [12, 11, 12, 12],
+    },
+  ],
 });
 const stats = loadStats();
 assert(avgScore(stats) === 73, '综合均分包含全部已评价操作');
@@ -56,6 +68,8 @@ assert(unassistedAvgScore(stats) === 90, '无辅助均分排除辅助和被迫�
 assert(stats.assistedEvalCount === 1 && stats.forcedEvalCount === 1, '辅助与被迫次数分别统计');
 assert(stats.mistakeCounts.waste_wild === 1, '结构化失误标签进入累计统计');
 assert(stats.difficulty.hard.rounds === 1 && stats.difficulty.hard.evalCount === 3, '统计按难度分桶');
+assert(stats.opponentModel.decisions === 1 && stats.opponentModel.typeStats.single.response.pass === 1,
+  '每副结束仅从公开逐手历史更新真人对手模型');
 
 console.log('大师难度设置与统计');
 saveSettings({ ...loadSettings(), difficulty: 'master', localAiEngine: 'hybrid' });
@@ -63,6 +77,11 @@ assert(loadSettings().difficulty === 'master', '大师难度设置可持久化')
 assert(loadSettings().localAiEngine === 'hybrid', '实验性混合决策引擎可由用户显式持久化');
 saveSettings({ ...loadSettings(), localAiEngine: 'unknown-engine' });
 assert(loadSettings().localAiEngine === 'expert', '未知本地决策引擎安全回退专家策略');
+saveSettings({ ...loadSettings(), localAiEngine: 'ismcts' });
+assert(loadSettings().localAiEngine === 'ismcts', '成对根 PIMC 实验引擎可由用户显式持久化');
+assert(saveLocalValueModel({ id: 'unit-local-model', schema: 'guandan-candidate-v1', layers: [] })
+  && loadLocalValueModel()?.id === 'unit-local-model',
+ '本地训练模型可独立持久化，不与用户战绩混在同一字段');
 recordRoundResult({
   myPlace: 0,
   teamWon: true,
@@ -137,6 +156,37 @@ const importedReplays = loadReplays();
 assert(importedReplays.length === 100, '导入时同样保留最近100副完整复盘');
 assert(importedReplays[0]?.id === 'import-0' && importedReplays[99]?.id === 'import-99',
   '导入复盘保持导出文件中的新旧顺序');
+
+console.log('导入失败原子回滚');
+{
+  const previousStorage = globalThis.localStorage;
+  const values = new Map([
+    ['guandan_skill_stats_v1', JSON.stringify({ version: 2, totalRounds: 77 })],
+    ['guandan_settings_v1', JSON.stringify({ difficulty: 'hard' })],
+    ['guandan_replays_v1', JSON.stringify([{ id: 'old-replay' }])],
+  ]);
+  globalThis.localStorage = {
+    getItem: (key) => (values.has(key) ? values.get(key) : null),
+    setItem: (key, value) => {
+      if (key === 'guandan_replays_v1') throw new Error('模拟空间不足');
+      values.set(key, String(value));
+    },
+    removeItem: (key) => values.delete(key),
+  };
+  const failedImport = importTrainingData({
+    stats: { version: 2, totalRounds: 1 },
+    settings: { difficulty: 'easy' },
+    replays: [{ id: 'new-replay' }],
+  });
+  assert(!failedImport.ok && failedImport.reason.includes('已回滚'),
+    '任一存储写入失败时导入返回失败并声明已回滚');
+  assert(JSON.parse(values.get('guandan_skill_stats_v1')).totalRounds === 77
+    && JSON.parse(values.get('guandan_settings_v1')).difficulty === 'hard'
+    && JSON.parse(values.get('guandan_replays_v1'))[0].id === 'old-replay',
+  '失败导入不会留下战绩、设置和复盘的半成品');
+  if (previousStorage === undefined) delete globalThis.localStorage;
+  else globalThis.localStorage = previousStorage;
+}
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

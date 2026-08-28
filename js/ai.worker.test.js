@@ -10,6 +10,7 @@ import {
 } from './ai.worker-client.js';
 import { createPublicAIObservation } from './ai-observation.js';
 import { HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA } from './ai-hybrid.js';
+import { makePromotedValueModel } from './value-model.test-fixture.js';
 
 let passed = 0;
 let failed = 0;
@@ -43,7 +44,7 @@ const ctx = {
   policyProfile: 'expert',
 };
 
-const zeroModel = {
+const zeroModel = makePromotedValueModel({
   id: 'worker-client-zero',
   schema: HYBRID_VALUE_SCHEMA,
   layers: [{
@@ -51,7 +52,7 @@ const zeroModel = {
     bias: [0],
     activation: 'linear',
   }],
-};
+});
 
 const originalWindow = globalThis.window;
 const originalWorker = globalThis.Worker;

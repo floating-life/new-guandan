@@ -8,7 +8,7 @@ import {
   getLegalHints, getHandAnalysis, getReturnCandidates, PHASE, seatName,
   applySettings, refreshCoach, getSkillStats, humanSelectSet, humanSelectAllOfRank,
   humanSelectRankCycle, getSelectedCards, getCombosFromSelection, restoreMatch,
-  resumeMatch, resetLLMFallback, markLLMFallback, AI_DIFFICULTY_LABEL,
+  persistMatch, resumeMatch, resetLLMFallback, markLLMFallback, AI_DIFFICULTY_LABEL,
 } from './game.js';
 import {
   SUIT_SYMBOL, SUIT_COLOR, RANK_LABEL, isJoker, isWild, isLevelCard,
@@ -19,7 +19,12 @@ import {
 } from './rules.js';
 import {
   loadReplays, clearStats, loadSettings, exportTrainingData, importTrainingData,
+  loadLocalValueModel, saveLocalValueModel,
 } from './stats.js';
+import { configureAIWorkerValueModel } from './ai.worker-client.js';
+import { validateHybridValueModel } from './ai-hybrid.js';
+import { isPromotedValueModel } from './value-model-gate.js';
+import { persistThenActivateValueModel } from './value-model-persistence.js';
 import {
   checkLLMHealth, getLLMHealth, getLLMConfig, updateLLMConfig, LLM_POLICY_MODE,
 } from './llm.js';
@@ -30,6 +35,7 @@ const $ = (sel) => document.querySelector(sel);
 let llmHealth = getLLMHealth();
 let llmHealthEpoch = 0;
 let llmConfig = { apiUrl: '', model: '', configured: false, apiKeyConfigured: false };
+let valueModelStatus = '未加载晋级模型';
 
 /** 用于 shift 连选 */
 let lastClickedId = null;
@@ -54,6 +60,71 @@ function rankHeadLabel(key, level) {
   if (key === 'joker17') return '大王×';
   if (Number(key) === level) return `级${RANK_LABEL[key] || key}×`;
   return `${RANK_LABEL[key] || key}×`;
+}
+
+function localEngineLabel(engine) {
+  if (engine === 'ismcts') return '成对根 PIMC（实验）';
+  if (engine === 'hybrid') return '混合搜索（实验）';
+  return '专家策略';
+}
+
+function valueModelFailureReason(result) {
+  return result?.reason === 'model_not_promoted'
+    ? '模型尚未通过500组全级牌未见种子镜像与完整发布回执门禁，不能进入正式对局'
+    : result?.reason || '模型格式不符合本机价值模型规范';
+}
+
+function preflightValueModel(model) {
+  const validation = validateHybridValueModel(model);
+  if (!validation.ok) return validation;
+  if (!isPromotedValueModel(model)) return { ok: false, reason: 'model_not_promoted' };
+  return { ok: true };
+}
+
+async function configureValueModel(model) {
+  const result = await configureAIWorkerValueModel(model);
+  if (!result?.ok) {
+    throw new Error(valueModelFailureReason(result));
+  }
+  return result;
+}
+
+async function activateValueModel(model, { persist = false, silent = false } = {}) {
+  let result;
+  if (persist) {
+    result = await persistThenActivateValueModel({
+      model,
+      preflight: preflightValueModel,
+      load: loadLocalValueModel,
+      save: saveLocalValueModel,
+      clear: () => saveLocalValueModel(null),
+      activate: configureValueModel,
+    });
+    if (!result?.ok) {
+      const reason = result.reason === 'storage_write_failed'
+        ? '模型已校验，但浏览器空间不足，未启用新模型'
+        : valueModelFailureReason(result);
+      throw new Error(result.rollbackFailed ? `${reason}；原保存模型恢复失败，请刷新后检查模型状态` : reason);
+    }
+  } else {
+    result = await configureValueModel(model);
+  }
+  const modelId = result.modelId || model?.id || '未命名模型';
+  valueModelStatus = `晋级模型：${modelId}`;
+  if (!silent) flash('晋级模型已加载：仅在大师实验搜索引擎的关键局面参与候选重排');
+  render();
+  return result;
+}
+
+async function restoreValueModel() {
+  const model = loadLocalValueModel();
+  if (!model) return;
+  try {
+    await activateValueModel(model, { silent: true });
+  } catch {
+    valueModelStatus = '已保存模型无效或未晋级，未启用';
+    render();
+  }
 }
 
 function renderCard(card, opts = {}) {
@@ -304,9 +375,17 @@ function renderTop() {
   const llmMode = $('#selLLMMode');
   const llmStatus = $('#llmStatus');
   const llmPrompt = $('#llmPrompt');
+  const modelStatus = $('#valueModelStatus');
   if (d && d.value !== s.difficulty) d.value = s.difficulty || 'normal';
-  if (localEngine && localEngine.value !== (s.localAiEngine || 'expert')) {
-    localEngine.value = s.localAiEngine || 'expert';
+  if (localEngine) {
+    const masterOnly = (s.difficulty || 'normal') === 'master';
+    localEngine.disabled = !masterOnly;
+    localEngine.title = masterOnly
+      ? '实验搜索只在大师难度关键局面启用；失败或超时自动回退专家策略'
+      : '实验搜索仅在大师难度运行；当前难度使用专家策略';
+    if (localEngine.value !== (s.localAiEngine || 'expert')) {
+      localEngine.value = s.localAiEngine || 'expert';
+    }
   }
   if (sp && sp.value !== s.aiSpeed) sp.value = s.aiSpeed || 'normal';
   if (llmMode && llmMode.value !== (s.llmPolicyMode || LLM_POLICY_MODE.LOCAL)) {
@@ -323,6 +402,7 @@ function renderTop() {
     llmStatus.className = `llm-status ${view.className}`;
     llmStatus.title = view.title || '';
   }
+  if (modelStatus) modelStatus.textContent = valueModelStatus;
   if (llmPrompt) {
     const mode = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
     llmPrompt.textContent = mode === LLM_POLICY_MODE.LOCAL
@@ -1120,6 +1200,8 @@ function openStats() {
     ? Object.entries(s.mistakeCounts).sort((a, b) => b[1] - a[1]).slice(0, 6)
       .map(([k, v]) => `<li>${escapeHtml(mistakeLabels[k] || k)}：${v} 次</li>`).join('')
     : '<li>暂无明确失误记录</li>'}</ul>
+    <h4>适应性对手模型</h4>
+    <p>已从 <strong>${Number(s.opponentModel?.decisions) || 0}</strong> 次你的公开行动中学习领牌类型、应手/过牌、实际用炸和相对座次；仅在大师 AI 领出时作有上限的小幅排序，不读取你的暗牌，也不会把过牌当成“手里有炸”。</p>
     <h4>最近趋势</h4>
     <ul>${recent.length ? recent.map((item) => `<li>${new Date(item.time).toLocaleString('zh-CN')} · ${escapeHtml(AI_DIFFICULTY_LABEL[item.difficulty] || item.difficulty)} · 综合 ${item.avg || '--'} · 无辅助 ${item.unassistedAvg ?? '--'}</li>`).join('') : '<li>暂无趋势数据</li>'}</ul>
     <p style="margin-top:12px;font-size:0.8rem;color:var(--muted)">数据仅保存在本机浏览器，可使用“导出数据”备份。</p>
@@ -1154,7 +1236,7 @@ function openReplay(preferId) {
     let html = `
       <p><strong>第 ${r.round} 副</strong> · 打 ${LEVEL_LABEL[r.level] || r.level}
       · 难度 ${escapeHtml(AI_DIFFICULTY_LABEL[r.difficulty] || r.difficulty || '-') }
-      · 本地引擎 ${r.localAiEngine === 'hybrid' ? '混合搜索（实验）' : '专家策略'} · 升 ${r.up} 级
+      · 本地引擎 ${localEngineLabel(r.localAiEngine)} · 升 ${r.up} 级
       · ${r.winTeam === 0 ? '我方' : '对方'}胜</p>
       <p>${new Date(r.endedAt || r.time).toLocaleString('zh-CN')}</p>
       <p>${escapeHtml(fo)}</p>
@@ -1177,11 +1259,12 @@ function openReplay(preferId) {
         <strong>第 ${current.trickNumber || '-'} 圈 · ${escapeHtml(current.text)}</strong>
         ${current.countsAfter ? `<p>剩余张数：你 ${current.countsAfter[0]} / 下家 ${current.countsAfter[1]} / 对家 ${current.countsAfter[2]} / 上家 ${current.countsAfter[3]}</p>` : ''}
         ${current.decisionMeta?.reason ? `<p>AI 思路：${escapeHtml(current.decisionMeta.reason)}</p>` : ''}
-        ${current.decisionMeta?.hybrid ? `<p>混合搜索：${current.decisionMeta.hybrid.changedDecision
+        ${current.decisionMeta?.hybrid ? `<p>${['paired-root-pimc-v1', 'ismcts-root-v1'].includes(current.decisionMeta.hybrid.searchMode) ? '成对根 PIMC' : '混合搜索'}：${current.decisionMeta.hybrid.changedDecision
           ? `改选 ${escapeHtml(current.decisionMeta.hybrid.localCandidateId || '-')} → ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || '-')}`
           : `保留 ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || current.decisionMeta.hybrid.localCandidateId || '专家首选')}`}
           · ${Number(current.decisionMeta.hybrid.samples) || 0} 个可能牌面
           · ${Number(current.decisionMeta.hybrid.nodes) || 0} 个模拟节点
+          ${['paired-root-pimc-v1', 'ismcts-root-v1'].includes(current.decisionMeta.hybrid.searchMode) ? ` · ${Number(current.decisionMeta.hybrid.iterations) || 0} 次成对 rollout` : ''}
           · ${escapeHtml(current.decisionMeta.hybrid.reason || '安全回退')}</p>` : ''}
         ${ev ? `<p>你的评价：<strong>${ev.score} · ${escapeHtml(ev.grade)}</strong>${ev.assisted ? '<span class="assist-badge">使用辅助</span>' : ''}${ev.forced ? '<span class="assist-badge">被迫操作</span>' : ''}</p>
           <ul>${(ev.tips || []).map((tip) => `<li>${escapeHtml(tip)}</li>`).join('')}</ul>` : ''}
@@ -1341,7 +1424,9 @@ function setupChrome() {
   });
   $('#btnClearStats').onclick = () => {
     if (confirm('确定清空本机牌技统计？')) {
-      clearStats();
+      const cleared = clearStats();
+      state.opponentModel = cleared.opponentModel;
+      persistMatch(state);
       openStats();
     }
   };
@@ -1353,10 +1438,26 @@ function setupChrome() {
     try {
       const result = importTrainingData(JSON.parse(await file.text()));
       if (!result.ok) throw new Error(result.reason);
+      state.opponentModel = getSkillStats().opponentModel;
+      persistMatch(state);
       flash('训练数据导入成功');
       openStats();
     } catch (error) {
       flash(`导入失败：${error.message || '文件无效'}`);
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  $('#btnValueModel').onclick = () => $('#fileValueModel').click();
+  $('#fileValueModel').onchange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const model = JSON.parse(await file.text());
+      await activateValueModel(model, { persist: true });
+    } catch (error) {
+      flash(`模型加载失败：${error.message || '文件无效'}`);
     } finally {
       e.target.value = '';
     }
@@ -1377,14 +1478,25 @@ function setupChrome() {
 
   $('#selDifficulty').onchange = (e) => {
     applySettings(state, { difficulty: e.target.value });
-    flash(`AI 难度：${e.target.options[e.target.selectedIndex].text}`);
+    const label = e.target.options[e.target.selectedIndex].text;
+    const engine = state.settings?.localAiEngine || 'expert';
+    flash(e.target.value !== 'master' && ['hybrid', 'ismcts'].includes(engine)
+      ? `AI 难度：${label}；实验搜索仅在大师难度运行，当前已暂停`
+      : `AI 难度：${label}`);
   };
   $('#selLocalEngine').onchange = (e) => {
-    const engine = e.target.value === 'hybrid' ? 'hybrid' : 'expert';
+    const engine = ['hybrid', 'ismcts'].includes(e.target.value) ? e.target.value : 'expert';
     applySettings(state, { localAiEngine: engine });
-    flash(engine === 'hybrid'
-      ? '混合搜索已启用：大师关键残局进行公平信息集模拟，异常自动回退专家策略'
-      : '已切换为稳定专家策略');
+    const master = (state.settings?.difficulty || 'normal') === 'master';
+    flash(engine === 'ismcts'
+      ? (master
+        ? '成对根 PIMC 已启用：大师关键局面在同一公开牌面池覆盖安全候选，证据不足自动回退专家策略'
+        : '成对根 PIMC 仅在大师难度运行，当前难度不会启用')
+      : engine === 'hybrid'
+        ? (master
+          ? '混合搜索已启用：大师关键残局进行公平信息集模拟，异常自动回退专家策略'
+          : '混合搜索仅在大师难度运行，当前难度不会启用')
+        : '已切换为稳定专家策略');
   };
   $('#selSpeed').onchange = (e) => {
     applySettings(state, { aiSpeed: e.target.value });
@@ -1481,6 +1593,7 @@ setUpdateCallback(() => {
 
 setupChrome();
 render();
+void restoreValueModel();
 if ((state.settings?.llmPolicyMode || LLM_POLICY_MODE.LOCAL) !== LLM_POLICY_MODE.LOCAL) {
   // 仅在已存在“本局回退”标记时做一次深度探针并自动恢复；普通启动仍只做浅检测，
   // 本地 AI 启动完全不访问云端。

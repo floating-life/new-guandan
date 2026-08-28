@@ -23,6 +23,7 @@ import {
   publicPartnerProtectionValue,
 } from './ai-route.js';
 import { chooseHybridFromConsultation } from './ai-hybrid.js';
+import { opponentPlayAdjustment } from './opponent-model.js';
 
 export const AI_DIFFICULTY = {
   easy: 'easy',
@@ -123,6 +124,12 @@ function withOnlyControlV2Feature(key) {
   });
 }
 
+const PAIRED_ROOT_PIMC_POLICY_VARIANT = Object.freeze({
+  policyProfile: 'expert',
+  policyFeatures: EXPERT_POLICY_FEATURES,
+  decisionEngine: 'ismcts',
+});
+
 /**
  * 独立策略消融定义。no-p0/no-p1/no-p2 始终保留 expert 的统一策略权重，
  * 只关闭被测模块，避免旧 baseline 同时关闭多项能力而污染归因。
@@ -138,6 +145,11 @@ export const AI_POLICY_VARIANTS = Object.freeze({
     policyFeatures: EXPERT_POLICY_FEATURES,
     decisionEngine: 'hybrid',
   }),
+  // 成对根 PIMC 实验引擎：仍受专家候选安全门保护，在同一公平世界池中
+  // 覆盖全部根候选；正式默认仍是 expert。
+  'root-pimc-v1': PAIRED_ROOT_PIMC_POLICY_VARIANT,
+  // 旧报告/命令的兼容别名；新评测和文档使用 root-pimc-v1。
+  'ismcts-v1': PAIRED_ROOT_PIMC_POLICY_VARIANT,
   'p2-on': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERIMENTAL_P2_POLICY_FEATURES,
@@ -334,7 +346,8 @@ export function resolvePolicyVariant(name = 'expert') {
     policyProfile: variant.policyProfile,
     policyFeatures: { ...variant.policyFeatures },
     policyThresholds: variant.policyThresholds ? { ...variant.policyThresholds } : null,
-    decisionEngine: variant.decisionEngine === 'hybrid' ? 'hybrid' : 'expert',
+    decisionEngine: ['hybrid', 'ismcts'].includes(variant.decisionEngine)
+      ? variant.decisionEngine : 'expert',
   };
 }
 
@@ -520,7 +533,8 @@ function cfg(difficulty = _difficulty) {
  */
 export function chooseAIPlay(ctx) {
   const selectedDifficulty = AI_DIFFICULTY[ctx?.difficulty] || _difficulty;
-  if (ctx?.decisionEngine === 'hybrid' && selectedDifficulty === AI_DIFFICULTY.master) {
+  if (['hybrid', 'ismcts'].includes(ctx?.decisionEngine)
+    && selectedDifficulty === AI_DIFFICULTY.master) {
     const consultation = getAIConsultation(ctx, {
       deterministic: !!ctx?.deterministic,
       timeBudgetMs: Number(ctx?.timeBudgetMs) || 0,
@@ -653,6 +667,8 @@ function chooseAIPlayInternal(ctx, options) {
     policyProfile = 'expert',
     policyFeatures = null,
     policyThresholds = null,
+    decisionEngine = 'expert',
+    opponentModel = null,
   } = ctx;
   const selectedDifficulty = AI_DIFFICULTY[options.difficulty]
     || AI_DIFFICULTY[ctx.difficulty]
@@ -688,6 +704,8 @@ function chooseAIPlayInternal(ctx, options) {
     policyProfile: normalizedPolicyProfile,
     policyFeatures: normalizedPolicyFeatures,
     policyThresholds: policyThresholds ? { ...policyThresholds } : null,
+    decisionEngine: ['hybrid', 'ismcts'].includes(decisionEngine) ? decisionEngine : 'expert',
+    opponentModel: opponentModel || null,
     difficulty: selectedDifficulty,
     strategyWeight: c.strategyWeight,
     // 真实对局严格受思考预算约束；超时只跳过尚未完成的 P1 扩展，沿用已经
@@ -1601,7 +1619,14 @@ function rankPlays(plays, mode, hand, level, ctx, c, search) {
     const score = mode === 'lead'
       ? scoreLead(play, hand, level, ctx, c, search, beforeStructure)
       : scoreBeat(play, hand, level, ctx, c, search, beforeStructure);
-    return { ...play, score };
+    const opponentModel = c.difficulty === 'master'
+      ? opponentPlayAdjustment(ctx.opponentModel, ctx, { ...play, action: 'play' })
+      : null;
+    return {
+      ...play,
+      score: score + (opponentModel?.score || 0),
+      opponentModel,
+    };
   }).sort((a, b) => compareRankedPlays(a, b, mode, ctx, level));
 
   if (c.lookAhead && scored.length > 1) {
@@ -2401,7 +2426,7 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
   result.alternatives = alternatives;
   // 云端只需要少量多样候选；本地混合引擎则在专家已经完成打分的全部
   // “规则生成候选”上先做安全筛选，不能沿用云端的三选一窄瓶颈。
-  const consultationPlays = ctx.decisionEngine === 'hybrid'
+  const consultationPlays = ['hybrid', 'ismcts'].includes(ctx.decisionEngine)
     ? ranked
     : selectDiverseCandidates(ranked, ctx.hand.length, 24, 10);
   result.candidates = consultationPlays.map((play, index) => ({
@@ -2446,6 +2471,23 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
       rawAdjustment: play.lookAhead.policyFusion.rawAdjustment,
       calibratedAdjustment: play.lookAhead.policyFusion.calibratedAdjustment,
       cap: play.lookAhead.policyFusion.cap,
+    } : null,
+    opponentModel: play.opponentModel?.applied ? {
+      adjustment: Math.round(play.opponentModel.score * 10) / 10,
+      reason: play.opponentModel.reason,
+      samples: play.opponentModel.samples,
+      type: play.opponentModel.type,
+      pressure: play.opponentModel.pressure,
+      relativePosition: play.opponentModel.relativePosition || null,
+      leadPreference: Number.isFinite(play.opponentModel.leadPreference)
+        ? Math.round(play.opponentModel.leadPreference * 1000) / 1000 : null,
+      bombUseRate: Number.isFinite(play.opponentModel.bombUseRate)
+        ? Math.round(play.opponentModel.bombUseRate * 1000) / 1000 : null,
+      components: play.opponentModel.components ? Object.fromEntries(
+        Object.entries(play.opponentModel.components).map(([key, value]) => [
+          key, Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0,
+        ]),
+      ) : null,
     } : null,
     routeTags: play.lookAhead?.routeTags || [],
     tags: play.strategy?.tags || [],
@@ -2508,7 +2550,8 @@ export function getAIConsultation(ctx, options = {}) {
   }
 
   const applyHybrid = (result) => {
-    if (ctx?.decisionEngine !== 'hybrid' || options.applyHybrid === false) return result;
+    if (!['hybrid', 'ismcts'].includes(ctx?.decisionEngine)
+      || options.applyHybrid === false) return result;
     try {
       const deterministicSearch = deterministic || timeBudgetMs <= 0;
       const deadlineMs = deterministicSearch
@@ -2523,6 +2566,8 @@ export function getAIConsultation(ctx, options = {}) {
         behaviorAttempts: 2,
         maxPlies: timeBudgetMs >= 500 ? 120 : 88,
         nodeBudget: deterministicSearch ? 3600 : timeBudgetMs >= 500 ? 5200 : 2400,
+        iterationBudget: deterministicSearch ? 72 : timeBudgetMs >= 500 ? 96 : 48,
+        searchMode: ctx?.decisionEngine === 'ismcts' ? 'paired-root-pimc-v1' : 'pimc-v1',
         deadlineMs,
       });
       const decision = hybrid?.decision;
