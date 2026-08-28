@@ -5,6 +5,8 @@
  *   node js/ai.ab.simulation.js [种子组数=30] [基础种子=20260801]
  *     [候选策略=expert] [对照策略=baseline] [--levels=all|2,3,...,A]
  *     [--level-blocks] [--continuous-match] [--trace-divergence] [--summary-only]
+ *     [--value-model=C:\路径\实验模型.json]
+ *     [--report=C:\路径\A-B报告.json]
  *
  * 每个种子发两次完全相同的牌：
  *   1. candidate 坐 0+2，comparison 坐 1+3；
@@ -13,6 +15,8 @@
  * 可用策略还包括 no-control-v2 与五个 only-* 控制策略独立消融臂。
  */
 import { performance } from 'node:perf_hooks';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const realSetTimeout = globalThis.setTimeout;
 const realClearTimeout = globalThis.clearTimeout;
@@ -45,9 +49,19 @@ const {
 } = await import('./ai.js');
 const { describeUpgrade, handSignature } = await import('./rules.js');
 const { sortHand } = await import('./cards.js');
+const {
+  configureHybridValueModel, validateHybridValueModel,
+} = await import('./ai-hybrid.js');
+const {
+  createSeedManifest, seedManifestOverlap, valueModelStatus,
+} = await import('./value-model-gate.js');
+const { modelPayloadSha256 } = await import('./model-fingerprint.js');
 
 const groupCount = positiveInteger(process.argv[2], 30);
 const baseSeed = finiteUint32(process.argv[3], 20260801);
+const evaluationSeedManifest = createSeedManifest(Array.from(
+  { length: groupCount }, (_, index) => (baseSeed + index) >>> 0,
+));
 const candidateName = policyVariantName(process.argv[4], 'expert');
 const comparisonName = policyVariantName(process.argv[5], 'baseline');
 const jsonOnly = process.argv.includes('--json');
@@ -61,8 +75,51 @@ const summaryOnly = process.argv.includes('--summary-only');
 const MAX_ACTIONS = continuousMatch ? 30_000 : 2000;
 const MAX_MATCH_ROUNDS = 80;
 const GAME_TIMEOUT_MS = 180_000;
+// M3 发布质量报告将一副至少 120 次行动的牌局视为“长局”。阈值写入
+// 报告本身，避免后续按不同口径回看同一场连续赛。
+const LONG_ROUND_ACTIONS = 120;
 const CANDIDATE = resolvePolicyVariant(candidateName);
 const COMPARISON = resolvePolicyVariant(comparisonName);
+const valueModelFlag = process.argv.find((item) => String(item).startsWith('--value-model='));
+const valueModelPath = valueModelFlag
+  ? path.resolve(String(valueModelFlag).slice('--value-model='.length)) : null;
+const reportFlag = process.argv.find((item) => String(item).startsWith('--report='));
+const reportPath = reportFlag
+  ? path.resolve(String(reportFlag).slice('--report='.length)) : null;
+const checkpointFlag = process.argv.find((item) => String(item).startsWith('--checkpoint='));
+const checkpointPath = checkpointFlag
+  ? path.resolve(String(checkpointFlag).slice('--checkpoint='.length)) : null;
+const resumeCheckpoint = process.argv.includes('--resume');
+let valueModelAudit = null;
+if (valueModelPath) {
+  if (!['hybrid', 'ismcts'].includes(CANDIDATE.decisionEngine)) {
+    throw new Error('--value-model 只可用于 hybrid-v1 或 root-pimc-v1 候选策略（ismcts-v1 仅为历史兼容别名）');
+  }
+  // 当前价值模型是进程级配置。为保证对照组绝不读取候选权重，带模型的
+  // 发布赛强制以稳定 expert 为对照；同引擎无模型消融应另起独立进程实现。
+  if (COMPARISON.name !== 'expert') {
+    throw new Error('--value-model 的对照策略必须是 expert，避免权重污染对照组');
+  }
+  const model = JSON.parse(fs.readFileSync(valueModelPath, 'utf8'));
+  const validation = validateHybridValueModel(model);
+  if (!validation.ok) throw new Error(`价值模型格式无效：${validation.reason}`);
+  const trainingSeedManifest = model.metadata?.trainingSeedManifest
+    || model.metadata?.trainingData?.seedManifest || null;
+  const overlappingSeeds = seedManifestOverlap(evaluationSeedManifest, trainingSeedManifest);
+  if (overlappingSeeds.length) {
+    throw new Error(`评测种子与训练种子重叠（${overlappingSeeds.slice(0, 8).join(', ')}${
+      overlappingSeeds.length > 8 ? '…' : ''}）；请改用未见种子后再启动 A/B`);
+  }
+  const configured = configureHybridValueModel(model, { allowExperimental: true });
+  if (!configured.ok) throw new Error(`价值模型无法用于离线A/B：${configured.reason}`);
+  valueModelAudit = {
+    id: validation.model.id,
+    status: valueModelStatus(model),
+    sha256: modelPayloadSha256(model),
+    trainingSeedManifest,
+    trainingDatasetSha256: model.metadata?.trainingData?.sha256 || null,
+  };
+}
 
 let activeRun = null;
 let processing = false;
@@ -240,6 +297,8 @@ function compactDecision(decision) {
         localCandidateId: decision.hybrid.localCandidateId || null,
         finalCandidateId: decision.hybrid.finalCandidateId || null,
         changedDecision: decision.hybrid.changedDecision === true,
+        searchMode: decision.hybrid.searchMode || null,
+        iterations: Number(decision.hybrid.iterations) || 0,
         samples: Number(decision.hybrid.samples) || 0,
         nodes: Number(decision.hybrid.nodes) || 0,
         candidates: Array.isArray(decision.hybrid.candidates)
@@ -268,6 +327,8 @@ function createHybridCounters() {
     changed: 0,
     samples: 0,
     nodes: 0,
+    iterations: 0,
+    searchModes: {},
     reasons: {},
     rejected: {},
   };
@@ -281,6 +342,9 @@ function recordHybridDecision(run, decision) {
   run.hybrid.changed += Number(hybrid.changedDecision === true);
   run.hybrid.samples += Number(hybrid.samples) || 0;
   run.hybrid.nodes += Number(hybrid.nodes) || 0;
+  run.hybrid.iterations += Number(hybrid.iterations) || 0;
+  const searchMode = String(hybrid.searchMode || 'none');
+  run.hybrid.searchModes[searchMode] = (run.hybrid.searchModes[searchMode] || 0) + 1;
   const reason = String(hybrid.reason || 'unknown');
   run.hybrid.reasons[reason] = (run.hybrid.reasons[reason] || 0) + 1;
   const rejectionEntries = hybrid.rejectionSummary
@@ -693,10 +757,55 @@ const pairs = [];
 const failures = [];
 const startedAt = performance.now();
 const plannedPairs = groupCount * (levelBlockDesign ? evaluationLevels.length : 1);
+const checkpointSignature = JSON.stringify({
+  groupCount, baseSeed, candidate: CANDIDATE.name, comparison: COMPARISON.name,
+  evaluationLevels, levelBlockDesign, continuousMatch,
+  valueModelSha256: valueModelAudit?.sha256 || null,
+});
+let resumeBlockIndex = 0;
+
+function writeCheckpoint(nextBlockIndex) {
+  if (!checkpointPath) return;
+  fs.mkdirSync(path.dirname(checkpointPath), { recursive: true });
+  fs.writeFileSync(checkpointPath, `${JSON.stringify({
+    schema: 'guandan-ai-ab-checkpoint-v1',
+    signature: checkpointSignature,
+    nextBlockIndex,
+    complete: nextBlockIndex >= groupCount,
+    games,
+    pairs,
+    failures,
+  })}\n`, 'utf8');
+}
+
+if (resumeCheckpoint) {
+  if (!checkpointPath || !fs.existsSync(checkpointPath)) {
+    throw new Error('--resume 需要现有 --checkpoint 文件');
+  }
+  const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
+  if (checkpoint.schema !== 'guandan-ai-ab-checkpoint-v1'
+    || checkpoint.signature !== checkpointSignature) {
+    throw new Error('检查点与当前评测配置或模型哈希不一致');
+  }
+  if (!Number.isInteger(checkpoint.nextBlockIndex)
+    || checkpoint.nextBlockIndex < 0 || checkpoint.nextBlockIndex > groupCount
+    || !Array.isArray(checkpoint.games) || !Array.isArray(checkpoint.pairs)
+    || !Array.isArray(checkpoint.failures)) {
+    throw new Error('检查点内容无效');
+  }
+  const expectedPairs = checkpoint.nextBlockIndex * (levelBlockDesign ? evaluationLevels.length : 1);
+  if (checkpoint.pairs.length !== expectedPairs || checkpoint.games.length !== expectedPairs * 2) {
+    throw new Error('检查点的已完成区组不完整');
+  }
+  games.push(...checkpoint.games);
+  pairs.push(...checkpoint.pairs);
+  failures.push(...checkpoint.failures);
+  resumeBlockIndex = checkpoint.nextBlockIndex;
+}
 
 try {
-  let pairIndex = 0;
-  for (let blockIndex = 0; blockIndex < groupCount; blockIndex++) {
+  let pairIndex = pairs.length;
+  for (let blockIndex = resumeBlockIndex; blockIndex < groupCount; blockIndex++) {
     const seed = (baseSeed + blockIndex) >>> 0;
     const levelsForSeed = levelBlockDesign
       ? evaluationLevels
@@ -783,6 +892,7 @@ try {
         });
       }
     }
+    writeCheckpoint(blockIndex + 1);
   }
 } finally {
   globalThis.clearInterval(heartbeat);
@@ -876,6 +986,10 @@ const hybridTotals = completedGames.reduce((total, game) => {
   total.changed += report.changed || 0;
   total.samples += report.samples || 0;
   total.nodes += report.nodes || 0;
+  total.iterations += report.iterations || 0;
+  for (const [key, value] of Object.entries(report.searchModes || {})) {
+    total.searchModes[key] = (total.searchModes[key] || 0) + value;
+  }
   for (const [key, value] of Object.entries(report.reasons || {})) {
     total.reasons[key] = (total.reasons[key] || 0) + value;
   }
@@ -886,11 +1000,12 @@ const hybridTotals = completedGames.reduce((total, game) => {
 }, createHybridCounters());
 
 if (!jsonOnly) console.log('\n');
-console.log(JSON.stringify({
+const finalReport = {
   config: {
     seedGroups: plannedPairs,
     baseDealBlocks: groupCount,
     baseSeed,
+    evaluationSeedManifest,
     gamesPlanned: plannedPairs * 2,
     evaluationLevels,
     evaluationDesign: levelBlockDesign ? 'same-deal-cross-level-blocks' : 'legacy-level-cycle',
@@ -910,6 +1025,7 @@ console.log(JSON.stringify({
     comparisonFeatures: COMPARISON.policyFeatures,
     candidateThresholds: CANDIDATE.policyThresholds,
     comparisonThresholds: COMPARISON.policyThresholds,
+    valueModel: valueModelAudit,
     difficulty: 'master',
     deterministic: true,
   },
@@ -966,6 +1082,8 @@ console.log(JSON.stringify({
       ? hybridTotals.samples / hybridTotals.turns : null),
     averageNodesPerAppliedTurn: rounded(hybridTotals.applied
       ? hybridTotals.nodes / hybridTotals.applied : null),
+    averageIterationsPerAppliedTurn: rounded(hybridTotals.applied
+      ? hybridTotals.iterations / hybridTotals.applied : null),
   },
   continuousMatch: {
     enabled: continuousMatch,
@@ -979,6 +1097,10 @@ console.log(JSON.stringify({
     aAttempts: continuousRounds.filter((round) => round.aAttempt).length,
     aFailures: continuousRounds.filter((round) => round.aFailed).length,
     aResets: continuousRounds.filter((round) => round.aReset).length,
+    longRoundActionThreshold: LONG_ROUND_ACTIONS,
+    longRounds: continuousRounds.filter((round) => round.actions >= LONG_ROUND_ACTIONS).length,
+    maxRoundActions: continuousRounds.length
+      ? Math.max(...continuousRounds.map((round) => round.actions)) : null,
     candidateRoundUpgradeUtility: continuousRounds.reduce(
       (sum, round) => sum + round.candidateUtility, 0,
     ),
@@ -992,7 +1114,14 @@ console.log(JSON.stringify({
   },
   ...(summaryOnly ? {} : { pairs, blocks }),
   failures,
-}, null, 2));
+};
+const serializedReport = JSON.stringify(finalReport, null, 2);
+if (reportPath) {
+  fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+  fs.writeFileSync(reportPath, `${serializedReport}\n`, 'utf8');
+}
+writeCheckpoint(groupCount);
+console.log(serializedReport);
 
 if (failures.length || completedPairs.length !== plannedPairs
   || completedBlocks.length !== groupCount) process.exitCode = 1;
