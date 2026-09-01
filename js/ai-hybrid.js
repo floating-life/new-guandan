@@ -16,6 +16,7 @@ import { createPublicAIObservation } from './ai-observation.js';
 import {
   VALUE_MODEL_STATUS, isPromotedValueModel, valueModelStatus,
 } from './value-model-gate.js';
+import { filterEnemyReportLeadCandidates } from './strategy-core.js';
 
 export const HYBRID_ENGINE_VERSION = 1;
 export const HYBRID_VALUE_SCHEMA = 'guandan-candidate-v1';
@@ -521,16 +522,60 @@ function rolloutStructureCost(play, fullHand, level) {
   return cost;
 }
 
-function chooseRolloutPlay(state, seat) {
+function leastCostRolloutPlay(plays, hand, level) {
+  return plays.slice().sort((left, right) => {
+    const leftRemain = hand.length - left.cards.length;
+    const rightRemain = hand.length - right.cards.length;
+    const leftCost = rolloutStructureCost(left, hand, level);
+    const rightCost = rolloutStructureCost(right, hand, level);
+    return leftRemain - rightRemain
+      || leftCost - rightCost
+      || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+      || left.hand.power - right.hand.power
+      || handSignature(left.hand).localeCompare(handSignature(right.hand));
+  })[0] || null;
+}
+
+function cheapestRolloutPlay(plays, hand, level) {
+  return plays.slice().sort((left, right) => (
+    rolloutStructureCost(left, hand, level) - rolloutStructureCost(right, hand, level)
+    || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+    || left.cards.length - right.cards.length
+    || left.hand.power - right.hand.power
+    || handSignature(left.hand).localeCompare(handSignature(right.hand))
+    || left.cards.map(physicalKey).sort().join(',')
+      .localeCompare(right.cards.map(physicalKey).sort().join(','))
+  ))[0] || null;
+}
+
+function responseRolloutPlay(plays, hand, level) {
+  return plays.slice().sort((left, right) => (
+    rolloutStructureCost(left, hand, level) - rolloutStructureCost(right, hand, level)
+    || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+    || left.hand.power - right.hand.power
+    || handSignature(left.hand).localeCompare(handSignature(right.hand))
+  ))[0] || null;
+}
+
+function finishingRolloutPlay(plays) {
+  return plays.slice().sort((left, right) => (
+    Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+    || left.hand.power - right.hand.power
+  ))[0] || null;
+}
+
+/**
+ * Choose an expert-oriented rollout action.  The optional legalPlaysOverride
+ * is kept for the unit test that simulates a future generator returning only
+ * bomb candidates; production callers always use generateLegalPlays.
+ */
+export function chooseRolloutPlay(state, seat, legalPlaysOverride = null) {
   const hand = state.hands[seat];
-  const plays = generateLegalPlays(hand, state.level, state.lastHand);
+  const plays = legalPlaysOverride || generateLegalPlays(hand, state.level, state.lastHand);
   if (!plays.length) return null;
   const finishing = plays.filter((play) => play.cards.length === hand.length);
   if (finishing.length) {
-    return finishing.sort((left, right) => (
-      Number(isBomb(left.hand)) - Number(isBomb(right.hand))
-      || left.hand.power - right.hand.power
-    ))[0];
+    return finishingRolloutPlay(finishing);
   }
 
   if (state.lastHand && state.lastSeat != null
@@ -542,26 +587,26 @@ function chooseRolloutPlay(state, seat) {
   const ordinary = plays.filter((play) => !isBomb(play.hand));
   const pool = ordinary.length
     ? ordinary
-    : (lastEnemyCount <= 4 || hand.length <= 8 ? plays : []);
-  if (!pool.length) return null;
-
-  return pool.slice().sort((left, right) => {
-    const leftRemain = hand.length - left.cards.length;
-    const rightRemain = hand.length - right.cards.length;
-    const leftCost = rolloutStructureCost(left, hand, state.level);
-    const rightCost = rolloutStructureCost(right, hand, state.level);
-    if (!state.lastHand) {
-      return leftRemain - rightRemain
-        || leftCost - rightCost
-        || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
-        || left.hand.power - right.hand.power
-        || handSignature(left.hand).localeCompare(handSignature(right.hand));
+    : (state.lastHand && (lastEnemyCount <= 4 || hand.length <= 8) ? plays : []);
+  if (!pool.length) {
+    // 首出不能把“没有普通候选”解释成过牌。正常规则会为非空手牌
+    // 生成单张，但这里仍显式保护未来生成器/牌型扩展的异常路径：只要
+    // 还有合法候选，就选择最小结构成本的一手并留下可审计诊断。
+    if (!state.lastHand && plays.length) {
+      return { ...cheapestRolloutPlay(plays, hand, state.level),
+        rolloutDiagnostic: 'lead_no_ordinary_fallback' };
     }
-    return leftCost - rightCost
-      || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
-      || left.hand.power - right.hand.power
-      || handSignature(left.hand).localeCompare(handSignature(right.hand));
-  })[0];
+    return null;
+  }
+
+  return state.lastHand
+    ? responseRolloutPlay(pool, hand, state.level)
+    : leastCostRolloutPlay(pool, hand, state.level);
+}
+
+function recordRolloutDiagnostic(limits, diagnostic) {
+  if (!diagnostic || !limits?.rolloutDiagnostics) return;
+  limits.rolloutDiagnostics[diagnostic] = (limits.rolloutDiagnostics[diagnostic] || 0) + 1;
 }
 
 function respondersForCurrentTrick(state) {
@@ -707,6 +752,7 @@ function simulateCandidate(sample, observation, candidate, limits) {
     }
     const seat = state.currentSeat;
     const play = chooseRolloutPlay(state, seat);
+    recordRolloutDiagnostic(limits, play?.rolloutDiagnostic);
     limits.nodes.value += 1;
     plies += 1;
     if (!play) {
@@ -842,6 +888,7 @@ function rolloutFromSimulationState(state, rootTeam, limits) {
     }
     const seat = state.currentSeat;
     const play = chooseRolloutPlay(state, seat);
+    recordRolloutDiagnostic(limits, play?.rolloutDiagnostic);
     const action = play ? actionFromPlay(play) : { action: 'pass', cards: [], hand: null };
     limits.nodes.value += 1;
     plies += 1;
@@ -1240,6 +1287,7 @@ function runISMCTSSearch(observation, candidates, limits, options) {
       pairedSweeps,
       sampledWorlds,
       sampleFailures,
+      rolloutDiagnostics: limits.rolloutDiagnostics,
       treeNodes,
       ...(options.includeTreeDigest === true ? { rollbackDiagnostics } : {}),
       ...(options.includeTreeDigest === true ? { treeDigest: digestOpenLoopNode(root) } : {}),
@@ -1290,6 +1338,7 @@ function runISMCTSSearch(observation, candidates, limits, options) {
     iterationBudget,
     sampledWorlds,
     sampleFailures,
+    rolloutDiagnostics: limits.rolloutDiagnostics,
     treeNodes,
     ...(options.includeTreeDigest === true ? { rollbackDiagnostics } : {}),
     ...(options.includeTreeDigest === true ? { treeDigest: digestOpenLoopNode(root) } : {}),
@@ -1479,6 +1528,7 @@ function runPIMCSearch(observation, sampling, candidates, limits) {
   return {
     searchMode: HYBRID_SEARCH_MODES.PIMC,
     iterations: candidateResults.reduce((sum, item) => sum + item.visits, 0),
+    rolloutDiagnostics: limits.rolloutDiagnostics,
     candidateResults,
   };
 }
@@ -1574,6 +1624,7 @@ function runPairedRootPIMCSearch(observation, sampling, candidates, limits, opti
     iterations,
     iterationBudget,
     pairedWorlds,
+    rolloutDiagnostics: limits.rolloutDiagnostics,
     candidateResults,
   };
 }
@@ -1621,6 +1672,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     deadlineMs: options.deadlineMs != null && Number.isFinite(Number(options.deadlineMs))
       ? Number(options.deadlineMs) : null,
     nodes,
+    rolloutDiagnostics: {},
   };
   const search = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
     ? runPairedRootPIMCSearch(observation, sampling, candidates, limits, options)
@@ -1668,6 +1720,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     pairedSweeps: search.pairedSweeps || 0,
     sampledWorlds: search.sampledWorlds || 0,
     sampleFailures: search.sampleFailures || {},
+    rolloutDiagnostics: search.rolloutDiagnostics || {},
     treeNodes: search.treeNodes || 0,
     rollbackDiagnostics: search.rollbackDiagnostics || [],
     treeDigest: search.treeDigest || null,
@@ -1863,15 +1916,48 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
 
   if (!consultation || !localCandidate) return fallback('missing_local_candidate');
   const allCandidates = consultation.candidates || [];
+  const guardedCandidates = ctx?.policyFeatures?.enemyReportLeadSafety === true
+    && !ctx?.lastHand
+    ? filterEnemyReportLeadCandidates(allCandidates, {
+      ...ctx,
+      hand: ctx.hand,
+      mode: 'lead',
+    }).entries
+    : allCandidates;
+  // STRAT-3 是混合搜索前的硬候选门。正常咨询已经把专家首选放在安全池中，
+  // 但这里仍防御直接调用/旧缓存：被阻断的低单不得借“本地锚点”身份重新进入
+  // 搜索；用过滤后的首个候选重建锚点，也让证据不足回退保持同一安全口径。
+  const guardedLocalCandidate = guardedCandidates.find(
+    (candidate) => candidate.id === consultation.localCandidateId,
+  );
+  if (!guardedLocalCandidate) {
+    const safeAnchor = guardedCandidates[0];
+    if (!safeAnchor) return fallback('enemy_report_lead_no_safe_candidate');
+    consultation = {
+      ...consultation,
+      action: safeAnchor.action,
+      ...(safeAnchor.action === 'play' ? {
+        cards: safeAnchor.cards,
+        hand: safeAnchor.hand,
+        signature: safeAnchor.signature || handSignature(safeAnchor.hand),
+      } : {}),
+      reason: '报单安全门阻断原专家首选，回退到安全候选',
+      localCandidateId: safeAnchor.id,
+    };
+  }
+  const effectiveLocalCandidate = guardedCandidates.find(
+    (candidate) => candidate.id === consultation.localCandidateId,
+  );
+  if (!effectiveLocalCandidate) return fallback('missing_guarded_local_candidate');
   // 专家最终选择优先进入池，再补入原排序靠前候选。本地模拟不受云端最多
   // 3 个候选的传输限制，但仍限制为 6 个，控制浏览器端时间与组合爆炸。
   const consideredCandidates = [
-    localCandidate,
-    ...allCandidates.filter((candidate) => candidate.id !== localCandidate.id),
+    effectiveLocalCandidate,
+    ...guardedCandidates.filter((candidate) => candidate.id !== effectiveLocalCandidate.id),
   ];
   const safety = consideredCandidates.map((candidate) => ({
     candidate,
-    ...hybridCandidateSafety(candidate, localCandidate, observation),
+    ...hybridCandidateSafety(candidate, effectiveLocalCandidate, observation),
   }));
   const candidateLimit = clamp(Math.floor(Number(options.candidateLimit) || 6), 2, 8);
   const candidates = safety.filter((item) => item.eligible)
@@ -2022,6 +2108,7 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     nodes: informationSet.nodes || 0,
     searchAttempted: informationSet.searchAttempted === true,
     searchTriggered: informationSet.searchTriggered === true,
+    rolloutDiagnostics: informationSet.rolloutDiagnostics || {},
     fallbackKind: forceExpert
       ? 'force_expert_choice'
       : !informationSet.applied ? 'search_evidence_insufficient' : null,

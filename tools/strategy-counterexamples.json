@@ -1,0 +1,111 @@
+{
+  "schema": "guandan-strategy-counterexample-set-v1",
+  "ruleVersion": "guandan-rules-v1",
+  "sourceFingerprint": {
+    "files": [
+      { "file": "js/ai.js", "sha256": "f2ffc2ef40aa097402b2d1385d8867d1dc79e95f70ba9ead2ae212e452989057", "bytes": 115568 },
+      { "file": "js/cards.js", "sha256": "c27bb5693fad1c21194422e8eb772ed3a20b0e784c521d5d71748280155f0820", "bytes": 3660 },
+      { "file": "js/evaluator.js", "sha256": "6344489a0d42b02fe19b44d0ca3aecb0c1951eeac9287bec65243be0cb58cef0", "bytes": 44362 },
+      { "file": "js/rules.js", "sha256": "672eea2f887af6e750abacbb6a560ed70a17f5b3acb5ec34bee1fb88e863e5b7", "bytes": 32780 },
+      { "file": "js/strategy-core.js", "sha256": "9526edcf2fe6cefcae0385428b9292bbfb8a96a368b86eb2e3efeb4935b9cf31", "bytes": 73743 }
+    ],
+    "sha256": "b3543a9e948db3d1baa4a38d80b43813f809382de6401d31a018a79ade25d1a6"
+  },
+  "fixtures": [
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "strat4-partner-wins-active-enemy-yielded",
+      "rule": "STRAT-4",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": { "sha256": "b3543a9e948db3d1baa4a38d80b43813f809382de6401d31a018a79ade25d1a6" },
+      "observation": {
+        "level": 2,
+        "seat": 0,
+        "hand": [
+          { "rank": 7, "suit": "S", "deckIndex": 0 },
+          { "rank": 8, "suit": "S", "deckIndex": 0 },
+          { "rank": 9, "suit": "S", "deckIndex": 0 },
+          { "rank": 10, "suit": "S", "deckIndex": 0 }
+        ],
+        "lastHand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 },
+        "lastSeat": 2,
+        "teams": [0, 1, 0, 1],
+        "finishOrder": [1],
+        "handCounts": [4, 0, 4, 7],
+        "publicHistory": [
+          { "turn": 37, "trickNumber": 10, "seat": 2, "action": "play", "cards": [{ "rank": 5, "suit": "C", "deckIndex": 0 }], "hand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 }, "countsBefore": [4, 0, 4, 8], "countsAfter": [4, 0, 4, 7] },
+          { "turn": 38, "trickNumber": 10, "seat": 3, "action": "pass", "cards": [], "hand": null, "countsBefore": [4, 0, 4, 7], "countsAfter": [4, 0, 4, 7] }
+        ]
+      },
+      "candidates": [
+        { "action": "pass", "cards": [], "signature": null, "tags": [] },
+        { "action": "play", "cards": [{ "rank": 7, "suit": "S", "deckIndex": 0 }], "signature": null, "tags": [] }
+      ],
+      "expected": {
+        "invariants": ["partner_current_trick_winner", "all_active_enemies_passed_or_finished", "prefer_pass_with_tactical_constraint"],
+        "preferredAction": "pass",
+        "blockedActions": ["play:7:S:0"]
+      }
+    },
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "strat4-enemy-can-still-respond",
+      "rule": "STRAT-4",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": { "sha256": "b3543a9e948db3d1baa4a38d80b43813f809382de6401d31a018a79ade25d1a6" },
+      "observation": {
+        "level": 2,
+        "seat": 0,
+        "hand": [{ "rank": 7, "suit": "S", "deckIndex": 0 }, { "rank": 8, "suit": "S", "deckIndex": 0 }, { "rank": 9, "suit": "S", "deckIndex": 0 }, { "rank": 10, "suit": "S", "deckIndex": 0 }],
+        "lastHand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 },
+        "lastSeat": 2,
+        "teams": [0, 1, 0, 1],
+        "finishOrder": [],
+        "handCounts": [4, 9, 4, 7],
+        "publicHistory": [{ "turn": 37, "trickNumber": 10, "seat": 2, "action": "play", "cards": [{ "rank": 5, "suit": "C", "deckIndex": 0 }], "hand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 }, "countsBefore": [4, 9, 4, 8], "countsAfter": [4, 9, 4, 7] }, { "turn": 38, "trickNumber": 10, "seat": 3, "action": "pass", "cards": [], "hand": null, "countsBefore": [4, 9, 4, 7], "countsAfter": [4, 9, 4, 7] }]
+      },
+      "candidates": [{ "action": "pass", "cards": [], "signature": null, "tags": [] }, { "action": "play", "cards": [{ "rank": 7, "suit": "S", "deckIndex": 0 }], "signature": null, "tags": [] }],
+      "expected": { "invariants": ["active_enemy_not_yet_yielded"], "preferredAction": null, "blockedActions": [] }
+    },
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "strat4-partner-just-finished",
+      "rule": "STRAT-4",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": { "sha256": "b3543a9e948db3d1baa4a38d80b43813f809382de6401d31a018a79ade25d1a6" },
+      "observation": {
+        "level": 2,
+        "seat": 0,
+        "hand": [{ "rank": 7, "suit": "S", "deckIndex": 0 }, { "rank": 8, "suit": "S", "deckIndex": 0 }, { "rank": 9, "suit": "S", "deckIndex": 0 }, { "rank": 10, "suit": "S", "deckIndex": 0 }],
+        "lastHand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 },
+        "lastSeat": 2,
+        "teams": [0, 1, 0, 1],
+        "finishOrder": [2, 1, 3],
+        "handCounts": [4, 0, 0, 0],
+        "publicHistory": [{ "turn": 43, "trickNumber": 12, "seat": 2, "action": "play", "cards": [{ "rank": 5, "suit": "C", "deckIndex": 0 }], "hand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 }, "countsBefore": [4, 0, 1, 0], "countsAfter": [4, 0, 0, 0] }]
+      },
+      "candidates": [{ "action": "pass", "cards": [], "signature": null, "tags": [] }, { "action": "play", "cards": [{ "rank": 7, "suit": "S", "deckIndex": 0 }], "signature": null, "tags": [] }],
+      "expected": { "invariants": ["partner_finished", "no_active_enemy_to_answer", "do_not_fall_through_to_opponent_response"], "preferredAction": "pass", "blockedActions": ["play:7:S:0"] }
+    },
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "strat4-no-history-is-not-proof",
+      "rule": "STRAT-4",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": { "sha256": "b3543a9e948db3d1baa4a38d80b43813f809382de6401d31a018a79ade25d1a6" },
+      "observation": {
+        "level": 2,
+        "seat": 0,
+        "hand": [{ "rank": 7, "suit": "S", "deckIndex": 0 }, { "rank": 8, "suit": "S", "deckIndex": 0 }, { "rank": 9, "suit": "S", "deckIndex": 0 }, { "rank": 10, "suit": "S", "deckIndex": 0 }],
+        "lastHand": { "type": "single", "mainRank": 5, "size": 1, "power": 5 },
+        "lastSeat": 2,
+        "teams": [0, 1, 0, 1],
+        "finishOrder": [1],
+        "handCounts": [4, 0, 4, 7],
+        "publicHistory": []
+      },
+      "candidates": [{ "action": "pass", "cards": [], "signature": null, "tags": [] }, { "action": "play", "cards": [{ "rank": 7, "suit": "S", "deckIndex": 0 }], "signature": null, "tags": [] }],
+      "expected": { "invariants": ["missing_public_pass_is_not_yield_evidence"], "preferredAction": null, "blockedActions": [] }
+    }
+  ]
+}

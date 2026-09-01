@@ -11,7 +11,7 @@ import {
   analyzeSingleRunPressure, countDisjointStraights, countPotentialBombs, createStrategicMemo,
   downstreamEnemyNeedsBlock, evaluateStrategicPlay, selectEmergencyBlock,
   strategicCandidateScore, wholeHandPlay, assessTeamFinishDelay,
-  selectPressureOrdinaryResponse,
+  selectPressureOrdinaryResponse, consumesReservedControl, assessPartnerTrickControl,
 } from './strategy-core.js';
 import {
   createBeatModel, inferPublicThreats, publicPartnerProtectionValue,
@@ -73,6 +73,10 @@ export function evaluatePlay(ctx) {
     return evaluatePass({
       legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
       finishOrder, assessment, level, playedCards, publicHistory, difficulty, policyFeatures,
+      partnerTrickControl: assessPartnerTrickControl({
+        hand: handBefore, lastHand, lastSeat, seat, teams, handCounts, finishOrder, publicHistory,
+        policyFeatures,
+      }),
     });
   }
 
@@ -110,8 +114,10 @@ export function evaluatePlay(ctx) {
     policyFeatures,
     strategyWeight: 1,
     leadAfterOwnBomb,
+    legalPlays: legal,
     strategyMemo: createStrategicMemo(handBefore, level),
   };
+  const partnerTrickControl = assessPartnerTrickControl(strategyCtx);
   const sharedStrategy = evaluateStrategicPlay({ cards, hand: parsed }, strategyCtx);
   const createsTwoStepFinish = sharedStrategy.createsTwoStepFinish;
   score += applyEvents(assessment, tips, sharedStrategy.events);
@@ -142,7 +148,20 @@ export function evaluatePlay(ctx) {
   }
 
   // 3) 压队友
-  if (isTeammateLead && lastHand) {
+  if (partnerTrickControl.shouldYield && cards.length < handBefore.length) {
+    const placementException = sharedStrategy.tags.includes('double_up_block')
+      || sharedStrategy.tags.includes('avoid_double_down');
+    if (!placementException) {
+      apply(
+        'cooperation',
+        -45,
+        'over_partner_trick_control',
+        '对家仍持有本圈牌权且活跃对手均已过牌/出完；此时抢牌会破坏接风，应优先过牌。',
+      );
+    }
+  }
+
+  if (isTeammateLead && lastHand && !partnerTrickControl.shouldYield) {
     const urgentBlock = downstreamEnemyNeedsBlock(lastHand, {
       seat, teams, handCounts, finishOrder,
     });
@@ -335,6 +354,7 @@ function evaluatePass({
   legal, lastHand, lastSeat, isTeammateLead, handBefore, handCounts, seat, teams, tips, score,
   finishOrder, assessment, level, playedCards = [], publicHistory = [], difficulty = 'master',
   policyFeatures = null,
+  partnerTrickControl = null,
 }) {
   const setScore = (target, dimension, tag, message) => {
     const delta = target - score;
@@ -345,6 +365,28 @@ function evaluatePass({
   if (!lastHand) {
     setScore(0, 'defense', 'invalid_pass', '领出时不能过牌。');
     return makeResult(0, tips, '无效操作', assessment);
+  }
+
+  const trickControl = partnerTrickControl || assessPartnerTrickControl({
+    hand: handBefore,
+    lastHand,
+    lastSeat,
+    seat,
+    teams,
+    handCounts,
+    finishOrder,
+    publicHistory,
+  });
+  if (trickControl.shouldYield && !legal.some((play) => play.cards.length === handBefore.length)) {
+    setScore(
+      92,
+      'cooperation',
+      'partner_trick_control',
+      trickControl.partnerFinished
+        ? '对家已出完但仍是本圈赢家，活跃对手均已过牌/出完；过牌接风，避免误入普通接对手。'
+        : '对家仍是本圈赢家且活跃对手均已过牌/出完；过牌接风，避免打断团队牌权。',
+    );
+    return makeResult(score, tips, '接风让牌', assessment);
   }
 
   // 队友牌：过是好的
@@ -1020,8 +1062,10 @@ function evalLead(parsed, cards, handBefore, level, legal) {
     }
   }
 
-  // 领出过大
-  if (!isBombType(parsed) && parsed.power >= 50 && handBefore.length > 10) {
+  // 普通高点领牌保留原有评价；STRAT-2 的 A/级牌三张与三带二门由共享
+  // strategy-core 单独控制，避免 AI 与教练各自复制阈值和重复扣分。
+  if (!isBombType(parsed) && parsed.power >= 50 && handBefore.length > 10
+    && !consumesReservedControl({ hand: parsed }, level)) {
     events.push({
       dimension: 'resources',
       delta: -12,
@@ -1029,7 +1073,6 @@ function evalLead(parsed, cards, handBefore, level, legal) {
       message: '开局过早甩级牌/大牌，不利于中盘控制。',
     });
   }
-
   // 领出小组合好
   if (!isBombType(parsed) && parsed.power <= 8 && cards.length >= 2) {
     events.push({

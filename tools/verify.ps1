@@ -99,6 +99,7 @@ $nodeTests = @(
   'js/rules.test.js',
   'js/ai.test.js',
   'js/ai.hybrid.test.js',
+  'tools/test_strategy_counterexamples.mjs',
   'js/opponent-model.test.js',
   'js/value-model-gate.test.js',
   'js/value-model-persistence.test.js',

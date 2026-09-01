@@ -19,7 +19,11 @@ import {
   setAIDifficulty,
 } from './ai.js';
 import { evaluatePlay, summarizeSession } from './evaluator.js';
-import { evaluateStrategicPlay } from './strategy-core.js';
+import {
+  assessEnemyReportLead, assessPartnerTrickControl, evaluateStrategicPlay,
+  filterEnemyReportLeadCandidates,
+  isLowSingleLead,
+} from './strategy-core.js';
 import {
   estimateThreeStepRoute, inferPublicThreats, publicCoordinationScore,
   inferRemainingPool, createBeatModel, createUnconditionedBeatModel,
@@ -28,6 +32,7 @@ import {
   orderedTeamControlLossProbability, evaluatePublicResponseTree,
   evaluatePublicEndgameRollout, publicPartnerProtectionValue,
 } from './ai-route.js';
+import { chooseHybridFromConsultation } from './ai-hybrid.js';
 import { applySearchTimeBudget } from './ai.js';
 
 let passed = 0;
@@ -314,6 +319,363 @@ console.log('领出对子时惜大打小');
   }));
   assert(recommendation?.hand.type === 'pair' && recommendation.hand.mainRank === 3,
     '困难AI与教练建议同样保留AA控制力');
+}
+
+console.log('满手不先甩三个A或三个级牌');
+{
+  const level = 7;
+  const hand = [
+    C(14, 'S'), C(14, 'H'), C(14, 'D'),
+    C(7, 'S'), C(7, 'H'), C(7, 'D'),
+    C(3, 'S'), C(3, 'H'),
+    C(4, 'S'), C(4, 'H'),
+    C(6, 'S'), C(8, 'S'), C(9, 'S'), C(10, 'S'), C(11, 'S'),
+    C(12, 'D'),
+  ];
+  const ctx = context(hand, {
+    level,
+    handCounts: [hand.length, 16, 16, 16],
+    difficulty: 'master',
+    deterministic: true,
+    policyProfile: 'expert',
+    policyFeatures: resolvePolicyVariant('with-reserved-high-control-lead').policyFeatures,
+  });
+  const aceFullHouse = [...hand.filter((card) => card.rank === 14), C(3, 'S'), C(3, 'H')];
+  const levelFullHouse = [...hand.filter((card) => card.rank === 7), C(4, 'S'), C(4, 'H')];
+  const aceLead = evaluateStrategicPlay(
+    { cards: aceFullHouse, hand: parseHand(aceFullHouse, level) },
+    { ...ctx, mode: 'lead' },
+  );
+  const levelLead = evaluateStrategicPlay(
+    { cards: levelFullHouse, hand: parseHand(levelFullHouse, level) },
+    { ...ctx, mode: 'lead' },
+  );
+  assert(aceLead.tags.includes('premature_high_control'),
+    '满手领出三个A带对子记为过早交出控制');
+  assert(levelLead.tags.includes('premature_high_control'),
+    '满手领出三个级牌带对子记为过早交出控制');
+
+  const strat2Features = resolvePolicyVariant('with-reserved-high-control-lead').policyFeatures;
+  const elevenCards = [
+    C(14, 'S'), C(14, 'H'), C(14, 'D'),
+    C(3, 'S'), C(4, 'S'), C(5, 'S'), C(6, 'S'), C(8, 'S'),
+    C(9, 'S'), C(10, 'S'), C(11, 'S'),
+  ];
+  const thirteenCards = [
+    C(14, 'S'), C(14, 'H'), C(14, 'D'),
+    C(3, 'S'), C(4, 'S'), C(5, 'S'), C(6, 'S'), C(7, 'S'), C(8, 'S'),
+    C(9, 'S'), C(10, 'S'), C(11, 'S'), C(12, 'S'),
+  ];
+  const fourteenCards = [
+    C(3, 'S'), C(3, 'H'), C(3, 'D'), C(14, 'S'), C(14, 'H'),
+    C(4, 'S'), C(5, 'S'), C(6, 'S'), C(7, 'S'), C(8, 'S'), C(9, 'S'),
+    C(10, 'S'), C(11, 'S'), C(12, 'S'),
+  ];
+  const strategyFor = (allCards, selectedCards) => evaluateStrategicPlay(
+    { cards: selectedCards, hand: parseHand(selectedCards, level) },
+    {
+      ...ctx,
+      hand: allCards,
+      policyFeatures: strat2Features,
+      mode: 'lead',
+    },
+  );
+  assert(!strategyFor(elevenCards, elevenCards.slice(0, 3)).tags.includes('premature_high_control'),
+    '11张边界出AAA后剩8张，不触发长手保留门');
+  assert(strategyFor(thirteenCards, thirteenCards.slice(0, 3)).tags.includes('premature_high_control'),
+    '13张边界出AAA后剩10张，触发长手保留门');
+  const pairAceFullHouse = fourteenCards.slice(0, 5);
+  assert(strategyFor(fourteenCards, pairAceFullHouse).tags.includes('premature_high_control'),
+    '14张边界三带二带对A，按同一剩余张数门槛触发保留门');
+  const multiDeclarations = parseHandVariants(levelFullHouse, level)
+    .filter((declared) => declared.type === 'fullhouse');
+  assert(multiDeclarations.length > 1
+      && multiDeclarations.every((declared) => evaluateStrategicPlay(
+        { cards: levelFullHouse, hand: declared },
+        { ...ctx, hand, policyFeatures: strat2Features, mode: 'lead' },
+      ).tags.includes('premature_high_control')),
+    '逢人配三带二的多解声明统一经过同一保留门');
+
+  const decision = recommendPlay(ctx);
+  const acesPlayed = (decision?.cards || []).filter((card) => card.rank === 14).length;
+  const levelsPlayed = (decision?.cards || []).filter((card) => card.rank === 7).length;
+  assert(decision?.action === 'play' && acesPlayed < 3 && levelsPlayed < 3,
+    `满手应先清理小牌，不能先甩三个A或三个级牌（实际 ${decision?.hand?.type}:${decision?.hand?.mainRank}）`);
+
+  const shortHand = [
+    C(17, 'J'),
+    C(14, 'H'), C(14, 'S'), C(14, 'C'),
+    C(10, 'D'), C(10, 'C'),
+  ];
+  const shortDecision = recommendPlay(context(shortHand, {
+    seat: 3,
+    level: 5,
+    handCounts: [12, 10, 9, shortHand.length],
+    policyProfile: 'expert',
+    policyFeatures: strat2Features,
+  }));
+  assert(shortDecision?.hand.type === 'fullhouse'
+    && shortDecision.cards.filter((card) => card.rank === 14).length === 3,
+    '残局两手收官仍先出AAA带对，不把满手禁令套到收官');
+
+  const defaultStrategy = evaluateStrategicPlay(
+    { cards: aceFullHouse, hand: parseHand(aceFullHouse, level) },
+    { ...ctx, policyFeatures: resolvePolicyVariant('expert').policyFeatures, mode: 'lead' },
+  );
+  assert(!defaultStrategy.tags.includes('premature_high_control'),
+    '正式 expert 默认关闭 STRAT-2，不把候选修复偷渡到默认策略');
+
+  const coach = evaluatePlay({
+    action: 'play',
+    cards: aceFullHouse,
+    handBefore: hand,
+    level,
+    seat: 0,
+    teams: TEAMS,
+    handCounts: [hand.length, 16, 16, 16],
+    policyFeatures: resolvePolicyVariant('with-reserved-high-control-lead').policyFeatures,
+  });
+  assert(coach.mistakeTags.includes('premature_high_control'),
+    '教练评价与 AI 共享同一 STRAT-2 标签和阈值');
+  const reserveEvents = coach.breakdown.filter(
+    (item) => item.tag === 'premature_high_control',
+  );
+  assert(reserveEvents.length === 1 && reserveEvents[0].delta === -12
+      && coach.tips.filter((tip) => tip.includes('手牌尚长时不宜先交')).length === 1,
+    '教练评价只应用一次共享 STRAT-2 惩罚，不重复扣分或提示');
+
+  const coachFinish = evaluatePlay({
+    action: 'play',
+    cards: shortDecision.cards,
+    handBefore: shortHand,
+    level: 5,
+    seat: 3,
+    teams: TEAMS,
+    handCounts: [12, 10, 9, shortHand.length],
+    policyFeatures: strat2Features,
+  });
+  assert(!coachFinish.mistakeTags.includes('premature_high_control')
+      && !coachFinish.breakdown.some((item) => item.tag === 'premature_high_control'),
+    '教练评价在候选开启时仍豁免两手收官');
+
+  const coachDefault = evaluatePlay({
+    action: 'play',
+    cards: aceFullHouse,
+    handBefore: hand,
+    level,
+    seat: 0,
+    teams: TEAMS,
+    handCounts: [hand.length, 16, 16, 16],
+  });
+  assert(!coachDefault.mistakeTags.includes('premature_high_control'),
+    '正式教练评价默认不启用 STRAT-2 候选门');
+}
+
+console.log('任一对手报单时的安全领牌实验门');
+{
+  const level = 2;
+  const hand = [
+    C(3, 'S'), C(3, 'H'), C(5, 'S'), C(5, 'H'),
+    C(7, 'S'), C(9, 'S'), C(10, 'S'), C(11, 'S'),
+  ];
+  const lowSingle = { cards: [hand[4]], hand: parseHand([hand[4]], level) };
+  const safePair = { cards: hand.slice(0, 2), hand: parseHand(hand.slice(0, 2), level) };
+  const experimental = resolvePolicyVariant('with-enemy-report-lead-safety');
+  const leadCtx = context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    policyFeatures: experimental.policyFeatures,
+    mode: 'lead',
+  });
+  const safety = assessEnemyReportLead(lowSingle, leadCtx, [lowSingle, safePair]);
+  assert(safety.reportingSeats.join(',') === '1,3' && safety.blocked
+      && safety.saferAlternativeCount === 1,
+  '实验门同时识别下家和上家报单，并只在存在安全非单路线时阻断低单');
+  const filtered = filterEnemyReportLeadCandidates([lowSingle, safePair], leadCtx);
+  assert(filtered.entries.length === 1 && filtered.entries[0] === safePair,
+    '共享候选过滤器移除低单而保留安全对子');
+  const guardedStrategy = evaluateStrategicPlay(lowSingle, {
+    ...leadCtx,
+    legalPlays: [lowSingle, safePair],
+  });
+  assert(guardedStrategy.tags.includes('enemy_report_lead_guard')
+      && guardedStrategy.events.filter((event) => event.tag === 'enemy_report_lead_guard').length === 1,
+    '共享策略评价为被阻断的低单写入唯一报单防守事件');
+
+  const bombHand = [C(8, 'S'), C(8, 'H'), C(8, 'D'), C(8, 'C'), C(3, 'D')];
+  const bomb = { cards: bombHand.slice(0, 4), hand: parseHand(bombHand.slice(0, 4), level) };
+  const noAlternative = context(bombHand, {
+    level,
+    handCounts: [bombHand.length, 1, 12, 1],
+    policyFeatures: experimental.policyFeatures,
+    mode: 'lead',
+  });
+  const noRoute = assessEnemyReportLead(
+    { cards: [bombHand[4]], hand: parseHand([bombHand[4]], level) },
+    noAlternative,
+    [
+      { cards: [bombHand[4]], hand: parseHand([bombHand[4]], level) },
+      bomb,
+    ],
+  );
+  assert(!noRoute.blocked,
+    '只有低单与炸弹时不机械禁止低单，保留无安全替代动作的回退');
+
+  const defaultCtx = context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    policyFeatures: resolvePolicyVariant('expert').policyFeatures,
+  });
+  const defaultStrategy = evaluateStrategicPlay(lowSingle, {
+    ...defaultCtx,
+    mode: 'lead',
+    legalPlays: [lowSingle, safePair],
+  });
+  assert(!defaultStrategy.tags.includes('enemy_report_lead_guard')
+      && !resolvePolicyVariant('expert').policyFeatures.enemyReportLeadSafety,
+  '正式 expert 默认关闭 STRAT-3，不把候选约束偷渡到产品策略');
+  const beatStrategy = evaluateStrategicPlay(lowSingle, {
+    ...leadCtx,
+    mode: 'beat',
+    legalPlays: [lowSingle, safePair],
+  });
+  assert(!beatStrategy.tags.includes('enemy_report_lead_guard'),
+    '报单安全约束只作用于领牌，不污染跟牌分支');
+  assert(isLowSingleLead(lowSingle), '风险分类明确把 J 及以下单张作为低单，而非全局禁出');
+
+  const compactLock = { ...lowSingle, tags: ['public_lock_lead'] };
+  const wrappedSafe = { play: safePair, strategy: { tags: ['public_lock_lead'] } };
+  const compactResult = filterEnemyReportLeadCandidates(
+    [compactLock, lowSingle, wrappedSafe], leadCtx,
+  );
+  assert(compactResult.entries.includes(compactLock)
+      && compactResult.entries.includes(wrappedSafe)
+      && !compactResult.entries.includes(lowSingle),
+    '共享过滤器识别紧凑顶层 tags 与 {play,strategy} 包装，不误删公开锁牌路线');
+
+  const consultation = getAIConsultation(context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    policyFeatures: experimental.policyFeatures,
+    decisionEngine: 'hybrid',
+    difficulty: 'master',
+    deterministic: true,
+  }));
+  const consultationHasLowSingle = consultation.candidates.some((candidate) => (
+    candidate.hand?.type === 'single' && Number(candidate.hand.mainRank) <= 11
+      && Number(candidate.hand.mainRank) !== level
+  ));
+  assert(!consultationHasLowSingle
+      && consultation.candidates.some((candidate) => candidate.hand?.type === 'pair'),
+  '混合咨询候选在序列化后仍只保留安全非单，低单不能进入云端候选池');
+
+  const compactCandidate = (id, cards, localScore, tags = []) => {
+    const handValue = parseHand(cards, level);
+    return {
+      id,
+      action: 'play',
+      cards: cards.map((card) => ({
+        id: card.id, rank: card.rank, suit: card.suit,
+      })),
+      hand: handValue,
+      signature: handSignature(handValue),
+      localScore,
+      tags,
+    };
+  };
+  const unsafeCandidate = compactCandidate('unsafe_low_single', [hand[4]], 100);
+  const safeCandidateA = compactCandidate('safe_pair_3', hand.slice(0, 2), 85);
+  const safeCandidateB = compactCandidate('safe_pair_5', hand.slice(2, 4), 80);
+  const hybridGuard = chooseHybridFromConsultation(
+    context(hand, {
+      level,
+      handCounts: [hand.length, 1, 12, 1],
+      policyFeatures: experimental.policyFeatures,
+      decisionEngine: 'ismcts-v3',
+      difficulty: 'master',
+      deterministic: true,
+    }),
+    {
+      action: 'play',
+      cards: unsafeCandidate.cards,
+      hand: unsafeCandidate.hand,
+      signature: unsafeCandidate.signature,
+      candidates: [unsafeCandidate, safeCandidateA, safeCandidateB],
+      localCandidateId: unsafeCandidate.id,
+      cloudConstraint: 'soft_rerank',
+    },
+    {
+      searchMode: 'ismcts-v3',
+      behaviorAttempts: 1,
+      iterationBudget: 2,
+      minimumEffectiveVisits: 2,
+      maxPlies: 16,
+      nodeBudget: 1000,
+      seed: 20260901,
+    },
+  );
+  assert(hybridGuard.decision?.hybrid?.localCandidateId !== unsafeCandidate.id
+      && hybridGuard.decision?.hybrid?.finalCandidateId !== unsafeCandidate.id
+      && !hybridGuard.decision?.cards?.some((card) => card.rank === 7),
+  '混合搜索再次收到旧式低单首选时也先过安全门，搜索/回退均不恢复被过滤低单');
+
+  const resourceHand = [
+    C(2, 'S'), C(2, 'H'), C(7, 'S'), C(3, 'S'), C(3, 'H'),
+    C(5, 'S'), C(5, 'H'), C(9, 'S'),
+  ];
+  const unsafeResource = compactCandidate('unsafe_resource_low', [resourceHand[2]], 100);
+  const safeLevelPair = compactCandidate(
+    'safe_level_lock_pair', resourceHand.slice(0, 2), 85, ['public_lock_lead'],
+  );
+  const safeOrdinaryPair = compactCandidate('safe_ordinary_pair', resourceHand.slice(3, 5), 80);
+  const resourceGuard = chooseHybridFromConsultation(
+    context(resourceHand, {
+      level,
+      handCounts: [resourceHand.length, 1, 12, 1],
+      policyFeatures: experimental.policyFeatures,
+      decisionEngine: 'ismcts-v3',
+      difficulty: 'master',
+      deterministic: true,
+    }),
+    {
+      action: 'play',
+      cards: unsafeResource.cards,
+      hand: unsafeResource.hand,
+      signature: unsafeResource.signature,
+      candidates: [unsafeResource, safeLevelPair, safeOrdinaryPair],
+      localCandidateId: unsafeResource.id,
+      cloudConstraint: 'mandatory_block',
+    },
+    { searchMode: 'ismcts-v3', seed: 20260902 },
+  );
+  assert(!resourceGuard.telemetry.rejectedCandidates?.some(
+    (item) => item.id === safeLevelPair.id,
+  ), '混合安全锚点改用过滤后候选比较资源，不误排除带公开锁牌标签的级牌对子');
+
+  const coachGuard = recommendPlay(context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    policyFeatures: experimental.policyFeatures,
+  }));
+  const coachLeadCards = [coachGuard, ...(coachGuard?.alternatives || [])];
+  assert(coachLeadCards.every((item) => !isLowSingleLead(item, level)),
+    '教练主推荐与备选统一经过报单安全过滤，不展示被排除的低单');
+
+  const ratedGuard = evaluatePlay({
+    action: 'play',
+    cards: [hand[4]],
+    handBefore: hand,
+    level,
+    seat: 0,
+    teams: TEAMS,
+    handCounts: [hand.length, 1, 12, 1],
+    finishOrder: [],
+    policyFeatures: experimental.policyFeatures,
+  });
+  assert(ratedGuard.mistakeTags.includes('enemy_report_lead_guard')
+      && ratedGuard.betterAlternative?.hand?.type === 'pair'
+      && ratedGuard.betterAlternative.cards.every((card) => card.rank !== 7),
+  '真人评价与AI共享报单防守标签，并推荐安全对子而非低单');
 }
 
 console.log('中盘不盲目反炸');
@@ -2536,14 +2898,23 @@ console.log('P0-P5 独立消融开关');
   const noControlV2 = resolvePolicyVariant('no-control-v2');
   const riskOnly = resolvePolicyVariant('only-control-risk');
   const coverOnly = resolvePolicyVariant('only-partner-cover');
+  const reservedHighControl = resolvePolicyVariant('with-reserved-high-control-lead');
   assert(full.policyProfile === 'expert' && full.policyFeatures.p0
       && full.policyFeatures.p1 && full.policyFeatures.p1ResponseSearch
       && full.policyFeatures.p2 && full.policyFeatures.p3
       && full.policyFeatures.p4 && full.policyFeatures.p5 && full.policyFeatures.endgame
       && full.policyFeatures.controlV2 && !full.policyFeatures.controlRiskV2
       && full.policyFeatures.cheapControl && !full.policyFeatures.partnerCover
-      && full.policyFeatures.placementControl && full.policyFeatures.publicLockLead,
-    '正式 expert 显式启用 P0-P5，旧控权V2概率实验仍保持关闭');
+      && full.policyFeatures.placementControl && full.policyFeatures.publicLockLead
+      && !full.policyFeatures.reserveHighControlLead,
+    '正式 expert 显式启用 P0-P5，STRAT-2 候选和旧控权V2概率实验仍保持关闭');
+  assert(reservedHighControl.policyProfile === 'expert'
+      && reservedHighControl.policyFeatures.reserveHighControlLead
+      && reservedHighControl.policyFeatures.p0
+      && reservedHighControl.policyFeatures.p1
+      && JSON.stringify(reservedHighControl.policyFeatures)
+        !== JSON.stringify(full.policyFeatures),
+    'STRAT-2 通过独立变体开启，且不改变其它 expert 特征');
   assert(p2On.policyProfile === 'expert' && p2On.policyFeatures.p0
       && p2On.policyFeatures.p1 && p2On.policyFeatures.p2 && p2On.policyFeatures.endgame,
     'p2-on 旧命令继续映射到含新版 P2 的正式策略');
@@ -3817,6 +4188,77 @@ console.log('8月25日真实复盘：跨牌型大量减牌后的控圈截断实�
       && blocked.hand.mainRank === 13
       && blocked.reason.includes('减牌'),
     '对手用钢板加单张连续减掉7张后，实验臂拆最小K对截断，不再继续整手过牌或交大王');
+}
+
+console.log('STRAT-4：队友当前圈赢家的接风硬优先级');
+{
+  const level = 2;
+  const hand = [C(7, 'S'), C(8, 'S'), C(9, 'S'), C(10, 'S')];
+  const partnerPlay = [C(5, 'C')];
+  const publicHistory = [
+    {
+      turn: 37, trickNumber: 10, seat: 2, action: 'play', cards: partnerPlay,
+      hand: parseHand(partnerPlay, level), countsBefore: [4, 0, 4, 8], countsAfter: [4, 0, 4, 7],
+    },
+    {
+      turn: 38, trickNumber: 10, seat: 3, action: 'pass', cards: [],
+      countsBefore: [4, 0, 4, 7], countsAfter: [4, 0, 4, 7],
+    },
+  ];
+  const yielded = context(hand, {
+    level, lastHand: parseHand(partnerPlay, level), lastSeat: 2,
+    handCounts: [hand.length, 0, 4, 7], finishOrder: [1], publicHistory,
+    difficulty: 'master', deterministic: true, policyProfile: 'expert',
+    policyFeatures: resolvePolicyVariant('with-partner-trick-control').policyFeatures,
+  });
+  const signal = assessPartnerTrickControl(yielded);
+  assert(signal.shouldYield && signal.partnerFinished === false
+      && signal.activeEnemySeats.length === 1 && signal.passedEnemySeats.length === 1,
+  '显式识别对家仍赢本圈、一个对手已出完且另一个对手已过牌');
+  const recommendation = recommendPlay(yielded);
+  assert(recommendation?.action === 'pass'
+      && recommendation.tacticalConstraint === 'partner_trick_control',
+  '所有活跃对手均已过/出完时优先接风，不进入P3或普通接牌分支');
+  const rating = evaluatePlay({
+    action: 'pass', cards: [], handBefore: hand, level,
+    lastHand: yielded.lastHand, lastSeat: 2, seat: 0, teams: TEAMS,
+    handCounts: yielded.handCounts, finishOrder: [1], publicHistory,
+    policyFeatures: yielded.policyFeatures,
+  });
+  assert(rating.score >= 90 && rating.breakdown.some((item) => item.tag === 'partner_trick_control'),
+  '教练评价与AI共享接风优先级，并写入唯一接风标签');
+  const consultation = getAIConsultation({ ...yielded, decisionEngine: 'pimc-v1' });
+  assert(consultation.cloudConstraint === 'partner_trick_control'
+      && consultation.candidates.length === 1
+      && consultation.candidates[0].action === 'pass',
+  '混合咨询继承接风硬约束，不把本地过牌重新交给搜索改写');
+
+  const stillCanRespond = recommendPlay({
+    ...yielded,
+    handCounts: [hand.length, 9, 4, 7], finishOrder: [],
+  });
+  assert(stillCanRespond?.tacticalConstraint !== 'partner_trick_control',
+  '仍有未行动的活跃对手时不把尚未过牌误判为接风条件');
+
+  const partnerFinished = recommendPlay({
+    ...yielded,
+    handCounts: [hand.length, 0, 0, 0], finishOrder: [2, 1, 3],
+  });
+  assert(partnerFinished?.action === 'pass'
+      && partnerFinished.tacticalConstraint === 'partner_trick_control',
+  'partnerFinished=true 仍显式走接风门，不静默落入普通接对手路径');
+
+  const finishHand = [C(7, 'S')];
+  const finish = recommendPlay({
+    ...yielded,
+    hand: finishHand, handCounts: [1, 0, 4, 7], finishOrder: [1],
+  });
+  assert(finish?.action === 'play' && finish.cards.length === finishHand.length,
+  '整手出完作为明确例外覆盖接风让牌');
+
+  const formal = recommendPlay({ ...yielded, policyFeatures: resolvePolicyFeatures('expert') });
+  assert(formal?.tacticalConstraint !== 'partner_trick_control',
+  'STRAT-4 候选开关关闭时保持正式 expert 对照行为');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

@@ -1,6 +1,8 @@
 /** 混合决策、公平观察、信息集采样与价值模型契约测试。 */
 import { createDeck } from './cards.js';
-import { handSignature, parseHand, parseHandVariants } from './rules.js';
+import {
+  HandType, generateLegalPlays, handSignature, parseHand, parseHandVariants,
+} from './rules.js';
 import {
   auditPublicAIObservation, createPublicAIObservation,
   FORBIDDEN_AI_OBSERVATION_FIELDS,
@@ -9,7 +11,7 @@ import {
   HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA,
   HYBRID_SEARCH_MODES,
   availabilityAwareUctBonus,
-  chooseHybridFromConsultation, configureHybridValueModel,
+  chooseHybridFromConsultation, chooseRolloutPlay, configureHybridValueModel,
   evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
   samplePublicInformationSets, validateHybridValueModel,
@@ -210,6 +212,9 @@ console.log('关键残局混合重排与安全回退');
   assert(result.decision.hybrid.searchAttempted === true
     && result.decision.hybrid.searchTriggered === true,
   '实际执行的信息集搜索必须写入显式搜索状态');
+  assert(result.decision.hybrid.rolloutDiagnostics
+      && typeof result.decision.hybrid.rolloutDiagnostics === 'object',
+  'PIMC 最终混合遥测保留 rollout 诊断对象');
 
   const hard = chooseHybridFromConsultation(observation, {
     ...consultation,
@@ -290,6 +295,8 @@ console.log('成对根 PIMC 公平根动作覆盖');
     )), '每个候选都在相同的三个假想世界完成基础覆盖');
   assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults),
     '成对根 PIMC 结果不受调用方误传暗牌字段影响，且固定种子可复现');
+  assert(first.rolloutDiagnostics && typeof first.rolloutDiagnostics === 'object',
+    '成对根 PIMC 结果保留 rollout 诊断对象');
   const legacyAlias = evaluateInformationSetCandidates(context, candidates, {
     ...options, searchMode: 'ismcts-root-v1',
   });
@@ -373,8 +380,82 @@ console.log('ISMCTS v2 开放环信息集树');
   assert(first.candidateResults.every((item) => (
     item.availability === 12 && item.visits >= 3 && item.completedSamples === item.visits
   )), 'UCT 根候选记录可用次数、真实访问数与 rollout 结果，不伪造覆盖');
+  assert(first.rolloutDiagnostics && typeof first.rolloutDiagnostics === 'object'
+      && !(first.sampleFailures?.rollout_action_invalid),
+  'ISMCTS 搜索结果保留 rollout 诊断载荷且首出不会伪造非法过牌失败');
   assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults),
     'ISMCTS v2 固定公开输入和种子时可复现，误传暗牌字段不影响结果');
+}
+
+console.log('rollout 首出不变量与异常回退');
+{
+  const deck = createDeck();
+  const hand = [
+    ...deck.filter((card) => card.rank === 9).slice(0, 5),
+    ...deck.filter((card) => card.rank === 10).slice(0, 4),
+  ];
+  const state = {
+    hands: [hand, [], [], []],
+    level: 7,
+    lastHand: null,
+    lastSeat: null,
+    teams: [0, 1, 0, 1],
+  };
+  const legal = generateLegalPlays(hand, state.level, null);
+  const normal = chooseRolloutPlay(state, 0, legal);
+  assert(normal?.cards?.length > 0 && normal.hand?.type !== 'pass',
+    '首出非空手牌始终返回合法出牌，不把 null 当作 pass');
+
+  // 模拟未来牌型生成器异常地只给出炸弹候选，验证保护路径而不是依赖
+  // 当前“单张总会生成”的实现细节。
+  const bombOnly = legal.filter((play) => play.hand?.type === HandType.BOMB);
+  const fallback = chooseRolloutPlay(state, 0, bombOnly);
+  const reversedFallback = chooseRolloutPlay(state, 0, [...bombOnly].reverse());
+  const cardSignature = (cards) => cards.map(physicalKey).sort().join(',');
+  assert(bombOnly.length > 0 && fallback?.cards?.length > 0
+      && bombOnly.some((play) => handSignature(play.hand) === handSignature(fallback.hand))
+      && fallback.cards.every((card) => hand.includes(card))
+      && fallback.cards.length === 4
+      && fallback.rolloutDiagnostic === 'lead_no_ordinary_fallback',
+  '首出无普通候选时选择最小结构成本的合法炸弹并留下显式诊断');
+  assert(reversedFallback?.rolloutDiagnostic === fallback.rolloutDiagnostic
+      && handSignature(reversedFallback.hand) === handSignature(fallback.hand)
+      && cardSignature(reversedFallback.cards) === cardSignature(fallback.cards),
+  '首出异常回退在候选乱序下仍保持确定性');
+
+  const finishingState = {
+    ...state,
+    hands: [fallback.cards, [], [], []],
+  };
+  const finishing = chooseRolloutPlay(finishingState, 0, [{ ...fallback,
+    rolloutDiagnostic: undefined,
+  }]);
+  assert(finishing?.cards?.length === finishingState.hands[0].length
+      && !finishing.rolloutDiagnostic,
+  '整手合法炸弹收官走正常 finishing 路径，不误记为异常回退');
+
+  const responseState = {
+    ...state,
+    hands: [hand.slice(0, 8), new Array(9).fill(null), [], []],
+    lastHand: parseHand([deck.find((card) => card.rank === 8)], state.level),
+    lastSeat: 1,
+  };
+  const responseCandidates = [
+    bombOnly.find((play) => play.cards.length === 5),
+    bombOnly.find((play) => play.cards.length === 4),
+  ].filter(Boolean);
+  const response = chooseRolloutPlay(responseState, 0, responseCandidates);
+  assert(response?.cards?.length === 4 && !response.rolloutDiagnostic,
+    '跟牌仍按原有结构成本/点力顺序选择，不受首出回退重构影响');
+
+  const shortHand = hand.slice(0, 7);
+  const shortState = { ...state, hands: [shortHand, [], [], []] };
+  const shortBombs = generateLegalPlays(shortHand, state.level, null)
+    .filter((play) => play.hand?.type === HandType.BOMB);
+  const shortFallback = chooseRolloutPlay(shortState, 0, shortBombs);
+  assert(shortFallback?.cards?.length > 0
+      && shortFallback.rolloutDiagnostic === 'lead_no_ordinary_fallback',
+  '7张首出即使只有炸弹候选也不走紧急跟牌分支，仍记录首出回退');
 }
 
 console.log('ISMCTS v3 根候选成对采样');
@@ -417,6 +498,8 @@ console.log('ISMCTS v3 根候选成对采样');
   )), 'v3 根候选严格成对：visits 与 availability 恒等于成功 sweep 数');
   assert(first.requiredPairedSweeps === 3 && first.pairedWorlds === 0,
     'v3 证据门槛按成对 sweep 数判定，不复用成对 PIMC 的世界口径');
+  assert(first.rolloutDiagnostics && typeof first.rolloutDiagnostics === 'object',
+    'ISMCTS v3 结果保留 rollout 诊断对象');
   assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults)
     && first.pairedSweeps === second.pairedSweeps,
   'ISMCTS v3 固定公开输入和种子时可复现，误传暗牌字段不影响结果');

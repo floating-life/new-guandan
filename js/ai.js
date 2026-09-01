@@ -15,6 +15,7 @@ import {
   countPotentialBombs, createStrategicMemo, downstreamEnemyNeedsBlock,
   evaluateStrategicPlay, selectEmergencyBlock, assessTeamFinishDelay,
   RESPONSE_DAMAGE_WEIGHT, selectPressureOrdinaryResponse, strategicResponseDamage,
+  shouldReserveHighControlLead, filterEnemyReportLeadCandidates, assessPartnerTrickControl,
 } from './strategy-core.js';
 import {
   estimateThreeStepRoute, inferPublicThreats, createBeatModel,
@@ -49,7 +50,9 @@ const CONTROL_V2_FEATURE_KEYS = Object.freeze([
 const POLICY_FEATURE_KEYS = [
   'p0', 'p1', 'p1ResponseSearch', 'p2', 'p3', 'p4', 'p5',
   'endgame', 'controlV2', 'teamFinishDelay', 'emergencyOrdinaryBlock',
-  'softOrdinaryPressure', 'highShedRunBlock',
+  'softOrdinaryPressure', 'highShedRunBlock', 'reserveHighControlLead',
+  'partnerTrickControl',
+  'enemyReportLeadSafety',
   ...CONTROL_V2_FEATURE_KEYS,
 ];
 const EXPERT_POLICY_FEATURES = Object.freeze({
@@ -82,6 +85,13 @@ const EXPERT_POLICY_FEATURES = Object.freeze({
   // 真实复盘实验：对手跨牌型连续控圈且短时间大量减牌时，允许用最低损伤
   // 普通牌截断。先保留为独立实验臂，镜像赛通过后再发布到大师默认策略。
   highShedRunBlock: false,
+  // STRAT-2：长手保留 A/级牌三张或三带二。必须先经过独立消融与镜像门。
+  reserveHighControlLead: false,
+  // STRAT-4：队友仍持有本圈牌权且对手均已让牌时，优先接风；先过代码门，
+  // 通过独立变体和镜像门后再讨论是否进入正式策略。
+  partnerTrickControl: false,
+  // STRAT-3：任一对手报单时，仅在存在安全替代路线时阻断低单领出。
+  enemyReportLeadSafety: false,
 });
 const EXPERIMENTAL_P2_POLICY_FEATURES = Object.freeze({
   ...EXPERT_POLICY_FEATURES,
@@ -106,6 +116,9 @@ const BASELINE_POLICY_FEATURES = Object.freeze({
   emergencyOrdinaryBlock: false,
   softOrdinaryPressure: false,
   highShedRunBlock: false,
+  reserveHighControlLead: false,
+  partnerTrickControl: false,
+  enemyReportLeadSafety: false,
 });
 
 function withControlV2Features(features, enabled) {
@@ -338,6 +351,21 @@ export const AI_POLICY_VARIANTS = Object.freeze({
   'with-high-shed-run-block': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, highShedRunBlock: true }),
+  }),
+  // STRAT-2 候选：只打开共享的长手高控制保留门，不改变正式 expert 默认。
+  'with-reserved-high-control-lead': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, reserveHighControlLead: true }),
+  }),
+  // STRAT-3 候选：只打开任一对手报单的安全领牌约束，不改变正式 expert 默认。
+  'with-enemy-report-lead-safety': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, enemyReportLeadSafety: true }),
+  }),
+  // STRAT-4 候选：队友当前圈赢家的接风硬优先级，正式 expert 默认关闭。
+  'with-partner-trick-control': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, partnerTrickControl: true }),
   }),
   // 实验性锐化变体：仅在 head-to-head A/B 中使用，不改默认 expert 行为。
   // 默认 expert 的 P0/P1 阈值是 p0LeadGate=0.8 / p0StopGate=0.8 /
@@ -821,7 +849,11 @@ function chooseAIPlayInternal(ctx, options) {
 
   const respond = (decision, ranked = [], reason = '', candidate = null) => {
     if (!options.explain || !decision) return decision;
-    return explainDecision(decision, ranked, reason, candidate, decisionCtx);
+    const explanationRanked = !decisionCtx.lastHand
+      && policyFeatureActive(decisionCtx, 'enemyReportLeadSafety')
+      ? filterEnemyReportLeadCandidates(ranked, decisionCtx).entries
+      : ranked;
+    return explainDecision(decision, explanationRanked, reason, candidate, decisionCtx);
   };
 
   if (plays.length === 0) {
@@ -832,18 +864,21 @@ function chooseAIPlayInternal(ctx, options) {
 
   if (!lastHand) {
     const ranked = rankPlays(plays, 'lead', hand, level, decisionCtx, c, search);
-    const finish = ranked.filter((play) => play.cards.length === hand.length);
-    const resourceSafe = ranked.filter((play) => (
+    const guarded = policyFeatureActive(decisionCtx, 'enemyReportLeadSafety')
+      ? filterEnemyReportLeadCandidates(ranked, decisionCtx).entries
+      : ranked;
+    const finish = guarded.filter((play) => play.cards.length === hand.length);
+    const resourceSafe = guarded.filter((play) => (
       !isBombType(play.hand)
       && !isPremiumNonBombControl(play.hand, level)
       && !play.strategy?.tags?.includes('preserve_wild')
     ));
     const leadPool = c.difficulty !== 'easy' && resourceSafe.length
       ? resourceSafe
-      : ranked;
+      : guarded;
     const best = finish.length && c.finishFirst ? finish[0] : pickByDifficulty(leadPool, c);
     const decision = { action: 'play', cards: best.cards, hand: best.hand };
-    return respond(decision, ranked, reasonForCandidate(best, 'lead', decisionCtx), best);
+    return respond(decision, guarded, reasonForCandidate(best, 'lead', decisionCtx), best);
   }
 
   const myTeam = teams[seat];
@@ -851,6 +886,7 @@ function chooseAIPlayInternal(ctx, options) {
   const isTeammate = lastTeam === myTeam && lastSeat !== seat;
   const partnerSeat = (seat + 2) % 4;
   const partnerFinished = finishOrder.includes(partnerSeat);
+  const partnerTrickControl = assessPartnerTrickControl(decisionCtx);
 
   // 一手出完通常优先；但整手强控制在团队名次仍未确定时可以延迟一次，
   // 避免“个人先走”硬门越过对家争头游/双上的判断。
@@ -874,6 +910,35 @@ function chooseAIPlayInternal(ctx, options) {
         ? '可以一手出完，争取名次优先于让牌'
         : '可以一手出完，直接锁定更好名次',
       best,
+    );
+  }
+
+  // STRAT-4：确认对家仍是本圈赢家且所有活跃对手都已过牌/出完后，先让牌
+  // 接风。整手出完已经在上面的硬优先级中返回；名次目标型炸弹则必须由
+  // 共享策略显式标记，不能因为 partnerFinished 静默落入普通接对手路径。
+  if (partnerTrickControl.shouldYield) {
+    const ranked = rankPlays(plays, 'beat', hand, level, decisionCtx, c, search);
+    const placementException = ranked.find((play) => (
+      play.strategy?.tags?.includes('double_up_block')
+      || play.strategy?.tags?.includes('avoid_double_down')
+    ));
+    if (placementException) {
+      return respond(
+        { action: 'play', cards: placementException.cards, hand: placementException.hand,
+          tacticalConstraint: 'partner_trick_control_exception' },
+        ranked,
+        placementException.strategy.reasons?.find((reason) => (
+          reason.includes('双上') || reason.includes('双下')
+        )) || '名次目标证明当前需要夺权，覆盖接风让牌',
+        placementException,
+      );
+    }
+    return respond(
+      { action: 'pass', tacticalConstraint: 'partner_trick_control' },
+      [],
+      partnerTrickControl.partnerFinished
+        ? '对家已出完且仍持有本圈牌权，活跃对手均已让牌，先过牌接风'
+        : '对家仍持有本圈牌权，活跃对手均已让牌，先过牌接风',
     );
   }
 
@@ -1699,9 +1764,10 @@ function shouldBomb(
 function rankPlays(plays, mode, hand, level, ctx, c, search) {
   const beforeStructure = structureBonus(hand, level, search);
   const scored = plays.map((play) => {
+    const scoringCtx = { ...ctx, legalPlays: plays };
     const score = mode === 'lead'
-      ? scoreLead(play, hand, level, ctx, c, search, beforeStructure)
-      : scoreBeat(play, hand, level, ctx, c, search, beforeStructure);
+      ? scoreLead(play, hand, level, scoringCtx, c, search, beforeStructure)
+      : scoreBeat(play, hand, level, scoringCtx, c, search, beforeStructure);
     const opponentModel = c.difficulty === 'master'
       ? opponentPlayAdjustment(ctx.opponentModel, ctx, { ...play, action: 'play' })
       : null;
@@ -1730,13 +1796,21 @@ function scoreLead(play, hand, level, ctx, c, search, beforeStructure) {
   const h = play.hand;
   const remain = hand.length - play.cards.length;
   const strategyScore = tacticalAdjustment(play, 'lead', ctx, hand, level);
+  const reservedHighControlLead = shouldReserveHighControlLead(play, {
+    ...ctx,
+    hand,
+    level,
+    mode: 'lead',
+  });
 
   if (remain === 0) score += 1000;
   if (isBombType(h) && !play.strategy?.createsTwoStepFinish) score -= c.bombLeadPenalty;
 
   score -= playResourcePower(h) * (0.4 + c.aggressiveness * 0.2);
   // 领单张/对子/三张时，高点牌主要用于后续控制；有牌未出完时应明显惜大打小。
-  if (remain > 0 && [HandType.SINGLE, HandType.PAIR, HandType.TRIPLE].includes(h.type)) {
+  // 三带二原先不走这条，满手会把三个 A / 级牌当“一次走五张”先甩出去。
+  if (remain > 0 && !reservedHighControlLead
+    && [HandType.SINGLE, HandType.PAIR, HandType.TRIPLE].includes(h.type)) {
     score -= h.power * c.simpleLeadPowerPenalty;
   }
   score += play.cards.length * 3;
@@ -2625,6 +2699,8 @@ export function getAIConsultation(ctx, options = {}) {
 
   if (consultation.tacticalConstraint === 'team_finish_delay') {
     cloudConstraint = 'team_finish_delay';
+  } else if (consultation.tacticalConstraint === 'partner_trick_control') {
+    cloudConstraint = 'partner_trick_control';
   } else if (finishesNow) cloudConstraint = 'finish_now';
   else if (teammateLead && !emergencyPartnerBlock && consultation.action === 'pass') {
     cloudConstraint = 'yield_to_partner';

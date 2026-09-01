@@ -222,10 +222,190 @@ export function selectPressureOrdinaryResponse(entries, ctx) {
 
 function activeEnemies(ctx) {
   const finished = ctx.finishOrder || [];
-  return (ctx.handCounts || []).map((count, seat) => ({ seat, count }))
+  return (ctx.handCounts || []).map((count, seat) => ({ seat, count: Number(count) }))
     .filter((item) => item.seat !== ctx.seat
+      && Number.isFinite(item.count) && item.count > 0
       && !finished.includes(item.seat)
       && ctx.teams?.[item.seat] !== ctx.teams?.[ctx.seat]);
+}
+
+function passesAfterLatestPlay(ctx) {
+  const explicit = Array.isArray(ctx?.passedSeats)
+    ? ctx.passedSeats.map((seat) => Number(seat)).filter(Number.isInteger)
+    : [];
+  const passed = new Set(explicit);
+  const history = Array.isArray(ctx?.publicHistory) ? ctx.publicHistory : [];
+  let latestPlayIndex = -1;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if (history[index]?.action === 'play') {
+      latestPlayIndex = index;
+      break;
+    }
+  }
+  if (latestPlayIndex < 0) return passed;
+  const latestTrick = Number(history[latestPlayIndex]?.trickNumber);
+  for (let index = latestPlayIndex + 1; index < history.length; index += 1) {
+    const item = history[index];
+    if (item?.action !== 'pass') continue;
+    const trick = Number(item.trickNumber);
+    if ((Number.isFinite(latestTrick) && latestTrick > 0 && trick === latestTrick)
+      || (!Number.isFinite(latestTrick) || latestTrick <= 0)) {
+      const seat = Number(item.seat);
+      if (Number.isInteger(seat)) passed.add(seat);
+    }
+  }
+  return passed;
+}
+
+/**
+ * STRAT-4 的唯一队友牌权门：当前玩家面对仍由对家持有的本圈牌权时，只有
+ * 活跃对手全部已经公开过牌（或已出完），才确认“接风/过牌”优先。仅凭
+ * lastSeat 或 partnerFinished 不足以触发，避免把尚未行动的对手误判为已让牌。
+ */
+export function assessPartnerTrickControl(ctx = {}) {
+  const enabled = ctx?.policyFeatures?.partnerTrickControl === true;
+  const seat = Number(ctx.seat);
+  const partner = (seat + 2) % 4;
+  const teams = ctx.teams || [0, 1, 0, 1];
+  const partnerIsWinner = ctx.lastHand
+    && Number.isInteger(seat)
+    && ctx.lastSeat === partner
+    && teams[partner] === teams[seat];
+  const countsKnown = Array.isArray(ctx.handCounts) && ctx.handCounts.length >= 4;
+  if (!enabled || !partnerIsWinner || !countsKnown) {
+    return {
+      shouldYield: false,
+      enabled,
+      partner,
+      activeEnemySeats: [],
+      passedEnemySeats: [],
+      reason: null,
+    };
+  }
+  const active = activeEnemies(ctx);
+  const passed = passesAfterLatestPlay(ctx);
+  const activeEnemySeats = active.map((enemy) => enemy.seat);
+  const passedEnemySeats = active.filter((enemy) => passed.has(enemy.seat)).map((enemy) => enemy.seat);
+  const allActiveEnemiesYielded = active.every((enemy) => passed.has(enemy.seat));
+  return {
+    shouldYield: allActiveEnemiesYielded,
+    partner,
+    partnerFinished: (ctx.finishOrder || []).includes(partner),
+    activeEnemySeats,
+    passedEnemySeats,
+    allActiveEnemiesYielded,
+    reason: allActiveEnemiesYielded ? 'partner_trick_control' : null,
+  };
+}
+
+const ENEMY_REPORT_COUNT = 1;
+const LOW_SINGLE_LEAD_MAX_RANK = 11;
+const LEAD_STRUCTURE_RISK_TAGS = new Set([
+  'split_bomb', 'split_flush_straight', 'split_straight', 'split_group', 'split_pair',
+]);
+
+/** 只把 J 及以下、且不是本局级牌的单张视作“低单”。 */
+export function isLowSingleLead(play, level = null) {
+  return play?.hand?.type === HandType.SINGLE
+    && (!Number.isFinite(Number(level)) || Number(play.hand.mainRank) !== Number(level))
+    && Number(play.hand.mainRank) <= LOW_SINGLE_LEAD_MAX_RANK;
+}
+
+function candidateTags(entry) {
+  return entry?.strategy?.tags || entry?.play?.strategy?.tags || entry?.tags || [];
+}
+
+function hasCandidateTag(entry, tag) {
+  return candidateTags(entry).includes(tag);
+}
+
+function candidatePlay(entry) {
+  const play = entry?.play || entry;
+  const strategy = entry?.strategy || play?.strategy;
+  if (!play || !strategy || play.strategy === strategy) return play;
+  return { ...play, strategy };
+}
+
+function isSaferEnemyReportLead(entry, ctx) {
+  const play = candidatePlay(entry);
+  if (!play?.hand) return false;
+  if (play.cards?.length === (ctx.hand || ctx.handBefore || []).length) return true;
+  if (hasCandidateTag(entry, 'public_lock_lead')
+    || hasCandidateTag(entry, 'two_step_finish')) return true;
+  if (isStrategicBomb(play.hand) || play.cards?.length < 2) return false;
+  if (play.hand.type === HandType.SINGLE) return false;
+  if (play.cards?.some((card) => isWild(card, ctx.level) || isJoker(card))) return false;
+  if (candidateTags(entry).some((tag) => LEAD_STRUCTURE_RISK_TAGS.has(tag))) return false;
+  return true;
+}
+
+function isEnemyReportLeadExempt(entry, ctx) {
+  const play = candidatePlay(entry);
+  const hand = ctx.hand || ctx.handBefore || [];
+  if (!play?.hand) return false;
+  if (play.cards?.length === hand.length) return true;
+  if (hasCandidateTag(entry, 'public_lock_lead')
+    || hasCandidateTag(entry, 'two_step_finish')) return true;
+  const remaining = removeCards(hand, play.cards || []);
+  return remaining.length > 0 && !!wholeHandPlay(remaining, ctx.level);
+}
+
+/**
+ * STRAT-3 的公开信息信号：任一未出完的敌方玩家只剩一张时，低单领出
+ * 可能直接把牌权送回该玩家。只有完整合法候选中存在不拆高资源的非单/公开
+ * 锁牌路线时才阻断；没有替代动作时保留原行为，避免演变成“永不出小单”。
+ */
+export function assessEnemyReportLead(play, ctx = {}, candidates = []) {
+  const enabled = ctx?.policyFeatures?.enemyReportLeadSafety === true
+    && (!ctx.mode || ctx.mode === 'lead');
+  const hand = ctx.hand || ctx.handBefore || [];
+  const active = activeEnemies(ctx);
+  const reportingSeats = enabled
+    ? active.filter((enemy) => Number(enemy.count) === ENEMY_REPORT_COUNT).map((enemy) => enemy.seat)
+    : [];
+  const lowSingle = isLowSingleLead(play, ctx.level);
+  const saferAlternatives = enabled
+    ? candidates.filter((candidate) => isSaferEnemyReportLead(candidate, ctx))
+    : [];
+  const lockRoute = isEnemyReportLeadExempt(play, { ...ctx, hand });
+  const blocked = reportingSeats.length > 0
+    && lowSingle
+    && !lockRoute
+    && saferAlternatives.length > 0;
+  return {
+    enabled,
+    reportingSeats,
+    lowSingle,
+    saferAlternativeCount: saferAlternatives.length,
+    blocked,
+    reason: blocked ? 'enemy_report_lead_guard' : null,
+  };
+}
+
+/**
+ * AI 选牌入口与其它消费者共享同一候选过滤器。entries 可为 play，也可为
+ * 包含 play 的评价项；返回原对象引用，确保不会丢失排序、解释和遥测字段。
+ */
+export function filterEnemyReportLeadCandidates(entries, ctx = {}) {
+  if (!Array.isArray(entries)) return { entries: [], safety: assessEnemyReportLead(null, ctx) };
+  const candidates = entries.map((entry) => candidatePlay(entry)).filter(Boolean);
+  const safetyCtx = {
+    ...ctx,
+    hand: ctx.hand || ctx.handBefore,
+  };
+  const safety = candidates
+    .map((candidate) => assessEnemyReportLead(candidate, safetyCtx, candidates))
+    .find((signal) => signal.blocked)
+    || assessEnemyReportLead(candidates[0] || null, safetyCtx, candidates);
+  if (!safety.blocked) return { entries, safety };
+  const filtered = entries.filter((entry) => {
+    const play = entry?.play || entry;
+    return !isLowSingleLead(play, ctx.level) || isEnemyReportLeadExempt(entry, ctx);
+  });
+  return {
+    entries: filtered.length ? filtered : entries,
+    safety,
+  };
 }
 
 /**
@@ -677,6 +857,42 @@ function isPremiumSimpleControl(hand, level) {
     && (hand.mainRank >= 16 || hand.mainRank === level);
 }
 
+// 单一可校准门槛：按出牌后的剩余张数定义“长手”，AI 与教练评价共用。
+export const RESERVED_CONTROL_LONG_HAND_REMAINING = 8;
+
+function isReservedControlRank(rank, level) {
+  return rank === level || rank === 14 || rank >= 16;
+}
+
+/** 三张 A / 级牌，或三带二把 A、级牌当主张/带对。炸弹与顺子不算。 */
+export function consumesReservedControl(play, level) {
+  const hand = play?.hand;
+  if (!hand || isStrategicBomb(hand)) return false;
+  if ([HandType.TRIPLE, HandType.FULLHOUSE].includes(hand.type)
+    && isReservedControlRank(hand.mainRank, level)) {
+    return true;
+  }
+  return hand.type === HandType.FULLHOUSE
+    && isReservedControlRank(hand.meta?.pairRank, level);
+}
+
+/**
+ * STRAT-2 的独立门控。默认不启用；显式实验臂才会对长手先交 A/级牌
+ * 三张或三带二施加共享策略惩罚。两手收官路线始终豁免。
+ */
+export function shouldReserveHighControlLead(play, ctx = {}) {
+  if (ctx?.policyFeatures?.reserveHighControlLead !== true) return false;
+  const handBefore = ctx.hand || ctx.handBefore || [];
+  const level = ctx.level;
+  if (ctx.mode !== 'lead' || !play?.cards?.length || !handBefore.length) return false;
+  const remaining = ctx.remaining || removeCards(handBefore, play.cards);
+  const createsTwoStepFinish = ctx.createsTwoStepFinish
+    ?? (remaining.length > 0 && !!wholeHandPlay(remaining, level));
+  return remaining.length > RESERVED_CONTROL_LONG_HAND_REMAINING
+    && !createsTwoStepFinish
+    && consumesReservedControl(play, level);
+}
+
 function sameCardFace(left, right) {
   return !!left && !!right && left.rank === right.rank && left.suit === right.suit;
 }
@@ -762,6 +978,22 @@ export function evaluateStrategicPlay(play, ctx) {
   }
   result.followUpFinish = wholeHandPlay(result.remaining, level);
   result.createsTwoStepFinish = result.remaining.length > 0 && !!result.followUpFinish;
+  // 满手/中盘先甩三个 A 或三个级牌（含三带二）会把小单留到尾牌。
+  // 两手收官或剩余已短时仍允许用它们降低手数。
+  const reservedLongLead = shouldReserveHighControlLead(play, {
+    ...ctx,
+    mode,
+    hand: handBefore,
+    level,
+    remaining: result.remaining,
+    createsTwoStepFinish: result.createsTwoStepFinish,
+  });
+  const enemyReportLead = assessEnemyReportLead(play, {
+    ...ctx,
+    mode,
+    hand: handBefore,
+    level,
+  }, ctx.legalPlays || []);
 
   const bombsBefore = memoValue(
     ctx, handBefore, level, 'bombsBefore', () => countPotentialBombs(handBefore, level),
@@ -782,7 +1014,8 @@ export function evaluateStrategicPlay(play, ctx) {
   const productiveRestructure = lostPotentialBombs > 0
     && compositeReorganization
     && completedFlushStraightCount(result.remaining, level) > 0
-    && looseAfter <= looseBefore + 1;
+    && looseAfter <= looseBefore + 1
+    && !reservedLongLead;
   result.productiveRestructure = productiveRestructure;
 
   // 同一点数的实体牌并不总是等价：例如出一对 7 时，选错花色可能把已经
@@ -819,7 +1052,8 @@ export function evaluateStrategicPlay(play, ctx) {
     && play.cards.length >= 5
     && !isStrategicBomb(play.hand)
     && !result.createsTwoStepFinish
-    && !productiveRestructure) {
+    && !productiveRestructure
+    && !reservedLongLead) {
     addExpertScore(
       result,
       ctx,
@@ -828,6 +1062,30 @@ export function evaluateStrategicPlay(play, ctx) {
       8,
       'flush_preserving_combo',
       `一次走掉${play.cards.length}张，同时保留成品同花顺作为后续强控制`,
+    );
+  }
+
+  if (reservedLongLead) {
+    addExpertScore(
+      result,
+      ctx,
+      -160,
+      'resources',
+      -12,
+      'premature_high_control',
+      `手牌尚长时不宜先交${formatHand(play.hand)}，应先清理小牌并把 A / 级牌留作中盘控制`,
+    );
+  }
+
+  if (enemyReportLead.blocked) {
+    addExpertScore(
+      result,
+      ctx,
+      -220,
+      'defense',
+      -14,
+      'enemy_report_lead_guard',
+      `对手${enemyReportLead.reportingSeats.map((seat) => `座位${seat}`).join('、')}已报单；存在更安全的非单或公开锁牌路线，不宜领出${formatHand(play.hand)}`,
     );
   }
 
