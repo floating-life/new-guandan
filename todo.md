@@ -2,7 +2,7 @@
 
 > 更新：2026-09-01
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 的本地冻结验证已通过，待该最终提交的远端 CI。**
+> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 的冻结提交已完成本地验证与[远端 CI](https://github.com/floating-life/new-guandan/actions/runs/33470270032)。**
 
 ## 当前停止线
 
@@ -10,7 +10,7 @@
 - [x] 不用前 60 区组、10 区组探针或总体正 CI 绕过完整性能失败。
 - [x] expert 继续作为网页默认；`ismcts-v3` 仅保留为离线候选。
 - [x] 暂不启动正式 DMC/DanZero 训练，不把 `trainingEligible=false` 的外部轨迹并入训练。
-- [ ] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子。
+- [x] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子；EVID-9b 已在冻结提交上经远端 CI 闭环。
 - [x] SEC-1～3 已完成：不在聊天、日志或文档中展示抽取到的令牌值；EVID-9b 仅提交已验证候选快照。
 
 ## P0-A：浏览器导出安全处置与产品诚实性
@@ -20,7 +20,7 @@
 - [x] **SEC-3：最小化浏览器抽取器。** `read_browser_replays.py` 现要求显式 `--profile-dir`、`--origin` 与输出目录，只接受 `http://localhost` / `http://127.0.0.1` 的精确 origin 加固定 `guandan_replays_v1` 键；LevelDB log 只解析 put 项，不再因批次含 `guandan` 而写出原始 batch。输出日志只含数量和 SHA-256。合成 write-batch 回归证明第三方 origin、相邻键和值不会进入文件；测试未读取原始导出。
 - [x] **UI-0：移除虚假的 DMC 选择项。** 已从 `index.html`、设置白名单、提示与复盘标签移除 `dmc-v1`；遗留设置经 `normalizeLocalAiEngine` 迁移为 expert，并由 stats/UI 回归证明不会以 DMC 标签伪装 expert 执行。
 
-## P0-B：证据门加固（SEC/UI/VERIFY 关闭后进入 EVID-9b；需要冻结提交与远端 CI 授权）
+## P0-B：证据门加固（已关闭；真实 M2 工件仍按后续 RUN-2～6 产生）
 
 - [x] **EVID-1：修正 ReleaseEvidence 退出语义。** `validate_release_evidence.mjs` 现在只有在 `promotion.promoted=true` 时才允许 `releaseEvidenceReady=true` 和退出 0；已覆盖模型哈希一致但 CI 下界≤0 的拒绝负例、主 A/B 绑定旧文件哈希的合成拒绝负例，以及完整正例。当前真实命令仍因旧主报告哈希不匹配返回 1，符合停止线。
 - [x] **EVID-2：修正遥测覆盖率分母。** `collectDecisionTelemetry` 现在对每个 AI 决策生成记录；缺少 `variant` 或 `localDecision` 时保留 `latencyMs=null` 并计入未测量。搜索/回退采用显式 `searchAttempted / searchTriggered / fallbackKind`；普通 expert 回合也明确记录“未搜索/无回退”，本地超时和决策错误保留真实 fallback 类型。`tools/test_ai_ab_simulation.mjs` 的生产者负例证明漏记仍须入账：搜索子集即使 100% 覆盖，缺一座策略/本地耗时也会拉低测量覆盖率，缺搜索或回退字段则令 `integrityComplete=false`；性能门从原始计数重算覆盖率并拒绝矛盾回执。
@@ -32,15 +32,15 @@
 - [x] **EVID-8：建立 M2 统一发布验证器（本地代码门已关闭）。** `tools/validate_m2_release.mjs` 现在互绑正常臂报告/checkpoint/原始遥测、严格性能回执、当前源码连续赛和真人盲评的场景载荷/灾难复核；逐对象复算完整性、真实测量覆盖、源码/机器 provenance、CI 下界、连续赛和盲评 gate。盲评 allocation 的 `assignmentSha256/mappingSha256` 会按冻结场景顺序、`randomSeed` 和参与者分支确定性重建，答案 ledger 逐题核对 mapping 与 `side === mapping[choice]`；同步篡改 mapping、side、聚合和摘要绑定的负例仍返回非 0。`tools/test_validate_m2_release.mjs` 以完整合成正例和 20 余类缺失/篡改/矛盾/跨零 CI 负例回归，均要求非 0；`verify.ps1` 的 ReleaseEvidence 入口已显式传入 selected scenarios 与 catastrophic review。fxe 仍只作机制归因，不能替代正常臂门禁。**本地代码门通过不等于真实发布证据通过。**
 - [x] **EVID-9a：形成无冲突、可验证的候选快照。** 逐侧核对后以无冲突的现行工作文件解决 `js/ai.ab.simulation.js`、`js/ai.hybrid.test.js`、`tools/analyze_force_expert_ablation.mjs`、`tools/test_ai_ab_simulation.mjs`、`tools/test_analyze_force_expert_ablation.mjs` 五个未合并索引路径，未用旧暂存版本覆盖实现；清除了 7 个 EOF 空白行，并将评测运行时模块、验证器和其回归文件纳入候选快照。`verify.ps1` 新增 staged diff 格式检查及 `git ls-files -u` 零结果门。`git ls-files -u`、工作区/staged `git diff --check` 均为零，完整统一验证 **36/36** 通过。边界：这只是本地可验证快照，不是冻结提交或远端 CI。
 - [x] **VERIFY-1：恢复 `-FullData` 独立契约。** `verify.ps1` 将 FullData 与 ReleaseEvidence 的输入解析拆分：前者只保留历史完整性所需的 checkpoint，后者才要求连续赛报告及 M2 专属工件。`tools/test_verify_full_data_contract.mjs` 固定这一分支契约；以故意不存在的 `-ContinuousReport` 执行 `-FullData` 仍完整通过，证明不依赖本机恰有默认报告。
-- [ ] **EVID-9b：代码门同一提交与远端 CI 闭环。** SEC-1～3、UI-0 和 VERIFY-1 后的冻结候选已在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**，并单独通过 A/B checkpoint 原子写入/Windows 锁/恢复及环境遥测回归；完整数据只经绝对路径只读引用，未复制工件。剩余唯一代码门是推送该最终提交并记录其远端 CI；真实 ReleaseEvidence/M2 工件仍到 RUN-2～6 后才可能形成，不作为 R0 代码门循环前置，也不消费新的正式种子。
+- [x] **EVID-9b：代码门同一提交与远端 CI 闭环。** SEC-1～3、UI-0 和 VERIFY-1 后的冻结候选 [`585f099`](https://github.com/floating-life/new-guandan/commit/585f0996c727abe77709a3b864f3d1f7ac3819e0) 已在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**，并单独通过 A/B checkpoint 原子写入/Windows 锁/恢复及环境遥测回归；完整数据只经绝对路径只读引用，未复制工件。该精确提交的 [远端 Windows CI run 33470270032](https://github.com/floating-life/new-guandan/actions/runs/33470270032) 已通过。真实 ReleaseEvidence/M2 工件仍到 RUN-2～6 后才可能形成，不作为 R0 代码门循环前置，也不消费新的正式种子。
 
 ### 0901 本轮 EVID-8 / EVID-9a / DMC-0 证据记录
 
 - 目标实现：`tools/validate_m2_release.mjs`、`tools/test_validate_m2_release.mjs`、`tools/summarize_ai_performance_baseline.mjs`、`tools/test_summarize_ai_performance_baseline.mjs`、`tools/test_environment_telemetry.mjs`、`tools/verify.ps1`、`js/game.js`；保留其他既有用户改动，不提交、不推送。
 - 通过：5 个未合并索引路径均已清零，7 个 EOF 空白行已清除；`verify.ps1` 同时检查工作区与 staged diff，并显式拒绝 unmerged index。0901 冻结候选在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**（后者仅只读引用既有本地数据工件；含 JS/MJS、`tools/` 与 `training/` Python 语法、严格自对弈/模型/历史 A-B/外部隔离检查），性能 provenance、M2 正负例、环境遥测、Windows 目录别名冲突和 checkpoint 原子锁/恢复回归均通过。
 - 独立复算：直接读取 43,653,388 字节 legacy v2 checkpoint，确认 2,080 局 / 1,040 镜像组 / 80 区组、无重复/缺失/失败，效用 `+0.028/局`、区组 bootstrap 95% CI `[+0.005,+0.051]`；6,677 个搜索代理回合 P95/P99 `619/1022ms`，1–60 为 `421.8/550ms`，61–80 为 `942/1481ms`。报告/checkpoint SHA-256 分别为 `3b4ebd543d56af0d9c860eef1c07d5fc294b3817a7da006612f3b0e04161762a` / `1a8ed1de8a4a67d6b474bd0bbf1a16f38cebcbff2f1294edd12c91aa26f9a887`。
-- 未通过/未完成：真实 M2 所需 checkpoint、raw telemetry、正式性能回执和盲评工件均不存在；严格旧价值模型发布校验按预期退出 1。当前冻结候选尚无远端 CI，expert 默认和现有性能停止线保持不变。
-- 代码审计边界：EVID-1～9a、SEC-1～3、UI-0 和 VERIFY-1 的本地回归通过；当前可进入 EVID-9b 冻结提交与远端 CI。预算遥测语义缺口仍待 TEL-1；炸弹首出非法过牌未复现，不列为现存发布 bug。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
+- 未通过/未完成：真实 M2 所需 checkpoint、raw telemetry、正式性能回执和盲评工件均不存在；严格旧价值模型发布校验按预期退出 1。冻结候选的远端 CI 已完成；expert 默认和现有性能停止线保持不变。
+- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0 和 VERIFY-1 的本地回归通过，冻结提交远端 CI 已完成；下一主线为 R2 的 ALGO-2/TEL-1 与 PERF-4 前置诊断。预算遥测语义缺口仍待 TEL-1；炸弹首出非法过牌未复现，不列为现存发布 bug。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
 
 ## P1：定位并修复搜索尾延迟
 
@@ -82,4 +82,4 @@
 - availability-aware UCT 已改为 `log(availability + 1) / visits`；旧错误实现报告全部退出正式证据集。
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
-- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零。SEC-1～3 均已完成；仍缺该最终提交的远端 CI。严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。
