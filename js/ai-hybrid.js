@@ -847,6 +847,49 @@ function selectOpenLoopActions(state, seat, maxBranch) {
   return actions.slice(0, maxBranch);
 }
 
+// 只读诊断：量化“专家首选 + pass + 低成本普通着法”在有限分支内是否挤掉
+// 合法炸弹。它不接入正式树搜索，不改变默认排序或搜索预算；若未来实验要
+// 预留炸弹槽，必须另行通过收益、灾难率和尾延迟门。
+export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5) {
+  const branch = clamp(Math.floor(Number(maxBranch) || 5), 2, 10);
+  const legal = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
+    .map(actionFromPlay);
+  const baseline = selectOpenLoopActions(state, seat, branch);
+  const bombs = legal.filter((action) => isBomb(action.hand)).sort((left, right) => (
+    rolloutStructureCost(left, state.hands[seat], state.level)
+    - rolloutStructureCost(right, state.hands[seat], state.level)
+    || left.hand.power - right.hand.power
+    || publicActionKey(left).localeCompare(publicActionKey(right))
+  ));
+  const reserved = baseline.slice();
+  let reservationApplied = false;
+  if (bombs.length && !reserved.some((action) => isBomb(action.hand))) {
+    const expert = chooseRolloutPlay(state, seat);
+    const protectedKeys = new Set([
+      expert ? publicActionKey(actionFromPlay(expert)) : null,
+      state.lastHand ? 'pass' : null,
+    ]);
+    const replaceIndex = reserved.map((action, index) => ({ action, index }))
+      .reverse()
+      .find(({ action }) => !protectedKeys.has(publicActionKey(action)))?.index;
+    if (replaceIndex != null) {
+      reserved[replaceIndex] = bombs[0];
+      reservationApplied = true;
+    }
+  }
+  const summary = (actions) => ({
+    actionCount: actions.length,
+    bombActions: actions.filter((action) => isBomb(action.hand)).length,
+    actionKeys: actions.map(publicActionKey),
+  });
+  return {
+    legalBombActions: bombs.length,
+    baseline: summary(baseline),
+    reserved: summary(reserved),
+    reservationApplied,
+  };
+}
+
 function rolloutFromSimulationState(state, rootTeam, limits) {
   let plies = 0;
   while (plies < limits.maxPlies && limits.nodes.value < limits.nodeBudget) {

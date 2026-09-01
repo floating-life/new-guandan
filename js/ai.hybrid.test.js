@@ -13,6 +13,7 @@ import {
   chooseHybridFromConsultation, configureHybridValueModel,
   evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
+  inspectOpenLoopBombCoverage,
   samplePublicInformationSets, validateHybridValueModel,
 } from './ai-hybrid.js';
 import { makePromotedValueModel } from './value-model.test-fixture.js';
@@ -88,6 +89,36 @@ console.log('rollout 首出不变量');
   )), '生成器异常时从实体牌重建最便宜的合法单张，而非把领出误作过牌');
   assert(fallbackState.rolloutDiagnostics.leadFallbackUsed === 1,
     '领出兜底会留下显式诊断，避免静默丢弃搜索 sweep');
+}
+
+console.log('开放环炸弹分支覆盖诊断');
+{
+  const deck = createDeck();
+  const cards = (rank, count = 1) => deck.filter((card) => card.rank === rank).slice(0, count);
+  const bomb = cards(6, 4);
+  const response = {
+    hands: [[...bomb, ...cards(10), ...cards(11), ...cards(12), ...cards(13), ...cards(14)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: parseHand(cards(9), 7), lastSeat: 1,
+  };
+  const urgent = inspectOpenLoopBombCoverage(response, 0, 5);
+  assert(urgent.legalBombActions >= 1 && urgent.baseline.bombActions === 0
+    && urgent.reserved.bombActions === 1 && urgent.reservationApplied,
+  '紧急可接局面量化出默认有限分支遗漏炸弹，诊断性预留槽能保留最小炸弹');
+
+  const finishing = inspectOpenLoopBombCoverage({
+    hands: [bomb, [], [], []], teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  }, 0, 5);
+  assert(finishing.legalBombActions === 1 && finishing.baseline.bombActions === 1
+    && !finishing.reservationApplied,
+  '收官整手炸弹本来就在专家首选中，诊断不会重复保留或改变其分支');
+
+  const lead = inspectOpenLoopBombCoverage({
+    hands: [[...bomb, ...cards(3), ...cards(4), ...cards(5), ...cards(8), ...cards(9), ...cards(10)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  }, 0, 5);
+  assert(lead.legalBombActions >= 1 && lead.baseline.bombActions === 0
+    && lead.reserved.bombActions === 1 && lead.reservationApplied,
+  '无目的领炸局面同样记录覆盖差异，但正式默认排序仍不接入预留槽');
 }
 
 console.log('公平观察白名单');

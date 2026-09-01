@@ -50,7 +50,7 @@
 - [ ] **PERF-3：只做有证据的优化。** 若根因是 checkpoint 体积或 GC，改为分块/流式保存并保持可复算；若根因在搜索，先用 profile 锁定热点再优化。不得通过放宽阈值或静默减少搜索覆盖过门。
 - [x] **ALGO-1：修正失败 sweep 的深层事务语义。** v3 每个 sweep 在完整候选集合完成前暂存整棵开放环树；中断或后置候选 rollout 失败时恢复 depth、节点、availability、visits、reward、outcomes、failures 和终端/截断计数。`includeTreeDigest` 下的回归先形成成功深树，再注入后置候选失败并继续下一成功 sweep，逐字段证明 snapshot/mutated/restored 一致；普通决策不启用测试 hook 或树序列化。
 - [x] **ALGO-2：固定 rollout 首出不变量。** 外评所称“9+ 张且首出只剩炸弹”在当前规则中不可达：任意非空首出手牌都会生成单张；代表性 9 张牌探针得到 14 个非炸弹与 3 个炸弹类着法。`chooseRolloutPlay` 现由 74 项混合层回归固定：`lastHand=null` 时正常 9 张首出永不返回 pass/null；若规则生成器异常返回空集，则从实体牌重新解析、按结构成本/牌力选择最便宜合法单张，并写入 `leadFallbackUsed` 诊断。若连独立单张解析也失败，rollout 以 `rollout_lead_missing_legal_play` 显式失败，绝不把领出伪装为过牌或静默保留 sweep。
-- [ ] **ALGO-3：量化炸弹分支覆盖。** 当前 `branchLimit=5`、专家动作/pass 先占槽且炸弹成本 +32，确会让非专家炸弹分支靠后；先建立含紧急阻断、收官、无目的领炸的牌面集，比较“预留一个最小炸弹槽”对合法动作覆盖、灾难率、节点数和 P95/P99 的影响。未通过收益与性能证据前不直接改排序。
+- [ ] **ALGO-3：量化炸弹分支覆盖。** 当前 `branchLimit=5`、专家动作/pass 先占槽且炸弹成本 +32，确会让非专家炸弹分支靠后。已建立只读 `inspectOpenLoopBombCoverage`，以紧急阻断、收官、无目的领炸三类牌面证明：前两类默认有限分支可能漏掉合法炸弹，诊断性“最小炸弹槽”可恢复覆盖；整手收官炸弹本已被专家首选保留。该函数未接入正式树和默认排序。仍需预登记新种子，量化预留槽对灾难率、节点数、P95/P99 和收益的影响；未通过这些证据前不直接改排序。
 - [x] **TEL-1：澄清 v3 预算遥测。** 输入 `iterationBudget` 保持 rollout 总预算，兼容既有配置与冻结解析；`ismcts-v3` 输出已明确改为 `rolloutBudget`、`sweepBudget` 与实际 `pairedSweeps`，不再把 `floor(rolloutBudget/candidateCount)` 伪标为 `iterationBudget`。v2/PIMC 仍保留其真实 iteration 口径。每手 checkpoint/raw telemetry 与 M2/fxe 严格字段校验同步记录三项新计数；混合层回归覆盖 2～6 个候选，验证 `iterations == pairedSweeps × candidateCount`，共 **80 passed**；`js/ai.test.js` **328 passed**、A/B checkpoint/M2/fxe 定向回归均通过。
 - [ ] **PERF-4：全新诊断种子性能探针。** R0 和 PERF-1～3 完成后，预登记仅供诊断的新种子，跑 10 区组 × 全 13 级 × 双腿；要求整体及每个足量运行段均满足 ≥100 触发、覆盖≥99%、P95≤500ms、P99≤750ms、回退<0.5%。收益与 CI 只记录，不作强度主张。
 
