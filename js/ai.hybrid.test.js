@@ -1,6 +1,6 @@
 /** 混合决策、公平观察、信息集采样与价值模型契约测试。 */
 import { createDeck } from './cards.js';
-import { handSignature, parseHand, parseHandVariants } from './rules.js';
+import { generateLegalPlays, handSignature, parseHand, parseHandVariants } from './rules.js';
 import {
   auditPublicAIObservation, createPublicAIObservation,
   FORBIDDEN_AI_OBSERVATION_FIELDS,
@@ -9,6 +9,7 @@ import {
   HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA,
   HYBRID_SEARCH_MODES,
   availabilityAwareUctBonus,
+  chooseRolloutPlay,
   chooseHybridFromConsultation, configureHybridValueModel,
   evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
@@ -60,6 +61,33 @@ console.log('availability-aware UCT');
   assert(availabilityAwareUctBonus(30, 3, 2) > bonus
     && availabilityAwareUctBonus(15, 6, 2) < bonus,
   'availability 增加会提高探索项，而同一动作访问增加会降低探索项');
+}
+
+console.log('rollout 首出不变量');
+{
+  const deck = createDeck();
+  const state = {
+    hands: [deck.slice(0, 9), [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  };
+  const normal = chooseRolloutPlay(state, 0);
+  assert(normal && normal.cards.length > 0 && normal.hand,
+    '9 张代表性首出总能选择实际牌型，不会返回 pass/null');
+
+  const fallbackState = {
+    ...state,
+    hands: state.hands.map((hand) => hand.slice()),
+    rolloutDiagnostics: {},
+  };
+  const fallback = chooseRolloutPlay(fallbackState, 0, { legalPlayGenerator: () => [] });
+  const legalSingles = generateLegalPlays(fallbackState.hands[0], fallbackState.level, null)
+    .filter((play) => play.cards.length === 1);
+  assert(fallback && legalSingles.some((play) => (
+    handSignature(play.hand) === handSignature(fallback.hand)
+      && play.cards[0].id === fallback.cards[0].id
+  )), '生成器异常时从实体牌重建最便宜的合法单张，而非把领出误作过牌');
+  assert(fallbackState.rolloutDiagnostics.leadFallbackUsed === 1,
+    '领出兜底会留下显式诊断，避免静默丢弃搜索 sweep');
 }
 
 console.log('公平观察白名单');

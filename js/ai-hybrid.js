@@ -521,10 +521,38 @@ function rolloutStructureCost(play, fullHand, level) {
   return cost;
 }
 
-function chooseRolloutPlay(state, seat) {
+function recordRolloutDiagnostic(state, key) {
+  if (!state.rolloutDiagnostics) state.rolloutDiagnostics = {};
+  state.rolloutDiagnostics[key] = (state.rolloutDiagnostics[key] || 0) + 1;
+}
+
+// 领出时规则生成器理论上总会提供至少一个单张。这个独立兜底不依赖其
+// 枚举结果：若未来的生成器回归遗漏了所有着法，仍从本家实体牌重建最便宜
+// 的单张，避免把领出错误地降格为 pass 并静默丢弃整次 sweep。
+function cheapestLeadFallback(hand, level) {
+  const candidates = hand.flatMap((card) => parseHandVariants([card], level).map((parsed) => ({
+    cards: [card], hand: parsed,
+  })));
+  return candidates.sort((left, right) => (
+    rolloutStructureCost(left, hand, level) - rolloutStructureCost(right, hand, level)
+    || left.hand.power - right.hand.power
+    || handSignature(left.hand).localeCompare(handSignature(right.hand))
+  ))[0] || null;
+}
+
+export function chooseRolloutPlay(state, seat, { legalPlayGenerator = generateLegalPlays } = {}) {
   const hand = state.hands[seat];
-  const plays = generateLegalPlays(hand, state.level, state.lastHand);
-  if (!plays.length) return null;
+  const plays = legalPlayGenerator(hand, state.level, state.lastHand);
+  if (!plays.length) {
+    if (state.lastHand) return null;
+    const fallback = cheapestLeadFallback(hand, state.level);
+    if (fallback) {
+      recordRolloutDiagnostic(state, 'leadFallbackUsed');
+      return fallback;
+    }
+    recordRolloutDiagnostic(state, 'leadFallbackUnavailable');
+    return null;
+  }
   const finishing = plays.filter((play) => play.cards.length === hand.length);
   if (finishing.length) {
     return finishing.sort((left, right) => (
@@ -710,6 +738,9 @@ function simulateCandidate(sample, observation, candidate, limits) {
     limits.nodes.value += 1;
     plies += 1;
     if (!play) {
+      if (!state.lastHand) {
+        return { ok: false, utility: null, plies, reason: 'rollout_lead_missing_legal_play' };
+      }
       state.passed.add(seat);
       if (!closeTrickIfComplete(state)) state.currentSeat = nextResponder(state, seat);
       continue;
@@ -842,6 +873,9 @@ function rolloutFromSimulationState(state, rootTeam, limits) {
     }
     const seat = state.currentSeat;
     const play = chooseRolloutPlay(state, seat);
+    if (!play && !state.lastHand) {
+      return { ok: false, utility: null, plies, reason: 'rollout_lead_missing_legal_play' };
+    }
     const action = play ? actionFromPlay(play) : { action: 'pass', cards: [], hand: null };
     limits.nodes.value += 1;
     plies += 1;
