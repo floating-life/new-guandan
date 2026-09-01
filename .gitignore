@@ -5,6 +5,7 @@
 *.local.*
 active-match.json
 stats.json
+/tools/extracted/
 
 # Secrets and local environment
 .env

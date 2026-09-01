@@ -129,6 +129,56 @@ const PAIRED_ROOT_PIMC_POLICY_VARIANT = Object.freeze({
   policyFeatures: EXPERT_POLICY_FEATURES,
   decisionEngine: 'ismcts',
 });
+const PIMC_POLICY_VARIANT = Object.freeze({
+  policyProfile: 'expert',
+  policyFeatures: EXPERT_POLICY_FEATURES,
+  decisionEngine: 'pimc-v1',
+});
+const ISMCTS_V2_POLICY_VARIANT = Object.freeze({
+  policyProfile: 'expert',
+  policyFeatures: EXPERT_POLICY_FEATURES,
+  decisionEngine: 'ismcts-v2',
+});
+
+// 本地混合引擎标识全集（含消融臂）。各校验点统一引用，避免多点维护漏改。
+const HYBRID_DECISION_ENGINES = Object.freeze([
+  'hybrid', 'pimc-v1', 'ismcts', 'root-pimc-v1', 'ismcts-v2', 'ismcts-v3',
+  'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe',
+]);
+
+/**
+ * One source of truth for the hybrid search work budget.  The A/B runner
+ * records this resolved object in its checkpoint and report, so a change in
+ * either policy or budget cannot silently resume an older evaluation.
+ */
+export function resolveHybridSearchConfig(decisionEngine, {
+  deterministic = false,
+  timeBudgetMs = 0,
+} = {}) {
+  const raw = String(decisionEngine || '');
+  const baseDecisionEngine = raw.endsWith('-fxe') ? raw.slice(0, -'-fxe'.length) : raw;
+  const extendedBudget = Number(timeBudgetMs) >= 500;
+  return {
+    candidateLimit: 6,
+    sampleCount: deterministic ? 6 : extendedBudget ? 8 : 4,
+    behaviorAttempts: 2,
+    maxPlies: extendedBudget ? 120 : 88,
+    // Probe10 with the corrected UCT measured search-triggered P95/P99 at
+    // 576.4/762.3ms under 2400 nodes, exceeding the unchanged 500/750ms
+    // gate.  1800 is a precommitted work-budget calibration for v3 only;
+    // it reduces work rather than weakening the acceptance threshold.
+    nodeBudget: deterministic
+      ? (baseDecisionEngine === 'ismcts-v3' ? 1800 : 3600)
+      : extendedBudget ? 5200 : 2400,
+    iterationBudget: deterministic ? 72 : extendedBudget ? 96 : 48,
+    searchMode: baseDecisionEngine === 'ismcts-v2'
+      ? 'ismcts-v2'
+      : baseDecisionEngine === 'ismcts-v3'
+        ? 'ismcts-v3'
+        : ['ismcts', 'root-pimc-v1'].includes(baseDecisionEngine)
+          ? 'paired-root-pimc-v1' : 'pimc-v1',
+  };
+}
 
 /**
  * 独立策略消融定义。no-p0/no-p1/no-p2 始终保留 expert 的统一策略权重，
@@ -145,11 +195,37 @@ export const AI_POLICY_VARIANTS = Object.freeze({
     policyFeatures: EXPERT_POLICY_FEATURES,
     decisionEngine: 'hybrid',
   }),
+  'pimc-v1': PIMC_POLICY_VARIANT,
   // 成对根 PIMC 实验引擎：仍受专家候选安全门保护，在同一公平世界池中
   // 覆盖全部根候选；正式默认仍是 expert。
   'root-pimc-v1': PAIRED_ROOT_PIMC_POLICY_VARIANT,
   // 旧报告/命令的兼容别名；新评测和文档使用 root-pimc-v1。
   'ismcts-v1': PAIRED_ROOT_PIMC_POLICY_VARIANT,
+  'ismcts-v2': ISMCTS_V2_POLICY_VARIANT,
+  // ismcts-v3 根候选成对采样：同一假想世界对每个根候选各强制下钻一次，
+  // 消除根候选比较中的世界难度混淆；v2 冻结保持与既有报告可比。
+  'ismcts-v3': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'ismcts-v3',
+  }),
+  // 消融臂（仅 A/B 评测，不进 UI 设置）：搜索与遥测照常，最终决策强制保持
+  // 专家首选；与正常臂在同一确定性种子下的配对差值即“搜索改选”的净贡献。
+  'root-pimc-v1-fxe': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'root-pimc-v1-fxe',
+  }),
+  'ismcts-v2-fxe': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'ismcts-v2-fxe',
+  }),
+  'ismcts-v3-fxe': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'ismcts-v3-fxe',
+  }),
   'p2-on': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERIMENTAL_P2_POLICY_FEATURES,
@@ -346,7 +422,7 @@ export function resolvePolicyVariant(name = 'expert') {
     policyProfile: variant.policyProfile,
     policyFeatures: { ...variant.policyFeatures },
     policyThresholds: variant.policyThresholds ? { ...variant.policyThresholds } : null,
-    decisionEngine: ['hybrid', 'ismcts'].includes(variant.decisionEngine)
+    decisionEngine: HYBRID_DECISION_ENGINES.includes(variant.decisionEngine)
       ? variant.decisionEngine : 'expert',
   };
 }
@@ -533,7 +609,7 @@ function cfg(difficulty = _difficulty) {
  */
 export function chooseAIPlay(ctx) {
   const selectedDifficulty = AI_DIFFICULTY[ctx?.difficulty] || _difficulty;
-  if (['hybrid', 'ismcts'].includes(ctx?.decisionEngine)
+  if (HYBRID_DECISION_ENGINES.includes(ctx?.decisionEngine)
     && selectedDifficulty === AI_DIFFICULTY.master) {
     const consultation = getAIConsultation(ctx, {
       deterministic: !!ctx?.deterministic,
@@ -669,6 +745,7 @@ function chooseAIPlayInternal(ctx, options) {
     policyThresholds = null,
     decisionEngine = 'expert',
     opponentModel = null,
+    opponentModelMode = 'adaptive',
   } = ctx;
   const selectedDifficulty = AI_DIFFICULTY[options.difficulty]
     || AI_DIFFICULTY[ctx.difficulty]
@@ -704,8 +781,14 @@ function chooseAIPlayInternal(ctx, options) {
     policyProfile: normalizedPolicyProfile,
     policyFeatures: normalizedPolicyFeatures,
     policyThresholds: policyThresholds ? { ...policyThresholds } : null,
-    decisionEngine: ['hybrid', 'ismcts'].includes(decisionEngine) ? decisionEngine : 'expert',
+    decisionEngine: HYBRID_DECISION_ENGINES.includes(decisionEngine) ? decisionEngine : 'expert',
     opponentModel: opponentModel || null,
+    // The public observation preserves this setting, but the local ranking
+    // context must retain it too.  Otherwise an evaluation that explicitly
+    // disables adaptive opponent modelling silently reverts to `adaptive`
+    // while scoring candidates.
+    opponentModelMode: ['off', 'observe', 'adaptive'].includes(opponentModelMode)
+      ? opponentModelMode : 'adaptive',
     difficulty: selectedDifficulty,
     strategyWeight: c.strategyWeight,
     // 真实对局严格受思考预算约束；超时只跳过尚未完成的 P1 扩展，沿用已经
@@ -2426,7 +2509,7 @@ function explainDecision(decision, ranked, reason, candidate, ctx) {
   result.alternatives = alternatives;
   // 云端只需要少量多样候选；本地混合引擎则在专家已经完成打分的全部
   // “规则生成候选”上先做安全筛选，不能沿用云端的三选一窄瓶颈。
-  const consultationPlays = ['hybrid', 'ismcts'].includes(ctx.decisionEngine)
+  const consultationPlays = HYBRID_DECISION_ENGINES.includes(ctx.decisionEngine)
     ? ranked
     : selectDiverseCandidates(ranked, ctx.hand.length, 24, 10);
   result.candidates = consultationPlays.map((play, index) => ({
@@ -2550,7 +2633,7 @@ export function getAIConsultation(ctx, options = {}) {
   }
 
   const applyHybrid = (result) => {
-    if (!['hybrid', 'ismcts'].includes(ctx?.decisionEngine)
+    if (!HYBRID_DECISION_ENGINES.includes(ctx?.decisionEngine)
       || options.applyHybrid === false) return result;
     try {
       const deterministicSearch = deterministic || timeBudgetMs <= 0;
@@ -2560,14 +2643,15 @@ export function getAIConsultation(ctx, options = {}) {
       const hybridInput = result.cloudConstraint === 'soft_rerank'
         ? { ...result, candidates: consultation.candidates }
         : result;
+      const forceExpertChoice = typeof ctx?.decisionEngine === 'string'
+        && ctx.decisionEngine.endsWith('-fxe');
+      const searchConfig = resolveHybridSearchConfig(ctx?.decisionEngine, {
+        deterministic: deterministicSearch,
+        timeBudgetMs,
+      });
       const hybrid = chooseHybridFromConsultation(ctx, hybridInput, {
-        candidateLimit: 6,
-        sampleCount: deterministicSearch ? 6 : timeBudgetMs >= 500 ? 8 : 4,
-        behaviorAttempts: 2,
-        maxPlies: timeBudgetMs >= 500 ? 120 : 88,
-        nodeBudget: deterministicSearch ? 3600 : timeBudgetMs >= 500 ? 5200 : 2400,
-        iterationBudget: deterministicSearch ? 72 : timeBudgetMs >= 500 ? 96 : 48,
-        searchMode: ctx?.decisionEngine === 'ismcts' ? 'paired-root-pimc-v1' : 'pimc-v1',
+        ...searchConfig,
+        forceExpertChoice,
         deadlineMs,
       });
       const decision = hybrid?.decision;
@@ -2592,6 +2676,10 @@ export function getAIConsultation(ctx, options = {}) {
           version: 1,
           applied: false,
           reason: 'hybrid_exception',
+          // 搜索可能已在抛错前启动；保留未知状态，禁止遥测把它当作未触发。
+          searchAttempted: null,
+          searchTriggered: null,
+          fallbackKind: 'hybrid_exception',
           error: String(error?.message || error).slice(0, 120),
         },
       };

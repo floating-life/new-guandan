@@ -195,5 +195,39 @@ console.log('炸弹倾向和相对座位只作保守软调整');
   '敌家识别真人公开的高用炸率，但只施加小幅风险项并保持总上限');
 }
 
+console.log('v3 衰减与模式边界');
+{
+  const history = [
+    item(1, 1, 1, 'play', 'pair', 14),
+    item(2, 1, 0, 'pass', null, 14),
+  ];
+  const once = observePublicRound(emptyOpponentProfile(), history, { userSeat: 0 });
+  const twice = observePublicRound(once, history, { userSeat: 0 });
+  assert(twice.version === OPPONENT_MODEL_VERSION
+    && twice.roundsObserved === 2
+    && twice.decisions > 1 && twice.decisions < 2,
+  '每副公开行动加入前按100副半衰期衰减旧证据，同时保留实际观察副数');
+
+  const profile = emptyOpponentProfile();
+  profile.decisions = 80;
+  profile.typeStats.pair.response = { play: 0, pass: 40 };
+  profile.pressure.open = { play: 0, pass: 40 };
+  const context = {
+    seat: 1, teams: [0, 1, 0, 1], handCounts: [14, 12, 12, 12], lastHand: null,
+  };
+  const candidate = { action: 'play', hand: { type: 'pair' } };
+  const observing = opponentPlayAdjustment(profile, {
+    ...context, opponentModelMode: 'observe',
+  }, candidate);
+  const off = opponentPlayAdjustment(profile, { ...context, opponentModelMode: 'off' }, candidate);
+  const adaptive = opponentPlayAdjustment(profile, {
+    ...context, opponentModelMode: 'adaptive',
+  }, candidate);
+  assert(observing.score === 0 && observing.reason === 'opponent_model_observe_only'
+    && off.score === 0 && off.reason === 'opponent_model_off'
+    && adaptive.applied && adaptive.confidence > 0,
+  'off/observe/adaptive 分别关闭、只积累和在安全候选内启用公开画像信号');
+}
+
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

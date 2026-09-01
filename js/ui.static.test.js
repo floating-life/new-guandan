@@ -22,8 +22,11 @@ assert(html.includes('id="declarationChips"') && ui.includes('renderDeclarationC
 assert(html.includes('id="endHands"') && ui.includes('renderEndHands'), '每副结束自动亮出未出完AI手牌');
 assert(html.includes('<option value="master">大师</option>'), '难度选择提供大师模式');
 assert(html.includes('大师模式') && html.includes('不读取其他玩家未公开手牌'), '规则说明公开大师模式与公平信息边界');
-assert(html.includes('id="selLocalEngine"') && html.includes('value="hybrid"')
-  && html.includes('value="ismcts"') && html.includes('成对根 PIMC（实验）'), '提供专家、PIMC 混合搜索与成对根 PIMC 引擎开关');
+assert(html.includes('id="selLocalEngine"') && html.includes('value="pimc-v1"')
+  && html.includes('value="root-pimc-v1"') && html.includes('value="ismcts-v2"')
+  && html.includes('成对根 PIMC（实验）'), '提供专家、PIMC、成对根 PIMC 与 ISMCTS v2 引擎开关');
+assert(!html.includes('dmc-v1') && !ui.includes("engine === 'dmc-v1'"),
+  'DMC 未具备可加载模型前不在产品选择器或复盘标签中伪装为可选引擎');
 assert(ui.includes("applySettings(state, { localAiEngine: engine })")
   && ui.includes('公平信息集模拟') && ui.includes('成对根 PIMC 已启用'), '本地引擎开关接入设置并说明公平采样、成对覆盖与安全回退');
 assert(ui.includes('localEngine.disabled') && ui.includes("实验搜索仅在大师难度运行"),
@@ -39,8 +42,11 @@ assert(html.includes('500 组未见种子镜像赛') && ui.includes('model_not_p
   '网页拒绝未晋级训练模型并明确展示发布门禁');
 assert(ui.includes('persistThenActivateValueModel') && ui.includes('未启用新模型'),
   '模型保存失败时不会先启用新模型，并向用户说明当前状态');
-assert(ui.includes('实际用炸和相对座次') && ui.includes('不会把过牌当成'),
+assert(ui.includes('实际用炸、残局压力和相对座次') && ui.includes('不会把过牌当成'),
   '统计页说明真人画像只使用公开的领牌、应手、用炸与座次证据');
+assert(html.includes('id="selOpponentModel"') && html.includes('value="observe"')
+  && html.includes('value="adaptive"') && ui.includes('opponentModelMode')
+  && ui.includes('100 副半衰期'), '提供本机画像的关闭、观察、自适应模式与时效说明');
 assert(ui.includes('state.opponentModel = cleared.opponentModel')
   && ui.includes('state.opponentModel = getSkillStats().opponentModel')
   && ui.includes('persistMatch(state)'),

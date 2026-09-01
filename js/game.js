@@ -1293,6 +1293,7 @@ export function aiDecisionContext(state, seat) {
     policyThresholds: state.settings?.aiPolicyThresholdsBySeat?.[seat] || null,
     leadAfterOwnBomb: isLeadAfterOwnBomb(state, seat),
     opponentModel: state.opponentModel,
+    opponentModelMode: state.settings?.opponentModelMode || 'adaptive',
     decisionEngine: state.settings?.aiDecisionEngineBySeat?.[seat]
       || state.settings?.localAiEngine
       || 'expert',
@@ -1470,6 +1471,10 @@ function resolveLocalConsultation(consultation, state, seat, reasonPrefix = '本
     seat,
   );
   decision.reason = `${reasonPrefix}：${consultation.reason || decision.reason || '采用本地候选'}`;
+  // 本地咨询已完成的混合搜索并不会因为最终仍采用本地候选而失效。保留
+  // 该遥测，才能让 Worker 座位与 0 号同步路径使用同一统计口径；尤其是
+  // force-expert 消融臂必须记录 wouldChange，不能悄悄退化成普通 expert。
+  decision.hybrid = consultation.hybrid || null;
   return decision;
 }
 
@@ -1615,6 +1620,7 @@ async function runAI(state) {
   let cloudAttempted = false;
   let localDecisionLatencyMs = null;
   let localDecisionSource = null;
+  let localFallbackKind = 'none';
   try {
     setAIDifficulty(state.settings?.difficulty || 'normal');
     if (preflight.eligible) {
@@ -1785,16 +1791,30 @@ async function runAI(state) {
           );
         } else {
           const localStartedAt = Date.now();
-          decision = await requestAIDecision(context, {
-            timeoutMs: Math.max(2000, (context.timeBudgetMs || 250) + 1500),
-          });
-          localDecisionLatencyMs = Date.now() - localStartedAt;
-          localDecisionSource = 'worker';
+          try {
+            decision = await requestAIDecision(context, {
+              timeoutMs: Math.max(2000, (context.timeBudgetMs || 250) + 1500),
+            });
+            localDecisionLatencyMs = Date.now() - localStartedAt;
+            localDecisionSource = 'worker';
+          } catch (error) {
+            // Worker timeout/error is still a measured local decision attempt.
+            // Preserve its elapsed time and source so strict performance gates
+            // cannot silently drop the failed search-triggered turn.
+            localDecisionLatencyMs = Date.now() - localStartedAt;
+            localDecisionSource = 'worker';
+            throw error;
+          }
         }
       } catch (error) {
         state.llmLastError = String(error?.message || error || '本地 AI 决策失败').slice(0, 160);
+        localFallbackKind = error?.name === 'TimeoutError' || error?.code === 'timeout'
+          ? 'local_timeout' : 'local_decision_error';
         decision = state.lastHand ? { action: 'pass', reason: '本地 AI 暂时无法接牌' } : null;
       }
+    }
+    if (decision?.localFallbackKind && localFallbackKind === 'none') {
+      localFallbackKind = decision.localFallbackKind;
     }
     if (!isCurrent()) return;
     const localDecision = {
@@ -1808,7 +1828,14 @@ async function runAI(state) {
         // 必须出 — 兜底出最小单张
         const c = state.hands[seat][state.hands[seat].length - 1];
         const hand = parseHand([c], state.currentLevel);
-        applyPlay(state, seat, [c], hand, null, { reason: '兜底领出最小单张' });
+        applyPlay(state, seat, [c], hand, null, {
+          reason: '兜底领出最小单张',
+          ...decisionTelemetryMeta(
+            decision,
+            localFallbackKind !== 'none' ? localFallbackKind : 'forced_lead',
+          ),
+          localDecision,
+        });
         advanceAfterPlay(state);
         return;
       }
@@ -1817,6 +1844,7 @@ async function runAI(state) {
         projectedTricks: decision?.projectedTricks ?? null,
         llm: decision?.llm || null,
         hybrid: decision?.hybrid || null,
+        ...decisionTelemetryMeta(decision, localFallbackKind),
         localDecision,
       });
       advanceAfterPass(state);
@@ -1828,6 +1856,7 @@ async function runAI(state) {
       projectedTricks: decision.projectedTricks ?? null,
       llm: decision.llm || null,
       hybrid: decision.hybrid || null,
+      ...decisionTelemetryMeta(decision, localFallbackKind),
       localDecision,
     });
     advanceAfterPlay(state);
@@ -1843,6 +1872,63 @@ async function runAI(state) {
       else notify(state);
     }
   }
+}
+
+// Every AI turn must carry explicit search/fallback fields.  Non-hybrid
+// expert turns are valid no-search decisions; malformed hybrid metadata stays
+// unknown so the strict telemetry gate rejects it instead of treating it as a
+// clean no-search turn.
+function decisionTelemetryMeta(decision, fallbackKind = 'none') {
+  const hybrid = decision?.hybrid;
+  if (fallbackKind !== 'none') {
+    if (hybrid == null) {
+      return {
+        // A timeout/error means the worker may have entered search before it
+        // failed.  Unknown is safer than claiming a clean no-search turn.
+        searchAttempted: ['local_timeout', 'local_decision_error'].includes(fallbackKind)
+          ? null : false,
+        searchTriggered: ['local_timeout', 'local_decision_error'].includes(fallbackKind)
+          ? null : false,
+        fallbackKind,
+      };
+    }
+    if (typeof hybrid !== 'object'
+      || typeof hybrid.searchAttempted !== 'boolean'
+      || typeof hybrid.searchTriggered !== 'boolean') {
+      return {
+        searchAttempted: null,
+        searchTriggered: null,
+        fallbackKind,
+      };
+    }
+    return {
+      searchAttempted: hybrid.searchAttempted,
+      searchTriggered: hybrid.searchTriggered,
+      fallbackKind,
+    };
+  }
+  if (hybrid == null) {
+    return {
+      searchAttempted: false,
+      searchTriggered: false,
+      fallbackKind: 'none',
+    };
+  }
+  if (typeof hybrid !== 'object'
+    || typeof hybrid.searchAttempted !== 'boolean'
+    || typeof hybrid.searchTriggered !== 'boolean') {
+    return {
+      searchAttempted: null,
+      searchTriggered: null,
+      fallbackKind: null,
+    };
+  }
+  return {
+    searchAttempted: hybrid.searchAttempted,
+    searchTriggered: hybrid.searchTriggered,
+    fallbackKind: typeof hybrid.fallbackKind === 'string' && hybrid.fallbackKind
+      ? hybrid.fallbackKind : 'none',
+  };
 }
 
 function evaluationSnapshot(ev) {
@@ -2026,6 +2112,7 @@ function endRound(state) {
     llmReport: state.llmReport,
     publicHistory: publicActionHistory(state),
     userSeat: 0,
+    opponentModelMode: state.settings?.opponentModelMode || 'adaptive',
   });
   state.opponentModel = updatedStats.opponentModel;
 

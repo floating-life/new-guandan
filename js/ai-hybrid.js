@@ -20,16 +20,33 @@ import {
 export const HYBRID_ENGINE_VERSION = 1;
 export const HYBRID_VALUE_SCHEMA = 'guandan-candidate-v1';
 /**
- * 信息集增强的两个可验证搜索模式：
+ * 信息集增强的三个可验证搜索模式：
  * - pimc-v1：每个候选在每个公平采样世界各 rollout 一次（现有基线）。
  * - paired-root-pimc-v1：在相同假想世界成对覆盖全部候选，并用完整世界数
  *   和有效访问数约束改选。世界仍来自当前公开信息集，不会把真实暗牌传入
  *   模拟器。它不是树搜索：每次 iteration 都对应一次实际 rollout。
+ * - ismcts-v2：每次 iteration 重新采样一个合法暗牌世界，在只由公开动作
+ *   序列索引的开放环树上按动作可用次数修正 UCT；叶节点使用专家 rollout。
+ * - ismcts-v3：在 v2 的开放环树与深层 UCT 之上，把每次迭代改为成对 sweep——
+ *   同一假想世界按轮转顺序对每个根候选各强制下钻一次（跳过根层 UCT），
+ *   消除根候选比较中的“世界难度”混淆；sweep 中途耗尽预算则整批丢弃不回传。
  */
 export const HYBRID_SEARCH_MODES = Object.freeze({
   PIMC: 'pimc-v1',
   PAIRED_ROOT_PIMC: 'paired-root-pimc-v1',
+  ISMCTS: 'ismcts-v2',
+  ISMCTS_V3: 'ismcts-v3',
 });
+
+// Availability-aware UCT (Cowling et al.) keeps the action's own visit count
+// in the denominator.  Availability is the number of determinizations in
+// which that action was legal, so it replaces—not supplements—the parent
+// visit count in the exploration numerator.
+export function availabilityAwareUctBonus(availability, visits, exploration) {
+  return Number(exploration) * Math.sqrt(
+    Math.log(Math.max(1, Number(availability) || 0) + 1) / Math.max(1, Number(visits) || 0),
+  );
+}
 export const HYBRID_VALUE_FEATURES = Object.freeze([
   'remaining_fraction', 'played_fraction', 'candidate_size', 'candidate_power',
   'local_score', 'projected_tricks', 'is_pass', 'is_lead', 'is_bomb',
@@ -58,8 +75,10 @@ function clamp(value, low, high) {
 
 function normalizeSearchMode(value) {
   const mode = String(value || '').toLowerCase();
+  if (mode === HYBRID_SEARCH_MODES.ISMCTS) return HYBRID_SEARCH_MODES.ISMCTS;
+  if (mode === HYBRID_SEARCH_MODES.ISMCTS_V3) return HYBRID_SEARCH_MODES.ISMCTS_V3;
   // 保留历史保存设置、旧 A/B 报告重放所用标识的读取兼容；运行时遥测
-  // 一律使用诚实的 paired-root-pimc-v1 名称。
+  // 一律使用诚实的 paired-root-pimc-v1 名称；它不能被误标为 ismcts-v2。
   if (mode === 'ismcts' || mode === 'ismcts-root' || mode === 'ismcts-root-v1'
     || mode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC) {
     return HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC;
@@ -711,6 +730,573 @@ function simulateCandidate(sample, observation, candidate, limits) {
   };
 }
 
+/**
+ * 以下状态机仅服务于 ISMCTS 的假想世界。它与真实牌局隔离，输入来自
+ * createPublicAIObservation 和公平采样；任何节点键都不读取这份状态里的
+ * 私有手牌。真实牌局的规则真源仍在 game/rules 模块。
+ */
+function createSimulationState(sample, observation) {
+  return {
+    hands: sample.hands.map((hand) => hand.map((card) => ({ ...card }))),
+    teams: observation.teams.slice(),
+    level: observation.level,
+    finishOrder: observation.finishOrder.slice(),
+    lastHand: observation.lastHand,
+    lastSeat: observation.lastSeat,
+    passed: historicalPasses(observation),
+    currentSeat: observation.seat,
+  };
+}
+
+function applySimulationAction(state, seat, action) {
+  if (state.currentSeat !== seat) return false;
+  if (action.action === 'pass') {
+    if (!state.lastHand) return false;
+    state.passed.add(seat);
+    if (!closeTrickIfComplete(state)) state.currentSeat = nextResponder(state, seat);
+    return true;
+  }
+  const cards = resolveCandidateCards(action, state.hands[seat]);
+  if (!cards || !cards.length) return false;
+  state.hands[seat] = removeCards(state.hands[seat], cards);
+  state.lastHand = action.hand;
+  state.lastSeat = seat;
+  state.passed.clear();
+  if (!state.hands[seat].length) finishSeat(state, seat);
+  if (terminalTeam(state) != null) return true;
+  state.currentSeat = nextResponder(state, seat);
+  if (state.currentSeat == null) closeTrickIfComplete(state);
+  return true;
+}
+
+// 一手打出的实体牌会成为公开历史，因此可安全进入开放环树的边。不要把
+// 未出牌、整副隐藏手牌、采样编号或未来状态混进这个 key。
+function publicActionKey(action) {
+  if (action?.action === 'pass') return 'pass';
+  const cards = candidateCards(action).map(physicalKey).filter(Boolean).sort();
+  const declared = action?.hand ? handSignature(action.hand) : '';
+  return `play:${cards.join(',')}|${declared}`;
+}
+
+function actionFromPlay(play) {
+  return {
+    action: 'play',
+    cards: play.cards,
+    hand: play.hand,
+    signature: handSignature(play.hand),
+  };
+}
+
+/** Pick a bounded, deterministic expert-oriented branch set for an inner node. */
+function selectOpenLoopActions(state, seat, maxBranch) {
+  const plays = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
+    .map(actionFromPlay);
+  const actions = [];
+  const add = (action) => {
+    if (!action || actions.some((item) => publicActionKey(item) === publicActionKey(action))) return;
+    actions.push(action);
+  };
+  // 先加入专家 rollout 的首选，使扩展与默认安全策略一致；随后只补少量
+  // 低结构成本的合法分支，防止信息集树把完整候选空间展开到不可交互。
+  const expert = chooseRolloutPlay(state, seat);
+  if (expert) add(actionFromPlay(expert));
+  if (state.lastHand) add({ action: 'pass', cards: [], hand: null, signature: null });
+  const ordered = plays.slice().sort((left, right) => {
+    const leftCost = rolloutStructureCost(left, state.hands[seat], state.level);
+    const rightCost = rolloutStructureCost(right, state.hands[seat], state.level);
+    return leftCost - rightCost
+      || Number(isBomb(left.hand)) - Number(isBomb(right.hand))
+      || Number(left.cards.length) - Number(right.cards.length)
+      || publicActionKey(left).localeCompare(publicActionKey(right));
+  });
+  for (const action of ordered) {
+    if (actions.length >= maxBranch) break;
+    add(action);
+  }
+  return actions.slice(0, maxBranch);
+}
+
+function rolloutFromSimulationState(state, rootTeam, limits) {
+  let plies = 0;
+  while (plies < limits.maxPlies && limits.nodes.value < limits.nodeBudget) {
+    if (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs) {
+      return { ok: true, utility: cutoffUtility(state, rootTeam), plies, timedOut: true };
+    }
+    const winner = terminalTeam(state);
+    if (winner != null || state.finishOrder.length >= 3) {
+      completeFinishOrder(state);
+      return {
+        ok: true,
+        utility: teamUpgradeUtility(state.finishOrder, state.teams, rootTeam),
+        plies,
+        terminal: true,
+      };
+    }
+    if (state.currentSeat == null) {
+      if (!closeTrickIfComplete(state)) {
+        state.currentSeat = nextSeatWith(state, state.lastSeat ?? 0, (candidateSeat) => (
+          state.hands[candidateSeat].length > 0
+        ));
+      }
+      if (state.currentSeat == null) break;
+    }
+    const seat = state.currentSeat;
+    const play = chooseRolloutPlay(state, seat);
+    const action = play ? actionFromPlay(play) : { action: 'pass', cards: [], hand: null };
+    limits.nodes.value += 1;
+    plies += 1;
+    if (!applySimulationAction(state, seat, action)) {
+      return { ok: false, utility: null, plies, reason: 'rollout_action_invalid' };
+    }
+  }
+  return {
+    ok: true,
+    utility: cutoffUtility(state, rootTeam),
+    plies,
+    truncated: true,
+  };
+}
+
+function createOpenLoopNode(depth = 0) {
+  return {
+    depth,
+    visits: 0,
+    total: 0,
+    actions: new Map(),
+  };
+}
+
+// v3 sweeps stage deep availability/child mutations before every candidate is
+// scored.  A failed or interrupted sweep must restore the whole open-loop
+// subtree, not just root visits.  The snapshot is deliberately local to one
+// sweep; it is bounded by the current tree and keeps limits.nodes consumed so
+// a failed rollout cannot evade the search budget.
+function cloneOpenLoopNode(node) {
+  if (!node) return null;
+  const cloneRecord = (record) => ({
+    key: record.key,
+    action: {
+      ...record.action,
+      cards: Array.isArray(record.action?.cards)
+        ? record.action.cards.map((card) => ({ ...card })) : record.action?.cards,
+    },
+    availability: record.availability,
+    visits: record.visits,
+    total: record.total,
+    outcomes: record.outcomes.slice(),
+    failures: { ...record.failures },
+    terminalCount: record.terminalCount,
+    truncatedCount: record.truncatedCount,
+    child: cloneOpenLoopNode(record.child),
+  });
+  return {
+    depth: node.depth,
+    visits: node.visits,
+    total: node.total,
+    actions: new Map([...node.actions.entries()].map(([key, record]) => [key, cloneRecord(record)])),
+  };
+}
+
+function restoreOpenLoopNode(target, snapshot) {
+  target.depth = snapshot.depth;
+  target.visits = snapshot.visits;
+  target.total = snapshot.total;
+  target.actions = snapshot.actions;
+}
+
+function countOpenLoopNodes(node) {
+  if (!node) return 0;
+  return 1 + [...node.actions.values()].reduce(
+    (total, record) => total + countOpenLoopNodes(record.child), 0,
+  );
+}
+
+// Test-only/diagnostic view of the open-loop tree.  It contains only public
+// action keys and mutable search statistics; callers must opt in through
+// `includeTreeDigest` so normal decisions never pay for serializing it.
+function digestOpenLoopNode(node) {
+  if (!node) return null;
+  return {
+    depth: node.depth,
+    visits: node.visits,
+    total: node.total,
+    actions: [...node.actions.values()]
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map((record) => ({
+        key: record.key,
+        availability: record.availability,
+        visits: record.visits,
+        total: record.total,
+        outcomes: record.outcomes.slice(),
+        failures: { ...record.failures },
+        terminalCount: record.terminalCount,
+        truncatedCount: record.truncatedCount,
+        child: digestOpenLoopNode(record.child),
+      })),
+  };
+}
+
+function registerOpenLoopAction(node, action) {
+  const key = publicActionKey(action);
+  let record = node.actions.get(key);
+  if (!record) {
+    record = {
+      key,
+      action: { ...action, cards: candidateCards(action).map((card) => ({ ...card })) },
+      availability: 0,
+      visits: 0,
+      total: 0,
+      outcomes: [],
+      failures: {},
+      terminalCount: 0,
+      truncatedCount: 0,
+      child: null,
+    };
+    node.actions.set(key, record);
+  }
+  return record;
+}
+
+function selectOpenLoopRecord(node, legalActions, state, rootTeam, exploration, minimumRootVisits = 0) {
+  const records = legalActions.map((action) => registerOpenLoopAction(node, action));
+  for (const record of records) record.availability += 1;
+  // 根动作都来自固定本家手牌，因而在每个假想世界都可用。先用不同的公平
+  // determinization 覆盖最小访问数，再交给 UCT 分配剩余预算；否则早期随机
+  // 波动会让某个安全候选永远没有足够证据，退化成看似树搜索的单臂赌博机。
+  if (node.depth === 0 && minimumRootVisits > 0) {
+    const incomplete = records.filter((record) => record.visits < minimumRootVisits);
+    if (incomplete.length) {
+      return incomplete.sort((left, right) => (
+        left.visits - right.visits || left.key.localeCompare(right.key)
+      ))[0];
+    }
+  }
+  const unvisited = records.filter((record) => record.visits === 0);
+  if (unvisited.length) return unvisited.sort((left, right) => left.key.localeCompare(right.key))[0];
+  const maximize = state.teams[state.currentSeat] === rootTeam;
+  return records.slice().sort((left, right) => {
+    const score = (record) => {
+      const mean = record.total / Math.max(1, record.visits);
+      const bonus = availabilityAwareUctBonus(record.availability, record.visits, exploration);
+      return maximize ? mean + bonus : mean - bonus;
+    };
+    const difference = score(right) - score(left);
+    return maximize ? difference : -difference || left.key.localeCompare(right.key);
+  })[0];
+}
+
+function runISMCTSSearch(observation, candidates, limits, options) {
+  const searchMode = options.searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3
+    ? HYBRID_SEARCH_MODES.ISMCTS_V3 : HYBRID_SEARCH_MODES.ISMCTS;
+  const root = createOpenLoopNode(0);
+  const rootActionByCandidate = new Map(candidates.map((candidate) => [
+    candidate.id,
+    publicActionKey(candidate),
+  ]));
+  const treeDepth = clamp(Math.floor(Number(options.treeDepth) || 5), 1, 12);
+  const branchLimit = clamp(Math.floor(Number(options.branchLimit) || 5), 2, 10);
+  const minimumRootVisits = clamp(
+    Math.floor(Number(options.minimumEffectiveVisits) || 3), 2, 12,
+  );
+  const exploration = clamp(Number(options.exploration) || 1.15, 0.1, 4);
+  const seedBase = Number.isFinite(Number(options.seed)) ? Number(options.seed) : 0;
+  const rootTeam = observation.teams[observation.seat];
+  let iterations = 0;
+  let sampledWorlds = 0;
+  let pairedSweeps = 0;
+  let treeNodes = 1;
+  const sampleFailures = {};
+  const rollbackDiagnostics = [];
+  // A deterministic failure hook is intentionally available only alongside
+  // the opt-in tree digest used by unit tests.  Production callers cannot
+  // accidentally inject outcomes, and the normal path does not allocate or
+  // inspect this hook.
+  const forcedOutcomeForTest = options.includeTreeDigest === true
+    && typeof options.testHooks?.forcedOutcome === 'function'
+    ? options.testHooks.forcedOutcome : null;
+  const budgetExhausted = () => (
+    limits.nodes.value >= limits.nodeBudget
+    || (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs)
+  );
+
+  // 单次树内下钻：从根走到首次扩展（或终端/截断），返回路径。v2 根层由
+  // availability 修正 UCT 选动作；v3 传 forcedRootAction 强制根候选并跳过
+  // 根层 UCT（也不在此时累加根 availability——它只在 sweep 完整回传时与
+  // visits 同步 +1，保证严格成对）。
+  const descendTree = (state, forcedRootAction = null) => {
+    const pathNodes = [root];
+    const pathActions = [];
+    let node = root;
+    let depth = 0;
+    let expanded = false;
+    let invalidReason = null;
+
+    while (depth < treeDepth && limits.nodes.value < limits.nodeBudget) {
+      const winner = terminalTeam(state);
+      if (winner != null || state.finishOrder.length >= 3) break;
+      if (state.currentSeat == null) {
+        if (!closeTrickIfComplete(state)) {
+          state.currentSeat = nextSeatWith(state, state.lastSeat ?? observation.seat, (candidateSeat) => (
+            state.hands[candidateSeat].length > 0
+          ));
+        }
+        if (state.currentSeat == null) break;
+      }
+      const seat = state.currentSeat;
+      const legalActions = depth === 0
+        ? candidates
+        : selectOpenLoopActions(state, seat, branchLimit);
+      if (!legalActions.length) {
+        invalidReason = 'tree_no_legal_action';
+        break;
+      }
+      const record = depth === 0 && forcedRootAction
+        ? registerOpenLoopAction(node, forcedRootAction)
+        : selectOpenLoopRecord(
+          node,
+          legalActions,
+          state,
+          rootTeam,
+          exploration,
+          minimumRootVisits,
+        );
+      const chosen = legalActions.find((action) => publicActionKey(action) === record.key);
+      if (!chosen || !applySimulationAction(state, seat, chosen)) {
+        invalidReason = 'tree_action_invalid';
+        break;
+      }
+      limits.nodes.value += 1;
+      pathActions.push(record);
+      if (!record.child) {
+        record.child = createOpenLoopNode(depth + 1);
+        treeNodes += 1;
+        expanded = true;
+      }
+      node = record.child;
+      pathNodes.push(node);
+      depth += 1;
+      if (expanded) break;
+    }
+    return { pathNodes, pathActions, invalidReason };
+  };
+  const backpropagate = ({ pathNodes, pathActions }, outcome) => {
+    for (const visited of pathNodes) {
+      visited.visits += 1;
+      visited.total += outcome.utility;
+    }
+    for (const record of pathActions) {
+      record.visits += 1;
+      record.total += outcome.utility;
+      record.outcomes.push(outcome.utility);
+      record.terminalCount += Number(outcome.terminal === true);
+      record.truncatedCount += Number(outcome.truncated === true || outcome.timedOut === true);
+    }
+  };
+  const summarizeRootRecords = () => candidates.map((candidate) => {
+    const record = root.actions.get(rootActionByCandidate.get(candidate.id));
+    if (!record) return summarizeCandidateRollouts(candidate.id, [], {}, 0, 0, 0);
+    return {
+      ...summarizeCandidateRollouts(
+        candidate.id,
+        record.outcomes,
+        record.failures,
+        record.terminalCount,
+        record.truncatedCount,
+        record.visits,
+      ),
+      availability: record.availability,
+    };
+  });
+
+  if (searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3) {
+    // v3：iterationBudget 与 v2 同口径（单次触发的 rollout 总预算），内部换算
+    // 为 sweep 数（默认量级 max(4, floor(72/候选数))），总算力与 v2 相当。
+    // 每次 sweep 采一个世界，同一世界按轮转顺序对每个根候选各强制下钻一次
+    // （每候选重建 simulation state）。原子性：sweep 中途耗尽节点预算或截止
+    // 时间，或任一候选 rollout 失败 → 整批丢弃不回传（记 partial_sweep_discarded
+    // / sweep_outcome_failed），杜绝半成对状态污染根候选比较；对应成对 PIMC
+    // 的 baseInterrupted 处理。
+    const rolloutBudget = clamp(
+      Math.floor(Number(options.iterationBudget) || Math.max(candidates.length * 6, 24)),
+      Math.max(candidates.length, 2),
+      2000,
+    );
+    const sweepBudget = clamp(
+      Math.floor(rolloutBudget / Math.max(1, candidates.length)),
+      1,
+      2000,
+    );
+    let sweeps = 0;
+    // 已完成下钻的累计节点消耗：用于 sweep 启动前的保守预算估计。剩余预算
+    // 不足以覆盖 1.25 倍估计时不再启动新 sweep——避免把尾段预算烧在注定被
+    // 原子丢弃的半成对工作上（尾延迟保护；估计本身是确定性的，不读墙钟）。
+    let completedDrills = 0;
+    let drillNodeCost = 0;
+    while (sweeps < sweepBudget && !budgetExhausted()) {
+      if (completedDrills > 0) {
+        const estimatedSweepCost = Math.ceil(
+          (drillNodeCost / completedDrills) * candidates.length * 1.25,
+        );
+        if (limits.nodes.value + estimatedSweepCost > limits.nodeBudget) break;
+      }
+      // 采样种子只来自公开观察和调用方公开种子，与 v2 同规则、按 sweep 计数。
+      const sampled = samplePublicInformationSets(observation, {
+        sampleCount: 1,
+        behaviorAttempts: options.behaviorAttempts,
+        seed: seedBase + sweeps * 7919,
+      });
+      const sweepIndex = sweeps;
+      sweeps += 1;
+      if (!sampled.ok || !sampled.samples[0]) {
+        const reason = sampled.failure?.reason || 'sampling_failed';
+        sampleFailures[reason] = (sampleFailures[reason] || 0) + 1;
+        continue;
+      }
+      const sweepSnapshot = cloneOpenLoopNode(root);
+      const completed = [];
+      let interrupted = false;
+      let sweepFailure = null;
+      for (let offset = 0; offset < candidates.length; offset++) {
+        if (budgetExhausted()) {
+          interrupted = true;
+          break;
+        }
+        const candidate = candidates[(sweepIndex + offset) % candidates.length];
+        const nodesBefore = limits.nodes.value;
+        const state = createSimulationState(sampled.samples[0], observation);
+        const descent = descendTree(state, candidate);
+        let outcome = descent.invalidReason
+          ? { ok: false, utility: null, reason: descent.invalidReason }
+          : rolloutFromSimulationState(state, rootTeam, limits);
+        if (!descent.invalidReason && forcedOutcomeForTest) {
+          let injected = null;
+          try {
+            injected = forcedOutcomeForTest({ sweepIndex, offset, candidateId: candidate.id });
+          } catch (error) {
+            injected = { ok: false, reason: `test_hook_failed:${error?.message || String(error)}` };
+          }
+          if (injected && injected.ok === false) {
+            outcome = {
+              ok: false,
+              utility: null,
+              reason: typeof injected.reason === 'string' && injected.reason
+                ? injected.reason : 'test_forced_failure',
+            };
+          }
+        }
+        completedDrills += 1;
+        drillNodeCost += Math.max(0, limits.nodes.value - nodesBefore);
+        if (!outcome.ok || !Number.isFinite(outcome.utility)) {
+          sweepFailure = outcome.reason || 'invalid_utility';
+          const rootRecord = root.actions.get(rootActionByCandidate.get(candidate.id));
+          if (rootRecord) {
+            rootRecord.failures[sweepFailure] = (rootRecord.failures[sweepFailure] || 0) + 1;
+          }
+          break;
+        }
+        completed.push({ descent, outcome, candidateId: candidate.id });
+      }
+      if (interrupted) {
+        const snapshotDigest = options.includeTreeDigest === true
+          ? digestOpenLoopNode(sweepSnapshot) : null;
+        const mutatedDigest = options.includeTreeDigest === true
+          ? digestOpenLoopNode(root) : null;
+        restoreOpenLoopNode(root, sweepSnapshot);
+        treeNodes = countOpenLoopNodes(root);
+        if (options.includeTreeDigest === true) rollbackDiagnostics.push({
+          kind: 'interrupted', sweepIndex, snapshotDigest, mutatedDigest,
+          restoredDigest: digestOpenLoopNode(root),
+        });
+        sampleFailures.partial_sweep_discarded = (sampleFailures.partial_sweep_discarded || 0) + 1;
+        break;
+      }
+      if (sweepFailure) {
+        const snapshotDigest = options.includeTreeDigest === true
+          ? digestOpenLoopNode(sweepSnapshot) : null;
+        const mutatedDigest = options.includeTreeDigest === true
+          ? digestOpenLoopNode(root) : null;
+        restoreOpenLoopNode(root, sweepSnapshot);
+        treeNodes = countOpenLoopNodes(root);
+        if (options.includeTreeDigest === true) rollbackDiagnostics.push({
+          kind: 'failed', sweepIndex, snapshotDigest, mutatedDigest,
+          restoredDigest: digestOpenLoopNode(root), reason: sweepFailure,
+        });
+        sampleFailures.sweep_outcome_failed = (sampleFailures.sweep_outcome_failed || 0) + 1;
+        continue;
+      }
+      pairedSweeps += 1;
+      sampledWorlds += 1;
+      iterations += completed.length;
+      for (const item of completed) {
+        backpropagate(item.descent, item.outcome);
+        // 根层 availability 与 visits 恒等：只在 sweep 完整回传后 +1。
+        root.actions.get(rootActionByCandidate.get(item.candidateId)).availability += 1;
+      }
+    }
+    return {
+      searchMode,
+      iterations,
+      iterationBudget: sweepBudget,
+      pairedSweeps,
+      sampledWorlds,
+      sampleFailures,
+      treeNodes,
+      ...(options.includeTreeDigest === true ? { rollbackDiagnostics } : {}),
+      ...(options.includeTreeDigest === true ? { treeDigest: digestOpenLoopNode(root) } : {}),
+      candidateResults: summarizeRootRecords(),
+    };
+  }
+
+  // ismcts-v2（冻结，保持与既有 A/B 报告可比）：每次迭代独立采样一个世界，
+  // UCT 单路径下钻，只回传路径上的记录。
+  const iterationBudget = clamp(
+    Math.floor(Number(options.iterationBudget) || Math.max(candidates.length * 6, 24)),
+    Math.max(candidates.length, 2),
+    2000,
+  );
+  while (iterations < iterationBudget && !budgetExhausted()) {
+    // 每一次迭代独立调用公平采样器。种子只来自公开观察和调用方公开种子，
+    // 用于可复现实验，不含任何真实暗牌。
+    const sampled = samplePublicInformationSets(observation, {
+      sampleCount: 1,
+      behaviorAttempts: options.behaviorAttempts,
+      seed: seedBase + iterations * 7919,
+    });
+    iterations += 1;
+    if (!sampled.ok || !sampled.samples[0]) {
+      const reason = sampled.failure?.reason || 'sampling_failed';
+      sampleFailures[reason] = (sampleFailures[reason] || 0) + 1;
+      continue;
+    }
+    sampledWorlds += 1;
+    const state = createSimulationState(sampled.samples[0], observation);
+    const descent = descendTree(state, null);
+    const outcome = descent.invalidReason
+      ? { ok: false, utility: null, reason: descent.invalidReason }
+      : rolloutFromSimulationState(state, rootTeam, limits);
+    if (!outcome.ok || !Number.isFinite(outcome.utility)) {
+      const reason = outcome.reason || 'invalid_utility';
+      for (const record of descent.pathActions) {
+        record.failures[reason] = (record.failures[reason] || 0) + 1;
+      }
+      continue;
+    }
+    backpropagate(descent, outcome);
+  }
+
+  return {
+    searchMode,
+    iterations,
+    iterationBudget,
+    sampledWorlds,
+    sampleFailures,
+    treeNodes,
+    ...(options.includeTreeDigest === true ? { rollbackDiagnostics } : {}),
+    ...(options.includeTreeDigest === true ? { treeDigest: digestOpenLoopNode(root) } : {}),
+    candidateResults: summarizeRootRecords(),
+  };
+}
+
 function performanceNow() {
   return globalThis.performance?.now?.() ?? Date.now();
 }
@@ -734,7 +1320,11 @@ function criticalHybridSituation(observation, searchMode = HYBRID_SEARCH_MODES.P
   // 成对根 PIMC 的价值在“公开信息已足够收缩、但还来得及争牌权”的中残局。
   // 仅对显式根模式放宽一档；原 PIMC 的触发范围不变，避免把较短的
   // 基线 rollout 无证据地扩散到中盘。所有扩展分支仍受同一墙钟/节点预算。
-  const extendedRootCritical = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+  const extendedRootCritical = [
+    HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC,
+    HYBRID_SEARCH_MODES.ISMCTS,
+    HYBRID_SEARCH_MODES.ISMCTS_V3,
+  ].includes(searchMode)
     && (total <= 56
       || observation.hand.length <= 13
       || enemyMin <= 9
@@ -994,11 +1584,19 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   const critical = criticalHybridSituation(observation, searchMode);
   if (!critical.active) {
     return {
-      applied: false, reason: 'not_critical', searchMode, observation, candidateResults: [],
+      applied: false,
+      reason: 'not_critical',
+      searchMode,
+      searchAttempted: false,
+      searchTriggered: false,
+      observation,
+      candidateResults: [],
     };
   }
   const sampling = samplePublicInformationSets(observation, {
-    sampleCount: options.sampleCount,
+    // ISMCTS 在迭代内部逐次重采样；这里仅作一次公开信息可采样预检。
+    sampleCount: [HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3].includes(searchMode)
+      ? 1 : options.sampleCount,
     behaviorAttempts: options.behaviorAttempts,
     seed: options.seed,
   });
@@ -1007,6 +1605,8 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
       applied: false,
       reason: sampling.failure?.reason || 'sampling_failed',
       searchMode,
+      searchAttempted: true,
+      searchTriggered: false,
       observation,
       sampling,
       candidateResults: [],
@@ -1024,7 +1624,9 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   };
   const search = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
     ? runPairedRootPIMCSearch(observation, sampling, candidates, limits, options)
-    : runPIMCSearch(observation, sampling, candidates, limits);
+    : [HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3].includes(searchMode)
+      ? runISMCTSSearch(observation, candidates, limits, { ...options, searchMode })
+      : runPIMCSearch(observation, sampling, candidates, limits);
   const { candidateResults } = search;
   const completeCandidates = candidateResults.filter((item) => item.completedSamples > 0).length;
   const rootMinimumEffectiveVisits = clamp(
@@ -1035,23 +1637,46 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   const requiredPairedWorlds = Math.max(
     2, Math.min(rootMinimumEffectiveVisits, sampling.samples.length),
   );
-  const rootEvidenceSufficient = searchMode !== HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC || (
-    candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
-    && Number(search.pairedWorlds) >= requiredPairedWorlds
+  // v3 的成对单位是 sweep：每次 sweep 覆盖全部根候选，要求至少完成
+  // requiredPairedSweeps 次（与成对 PIMC 的 requiredPairedWorlds 同构）。
+  const requiredPairedSweeps = Math.max(
+    2, Math.min(rootMinimumEffectiveVisits, Number(search.iterationBudget) || 0),
   );
+  const rootEvidenceSufficient = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+    ? candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
+      && Number(search.pairedWorlds) >= requiredPairedWorlds
+    : searchMode === HYBRID_SEARCH_MODES.ISMCTS
+      ? candidateResults.every((item) => (
+        item.visits >= rootMinimumEffectiveVisits
+        && Number(item.availability) >= rootMinimumEffectiveVisits
+      )) && Number(search.sampledWorlds) >= candidates.length * rootMinimumEffectiveVisits
+      : searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3
+        ? candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
+          && Number(search.pairedSweeps) >= requiredPairedSweeps
+        : true;
   const completed = completeCandidates === candidates.length;
   return {
     applied: completed && candidates.length > 1 && rootEvidenceSufficient,
     reason: !completed ? 'budget_exhausted'
       : rootEvidenceSufficient ? 'completed' : 'insufficient_search_evidence',
     searchMode: search.searchMode,
+    searchAttempted: true,
+    searchTriggered: Number(search.iterations) > 0 || nodes.value > 0,
     iterations: search.iterations,
     iterationBudget: search.iterationBudget || null,
     pairedWorlds: search.pairedWorlds || 0,
-    minimumEffectiveVisits: searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
+    pairedSweeps: search.pairedSweeps || 0,
+    sampledWorlds: search.sampledWorlds || 0,
+    sampleFailures: search.sampleFailures || {},
+    treeNodes: search.treeNodes || 0,
+    rollbackDiagnostics: search.rollbackDiagnostics || [],
+    treeDigest: search.treeDigest || null,
+    minimumEffectiveVisits: [HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC, HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3].includes(searchMode)
       ? rootMinimumEffectiveVisits : null,
     requiredPairedWorlds: searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
       ? requiredPairedWorlds : null,
+    requiredPairedSweeps: searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3
+      ? requiredPairedSweeps : null,
     observation,
     sampling,
     critical,
@@ -1061,7 +1686,8 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
 }
 
 function rootRerankConfidence(informationSet, proposedCandidateId, localCandidateId, options = {}) {
-  if (informationSet?.searchMode !== HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC) {
+  if (![HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC, HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3]
+    .includes(informationSet?.searchMode)) {
     return { required: false, allowed: true, reason: 'not_root_search' };
   }
   if (proposedCandidateId === localCandidateId) {
@@ -1113,7 +1739,11 @@ function rootRerankConfidence(informationSet, proposedCandidateId, localCandidat
   return {
     required: true,
     allowed,
-    reason: allowed ? 'confidence_margin_met' : 'confidence_margin_insufficient',
+    reason: allowed
+      ? [HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3]
+        .includes(informationSet.searchMode)
+        ? 'ismcts_confidence_margin_met' : 'confidence_margin_met'
+      : 'confidence_margin_insufficient',
     minimumEffectiveVisits,
     confidenceZ,
     minimumUtilityGap,
@@ -1126,6 +1756,22 @@ function rootRerankConfidence(informationSet, proposedCandidateId, localCandidat
     proposedLowerBound,
     localUpperBound,
     confidenceGap,
+  };
+}
+
+// 盲评场景用的紧凑选项描述：只含渲染一手候选所需的公开字段。
+function compactScenarioOption(candidate) {
+  if (!candidate) return null;
+  return {
+    id: candidate.id,
+    action: candidate.action === 'pass' ? 'pass' : 'play',
+    cards: candidateCards(candidate).map((card) => ({
+      rank: Number(card.rank),
+      suit: String(card.suit || ''),
+      deckIndex: card.deckIndex != null && Number.isFinite(Number(card.deckIndex))
+        ? Number(card.deckIndex) : null,
+    })),
+    signature: candidate.signature || (candidate.hand ? handSignature(candidate.hand) : null),
   };
 }
 
@@ -1145,6 +1791,28 @@ function decisionFromCandidate(candidate, observation) {
     hand: declared,
     signature: handSignature(declared),
     projectedTricks: candidate.projectedTricks ?? null,
+  };
+}
+
+// An ablation must execute the exact expert decision object, not reconstruct a
+// semantically similar candidate.  Reconstruction is necessary for compact
+// remote candidates, but it can change a wildcard declaration or card object
+// representation and would invalidate a force-expert control arm.
+function decisionFromConsultation(consultation) {
+  if (!consultation || !consultation.action) return null;
+  if (consultation.action === 'pass') {
+    return {
+      action: 'pass',
+      projectedTricks: consultation.projectedTricks ?? null,
+    };
+  }
+  if (!consultation.cards || !consultation.hand) return null;
+  return {
+    action: 'play',
+    cards: consultation.cards,
+    hand: consultation.hand,
+    signature: consultation.signature || handSignature(consultation.hand),
+    projectedTricks: consultation.projectedTricks ?? null,
   };
 }
 
@@ -1172,6 +1840,9 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
         applied: false,
         reason,
         searchMode: normalizeSearchMode(options.searchMode),
+        searchAttempted: false,
+        searchTriggered: false,
+        fallbackKind: 'expert_safety_fallback',
         iterations: 0,
         localCandidateId: consultation?.localCandidateId || null,
         finalCandidateId: consultation?.localCandidateId || null,
@@ -1180,7 +1851,14 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
         ...extra,
       },
     } : null,
-    telemetry: { applied: false, reason, ...extra },
+    telemetry: {
+      applied: false,
+      reason,
+      searchAttempted: false,
+      searchTriggered: false,
+      fallbackKind: 'expert_safety_fallback',
+      ...extra,
+    },
   });
 
   if (!consultation || !localCandidate) return fallback('missing_local_candidate');
@@ -1251,6 +1929,9 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     return fallback(informationSet.reason || 'no_enhancement_evidence', {
       samples: informationSet.sampling?.sampleCount || 0,
       nodes: informationSet.nodes || 0,
+      searchAttempted: informationSet.searchAttempted === true,
+      searchTriggered: informationSet.searchTriggered === true,
+      fallbackKind: 'search_evidence_insufficient',
     });
   }
 
@@ -1277,19 +1958,31 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     consultation.localCandidateId,
     options,
   );
+  // 消融臂（-fxe 评测变体）：搜索与门禁照常执行并写入遥测，但最终选择强制
+  // 保持专家首选；同一确定性种子下与正常臂的配对差值即“改选”的净贡献。
+  const forceExpert = options.forceExpertChoice === true;
+  const wouldChange = rerankGate.allowed
+    && proposed.candidate.id !== consultation.localCandidateId;
   let selected = proposed;
-  if (!rerankGate.allowed) {
+  if (forceExpert || !rerankGate.allowed) {
     selected = scores.find((item) => item.candidate.id === consultation.localCandidateId) || proposed;
   }
-  const decision = decisionFromCandidate(selected.candidate, observation);
+  const decision = forceExpert
+    ? decisionFromConsultation(consultation)
+    : decisionFromCandidate(selected.candidate, observation);
   if (!decision) {
     return fallback('selected_candidate_invalid', {
       samples: informationSet.sampling?.sampleCount || 0,
       nodes: informationSet.nodes || 0,
+      searchAttempted: informationSet.searchAttempted === true,
+      searchTriggered: informationSet.searchTriggered === true,
+      fallbackKind: 'selected_candidate_invalid',
     });
   }
   const changed = selected.candidate.id !== consultation.localCandidateId;
-  decision.reason = !rerankGate.allowed
+  decision.reason = forceExpert && wouldChange
+    ? '搜索提议改选，消融臂强制保持专家首选'
+    : !rerankGate.allowed
     ? '信息集搜索证据不足，保持专家首选'
     : changed
     ? `混合决策：专家安全候选经${model ? '专用价值模型与' : ''}公平信息集模拟后改选`
@@ -1302,15 +1995,36 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     proposedCandidateId: proposed.candidate.id,
     finalCandidateId: selected.candidate.id,
     changedDecision: changed,
+    forceExpertChoice: forceExpert,
+    wouldChangeDecision: wouldChange,
+    // 改选分歧载荷（仅 when wouldChange）：专家首选与搜索提议的完整选项描述，
+    // 供 --hybrid-scenario-log 生成真人盲评题目；正常决策不携带，遥测体积不变。
+    divergence: wouldChange ? {
+      expert: compactScenarioOption(
+        scores.find((item) => item.candidate.id === consultation.localCandidateId)?.candidate
+          || localCandidate,
+      ),
+      proposed: compactScenarioOption(proposed.candidate),
+    } : null,
     searchMode: informationSet.searchMode || HYBRID_SEARCH_MODES.PIMC,
     iterations: informationSet.iterations || 0,
     iterationBudget: informationSet.iterationBudget || null,
     pairedWorlds: informationSet.pairedWorlds || 0,
+    pairedSweeps: informationSet.pairedSweeps || 0,
+    sampledWorlds: informationSet.sampledWorlds || 0,
+    treeNodes: informationSet.treeNodes || 0,
+    sampleFailures: informationSet.sampleFailures || {},
     minimumEffectiveVisits: informationSet.minimumEffectiveVisits || null,
     requiredPairedWorlds: informationSet.requiredPairedWorlds || null,
+    requiredPairedSweeps: informationSet.requiredPairedSweeps || null,
     rerankGate,
     samples: informationSet.sampling?.sampleCount || 0,
     nodes: informationSet.nodes || 0,
+    searchAttempted: informationSet.searchAttempted === true,
+    searchTriggered: informationSet.searchTriggered === true,
+    fallbackKind: forceExpert
+      ? 'force_expert_choice'
+      : !informationSet.applied ? 'search_evidence_insufficient' : null,
     model: model
       ? { configured: true, modelId: model.id || 'inline-model', schema: model.schema }
       : getHybridValueModelStatus(),
@@ -1324,6 +2038,7 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
       completedSamples: item.rolloutResult?.completedSamples || 0,
       attempts: item.rolloutResult?.attempts || 0,
       visits: item.rolloutResult?.visits || 0,
+      availability: item.rolloutResult?.availability || null,
       standardError: Number.isFinite(item.rolloutResult?.standardError)
         ? Math.round(item.rolloutResult.standardError * 1000) / 1000 : null,
       failures: item.rolloutResult?.failures || {},

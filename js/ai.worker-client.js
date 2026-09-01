@@ -54,6 +54,25 @@ function cloneModelConfig(model) {
   return JSON.parse(JSON.stringify(model));
 }
 
+function workerFallbackKind(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return error?.name === 'TimeoutError' || error?.code === 'timeout'
+    || message.includes('timeout') || message.includes('超时')
+    ? 'local_timeout' : 'local_decision_error';
+}
+
+function chooseWithWorkerFallback(observation, error) {
+  const decision = chooseAIPlay(observation);
+  if (!decision || typeof decision !== 'object') return decision;
+  // Keep the existing decision shape for callers, while exposing the fact
+  // that a Worker request failed so game.js can retain an auditable fallback
+  // classification instead of treating this as a clean no-search turn.
+  return {
+    ...decision,
+    localFallbackKind: workerFallbackKind(error),
+  };
+}
+
 function createWorker() {
   try {
     const url = new URL('./ai.worker.js', import.meta.url);
@@ -97,7 +116,7 @@ export function requestAIDecision(ctx, options = {}) {
       reject,
       timer: null,
       worker: activeWorker,
-      onWorkerFailure: () => resolve(chooseAIPlay(observation)),
+      onWorkerFailure: (error) => resolve(chooseWithWorkerFallback(observation, error)),
     };
     pending.set(id, waiter);
     if (timeoutMs > 0) {

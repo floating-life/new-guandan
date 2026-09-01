@@ -63,8 +63,9 @@ function rankHeadLabel(key, level) {
 }
 
 function localEngineLabel(engine) {
-  if (engine === 'ismcts') return '成对根 PIMC（实验）';
-  if (engine === 'hybrid') return '混合搜索（实验）';
+  if (engine === 'root-pimc-v1' || engine === 'ismcts') return '成对根 PIMC（实验）';
+  if (engine === 'ismcts-v2') return 'ISMCTS v2（实验）';
+  if (engine === 'pimc-v1' || engine === 'hybrid') return 'PIMC（实验）';
   return '专家策略';
 }
 
@@ -368,6 +369,7 @@ function renderTop() {
   const s = state.settings || loadSettings();
   const d = $('#selDifficulty');
   const localEngine = $('#selLocalEngine');
+  const opponentModel = $('#selOpponentModel');
   const sp = $('#selSpeed');
   const c = $('#chkCoach');
   const large = $('#chkLargeText');
@@ -388,6 +390,9 @@ function renderTop() {
     }
   }
   if (sp && sp.value !== s.aiSpeed) sp.value = s.aiSpeed || 'normal';
+  if (opponentModel && opponentModel.value !== (s.opponentModelMode || 'adaptive')) {
+    opponentModel.value = s.opponentModelMode || 'adaptive';
+  }
   if (llmMode && llmMode.value !== (s.llmPolicyMode || LLM_POLICY_MODE.LOCAL)) {
     llmMode.value = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
   }
@@ -1200,8 +1205,8 @@ function openStats() {
     ? Object.entries(s.mistakeCounts).sort((a, b) => b[1] - a[1]).slice(0, 6)
       .map(([k, v]) => `<li>${escapeHtml(mistakeLabels[k] || k)}：${v} 次</li>`).join('')
     : '<li>暂无明确失误记录</li>'}</ul>
-    <h4>适应性对手模型</h4>
-    <p>已从 <strong>${Number(s.opponentModel?.decisions) || 0}</strong> 次你的公开行动中学习领牌类型、应手/过牌、实际用炸和相对座次；仅在大师 AI 领出时作有上限的小幅排序，不读取你的暗牌，也不会把过牌当成“手里有炸”。</p>
+    <h4>本机对手画像 v3</h4>
+    <p>模式：<strong>${escapeHtml({ off: '关闭', observe: '仅观察', adaptive: '自适应' }[state.settings?.opponentModelMode || 'adaptive'])}</strong> · 已观察 <strong>${Number(s.opponentModel?.roundsObserved) || 0}</strong> 副、有效公开决策 <strong>${Math.round(Number(s.opponentModel?.decisions) || 0)}</strong> 次。只学习公开领牌、应手/过牌、牌型、实际用炸、残局压力和相对座次；证据按 100 副半衰期衰减。观察模式不影响决策；自适应模式只在专家安全候选内作小幅调整，不读取暗牌，也不会把过牌当成“手里有炸”。画像随统计数据本机保存，可用“导出数据”备份或“清空统计”删除。</p>
     <h4>最近趋势</h4>
     <ul>${recent.length ? recent.map((item) => `<li>${new Date(item.time).toLocaleString('zh-CN')} · ${escapeHtml(AI_DIFFICULTY_LABEL[item.difficulty] || item.difficulty)} · 综合 ${item.avg || '--'} · 无辅助 ${item.unassistedAvg ?? '--'}</li>`).join('') : '<li>暂无趋势数据</li>'}</ul>
     <p style="margin-top:12px;font-size:0.8rem;color:var(--muted)">数据仅保存在本机浏览器，可使用“导出数据”备份。</p>
@@ -1255,17 +1260,23 @@ function openReplay(preferId) {
     </div>`;
     if (current) {
       const ev = current.evaluation;
+      const search = current.decisionMeta?.hybrid || null;
+      const isPairedRoot = ['paired-root-pimc-v1', 'ismcts-root-v1'].includes(search?.searchMode);
+      const isIsmcts = search?.searchMode === 'ismcts-v2';
+      const searchLabel = isIsmcts ? 'ISMCTS v2' : (isPairedRoot ? '成对根 PIMC' : '混合搜索');
+      const searchDetail = isIsmcts
+        ? ` · ${Number(search?.iterations) || 0} 次迭代 / ${Number(search?.sampledWorlds) || 0} 个重采样世界 / ${Number(search?.treeNodes) || 0} 个树节点`
+        : (isPairedRoot ? ` · ${Number(search?.iterations) || 0} 次成对 rollout` : '');
       html += `<div class="replay-current">
         <strong>第 ${current.trickNumber || '-'} 圈 · ${escapeHtml(current.text)}</strong>
         ${current.countsAfter ? `<p>剩余张数：你 ${current.countsAfter[0]} / 下家 ${current.countsAfter[1]} / 对家 ${current.countsAfter[2]} / 上家 ${current.countsAfter[3]}</p>` : ''}
         ${current.decisionMeta?.reason ? `<p>AI 思路：${escapeHtml(current.decisionMeta.reason)}</p>` : ''}
-        ${current.decisionMeta?.hybrid ? `<p>${['paired-root-pimc-v1', 'ismcts-root-v1'].includes(current.decisionMeta.hybrid.searchMode) ? '成对根 PIMC' : '混合搜索'}：${current.decisionMeta.hybrid.changedDecision
-          ? `改选 ${escapeHtml(current.decisionMeta.hybrid.localCandidateId || '-')} → ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || '-')}`
-          : `保留 ${escapeHtml(current.decisionMeta.hybrid.finalCandidateId || current.decisionMeta.hybrid.localCandidateId || '专家首选')}`}
-          · ${Number(current.decisionMeta.hybrid.samples) || 0} 个可能牌面
-          · ${Number(current.decisionMeta.hybrid.nodes) || 0} 个模拟节点
-          ${['paired-root-pimc-v1', 'ismcts-root-v1'].includes(current.decisionMeta.hybrid.searchMode) ? ` · ${Number(current.decisionMeta.hybrid.iterations) || 0} 次成对 rollout` : ''}
-          · ${escapeHtml(current.decisionMeta.hybrid.reason || '安全回退')}</p>` : ''}
+        ${search ? `<p>${searchLabel}：${search.changedDecision
+          ? `改选 ${escapeHtml(search.localCandidateId || '-')} → ${escapeHtml(search.finalCandidateId || '-')}`
+          : `保留 ${escapeHtml(search.finalCandidateId || search.localCandidateId || '专家首选')}`}
+          · ${Number(search.samples) || 0} 个可能牌面
+          · ${Number(search.nodes) || 0} 个模拟节点${searchDetail}
+          · ${escapeHtml(search.reason || '安全回退')}</p>` : ''}
         ${ev ? `<p>你的评价：<strong>${ev.score} · ${escapeHtml(ev.grade)}</strong>${ev.assisted ? '<span class="assist-badge">使用辅助</span>' : ''}${ev.forced ? '<span class="assist-badge">被迫操作</span>' : ''}</p>
           <ul>${(ev.tips || []).map((tip) => `<li>${escapeHtml(tip)}</li>`).join('')}</ul>` : ''}
       </div>`;
@@ -1480,23 +1491,37 @@ function setupChrome() {
     applySettings(state, { difficulty: e.target.value });
     const label = e.target.options[e.target.selectedIndex].text;
     const engine = state.settings?.localAiEngine || 'expert';
-    flash(e.target.value !== 'master' && ['hybrid', 'ismcts'].includes(engine)
+    flash(e.target.value !== 'master' && ['pimc-v1', 'root-pimc-v1', 'ismcts-v2'].includes(engine)
       ? `AI 难度：${label}；实验搜索仅在大师难度运行，当前已暂停`
       : `AI 难度：${label}`);
   };
   $('#selLocalEngine').onchange = (e) => {
-    const engine = ['hybrid', 'ismcts'].includes(e.target.value) ? e.target.value : 'expert';
+    const engine = ['pimc-v1', 'root-pimc-v1', 'ismcts-v2'].includes(e.target.value)
+      ? e.target.value : 'expert';
     applySettings(state, { localAiEngine: engine });
     const master = (state.settings?.difficulty || 'normal') === 'master';
-    flash(engine === 'ismcts'
+    flash(engine === 'ismcts-v2'
+      ? (master
+        ? 'ISMCTS v2 已启用：每次迭代重新采样公开信息世界，在开放环树中搜索；超时或证据不足自动回退专家策略'
+        : 'ISMCTS v2 仅在大师难度运行，当前难度不会启用')
+      : engine === 'root-pimc-v1'
       ? (master
         ? '成对根 PIMC 已启用：大师关键局面在同一公开牌面池覆盖安全候选，证据不足自动回退专家策略'
         : '成对根 PIMC 仅在大师难度运行，当前难度不会启用')
-      : engine === 'hybrid'
+      : engine === 'pimc-v1'
         ? (master
-          ? '混合搜索已启用：大师关键残局进行公平信息集模拟，异常自动回退专家策略'
-          : '混合搜索仅在大师难度运行，当前难度不会启用')
+          ? 'PIMC 已启用：大师关键残局进行公平信息集模拟，异常自动回退专家策略'
+          : 'PIMC 仅在大师难度运行，当前难度不会启用')
         : '已切换为稳定专家策略');
+  };
+  $('#selOpponentModel').onchange = (e) => {
+    const mode = ['off', 'observe', 'adaptive'].includes(e.target.value) ? e.target.value : 'adaptive';
+    applySettings(state, { opponentModelMode: mode });
+    flash(mode === 'off'
+      ? '对手画像已关闭：不累积也不影响决策'
+      : mode === 'observe'
+        ? '对手画像仅观察：只累积本机公开行动，不影响 AI 决策'
+        : '对手画像自适应：仅在专家安全候选内使用公开行为的低权重信号');
   };
   $('#selSpeed').onchange = (e) => {
     applySettings(state, { aiSpeed: e.target.value });

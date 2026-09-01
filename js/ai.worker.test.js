@@ -127,6 +127,8 @@ configureAIWorkerValueModel(zeroModel).then((configured) => {
       '任一请求超时会终止阻塞 Worker，避免旧搜索占用后续决策队列');
     assert(decisions.every((item) => item?.action === 'play'),
       '同一阻塞 Worker 上的全部待决请求都会安全回退，不遗留悬空 Promise');
+    assert(decisions.every((item) => item?.localFallbackKind === 'local_timeout'),
+      'Worker 超时回退必须保留 local_timeout 分类，供正式决策遥测入账');
 
     enableFakeBrowserWorker('respond');
     return requestAIDecision(ctx, { timeoutMs: 200 });
@@ -136,7 +138,8 @@ configureAIWorkerValueModel(zeroModel).then((configured) => {
   enableFakeBrowserWorker('error');
   return requestAIDecision(ctx, { timeoutMs: 200 });
 }).then((decision) => {
-  assert(decision?.action === 'play', 'Worker 运行时故障直接回退专家策略而不是误过牌');
+  assert(decision?.action === 'play' && decision?.localFallbackKind === 'local_decision_error',
+    'Worker 运行时故障直接回退专家策略并保留 local_decision_error 分类');
   restoreGlobals();
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

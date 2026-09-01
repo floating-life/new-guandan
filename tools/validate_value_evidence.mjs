@@ -15,9 +15,18 @@ import { modelPayloadSha256 } from '../js/model-fingerprint.js';
 import { normalizeSeedManifest, seedManifestOverlap } from '../js/value-model-gate.js';
 
 function parseArgs(argv) {
-  const options = { model: null, report: null, continuousCheckpoint: null };
+  const options = {
+    model: null,
+    report: null,
+    continuousCheckpoint: null,
+    requireCompleteCheckpoint: false,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
+    if (key === '--require-complete-checkpoint') {
+      options.requireCompleteCheckpoint = true;
+      continue;
+    }
     if (!['--model', '--report', '--continuous-checkpoint'].includes(key)) {
       throw new Error(`未知参数：${key}`);
     }
@@ -29,7 +38,7 @@ function parseArgs(argv) {
     index += 1;
   }
   if (!options.model || !options.report) {
-    throw new Error('用法：node tools/validate_value_evidence.mjs --model 模型.json --report A-B报告.json [--continuous-checkpoint 检查点.json]');
+    throw new Error('用法：node tools/validate_value_evidence.mjs --model 模型.json --report A-B报告.json [--continuous-checkpoint 检查点.json] [--require-complete-checkpoint]');
   }
   return options;
 }
@@ -65,7 +74,7 @@ function auditCheckpoint(file) {
   const config = typeof value.signature === 'string' ? (() => {
     try { return JSON.parse(value.signature); } catch { return null; }
   })() : null;
-  const valid = value?.schema === 'guandan-ai-ab-checkpoint-v1'
+  const valid = ['guandan-ai-ab-checkpoint-v1', 'guandan-ai-ab-checkpoint-v2', 'guandan-ai-ab-checkpoint-v3'].includes(value?.schema)
     && Number.isInteger(value?.nextBlockIndex)
     && Number.isInteger(config?.groupCount)
     && config.groupCount > 0
@@ -150,9 +159,17 @@ function main() {
   }
   const checkpoint = options.continuousCheckpoint ? auditCheckpoint(options.continuousCheckpoint) : null;
   if (checkpoint && !checkpoint.valid) errors.push('continuous_checkpoint_invalid');
+  if (checkpoint && options.requireCompleteCheckpoint && !checkpoint.complete) {
+    errors.push('continuous_checkpoint_incomplete');
+  }
   const reportCompletion = report?.completion || {};
   const output = {
     schema: 'guandan-value-evidence-validation-v1',
+    // `integrityOk` 只说明声明的历史工件可读且内部一致；它不等同于当前
+    // 模型可发布。调用方必须同时检查 releaseCompatible，正式发布则用
+    // validate_release_evidence.mjs 的严格互绑门禁。
+    integrityOk: errors.length === 0,
+    releaseCompatible: canonicalMatch,
     ok: errors.length === 0,
     model: {
       file: modelFile.file,
@@ -181,7 +198,7 @@ function main() {
     errors,
   };
   console.log(JSON.stringify(output, null, 2));
-  if (!output.ok) process.exitCode = 1;
+  if (!output.integrityOk) process.exitCode = 1;
 }
 
 main();

@@ -74,11 +74,15 @@ assert(stats.opponentModel.decisions === 1 && stats.opponentModel.typeStats.sing
 console.log('大师难度设置与统计');
 saveSettings({ ...loadSettings(), difficulty: 'master', localAiEngine: 'hybrid' });
 assert(loadSettings().difficulty === 'master', '大师难度设置可持久化');
-assert(loadSettings().localAiEngine === 'hybrid', '实验性混合决策引擎可由用户显式持久化');
+assert(loadSettings().localAiEngine === 'pimc-v1', '旧 hybrid 设置自动迁移为 PIMC v1');
 saveSettings({ ...loadSettings(), localAiEngine: 'unknown-engine' });
 assert(loadSettings().localAiEngine === 'expert', '未知本地决策引擎安全回退专家策略');
 saveSettings({ ...loadSettings(), localAiEngine: 'ismcts' });
-assert(loadSettings().localAiEngine === 'ismcts', '成对根 PIMC 实验引擎可由用户显式持久化');
+assert(loadSettings().localAiEngine === 'root-pimc-v1', '旧 ismcts 设置自动迁移为成对根 PIMC');
+saveSettings({ ...loadSettings(), localAiEngine: 'ismcts-v2' });
+assert(loadSettings().localAiEngine === 'ismcts-v2', 'ISMCTS v2 可由用户显式持久化');
+saveSettings({ ...loadSettings(), localAiEngine: 'dmc-v1' });
+assert(loadSettings().localAiEngine === 'expert', '旧 DMC 设置迁移为专家策略，不保留虚假执行标签');
 assert(saveLocalValueModel({ id: 'unit-local-model', schema: 'guandan-candidate-v1', layers: [] })
   && loadLocalValueModel()?.id === 'unit-local-model',
  '本地训练模型可独立持久化，不与用户战绩混在同一字段');

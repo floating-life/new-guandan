@@ -5,6 +5,7 @@
 
 import {
   emptyOpponentProfile, normalizeOpponentProfile, observePublicRound,
+  OPPONENT_MODEL_MODES,
 } from './opponent-model.js';
 
 const KEY = 'guandan_skill_stats_v1';
@@ -12,6 +13,20 @@ const SETTINGS_KEY = 'guandan_settings_v1';
 const REPLAY_KEY = 'guandan_replays_v1';
 const ACTIVE_MATCH_KEY = 'guandan_active_match_v2';
 const VALUE_MODEL_KEY = 'guandan_value_model_v1';
+const LOCAL_ENGINE_MIGRATIONS = Object.freeze({
+  hybrid: 'pimc-v1',
+  ismcts: 'root-pimc-v1',
+  'ismcts-v1': 'root-pimc-v1',
+});
+const LOCAL_ENGINES = new Set([
+  'expert', 'pimc-v1', 'root-pimc-v1', 'ismcts-v2',
+]);
+
+export function normalizeLocalAiEngine(value) {
+  const normalized = LOCAL_ENGINE_MIGRATIONS[String(value || '').toLowerCase()]
+    || String(value || '').toLowerCase();
+  return LOCAL_ENGINES.has(normalized) ? normalized : 'expert';
+}
 const DATA_VERSION = 2;
 const REPLAY_LIMIT = 100;
 
@@ -27,7 +42,6 @@ function storage() {
     removeItem: (k) => { memoryStore.delete(k); },
   };
 }
-
 function safeSet(key, value) {
   try {
     storage().setItem(key, JSON.stringify(value));
@@ -153,6 +167,7 @@ export function recordRoundResult({
   llmReport = null,
   publicHistory = null,
   userSeat = 0,
+  opponentModelMode = 'adaptive',
 }) {
   const s = loadStats();
   s.totalRounds += 1;
@@ -234,7 +249,7 @@ export function recordRoundResult({
   s.llm = llm;
 
   // 画像只从本副已经公开的逐手历史生成；回放暗牌、起手牌、教练评价均不参与。
-  if (Array.isArray(publicHistory) && publicHistory.length) {
+  if (opponentModelMode !== 'off' && Array.isArray(publicHistory) && publicHistory.length) {
     s.opponentModel = observePublicRound(s.opponentModel, publicHistory, { userSeat });
   } else {
     s.opponentModel = normalizeOpponentProfile(s.opponentModel);
@@ -275,7 +290,14 @@ export function sanitizeUserSettings(settings) {
     aiDecisionEngineBySeat,
     ...rest
   } = settings;
-  return rest;
+  return {
+    ...rest,
+    ...(Object.prototype.hasOwnProperty.call(rest, 'localAiEngine')
+      ? { localAiEngine: normalizeLocalAiEngine(rest.localAiEngine) } : {}),
+    ...(Object.prototype.hasOwnProperty.call(rest, 'opponentModelMode')
+      ? { opponentModelMode: OPPONENT_MODEL_MODES.includes(rest.opponentModelMode)
+        ? rest.opponentModelMode : 'adaptive' } : {}),
+  };
 }
 
 export function loadSettings() {
@@ -284,6 +306,7 @@ export function loadSettings() {
     aiSpeed: 'normal',
     llmPolicyMode: 'local',
     localAiEngine: 'expert',
+    opponentModelMode: 'adaptive',
     coachMode: false,
     autoHint: false,
     reducedMotion: false,
@@ -293,7 +316,10 @@ export function loadSettings() {
     const raw = storage().getItem(SETTINGS_KEY);
     const parsed = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
     if (!['local', 'auto', 'cloud'].includes(parsed.llmPolicyMode)) parsed.llmPolicyMode = 'local';
-    if (!['expert', 'hybrid', 'ismcts'].includes(parsed.localAiEngine)) parsed.localAiEngine = 'expert';
+    parsed.localAiEngine = normalizeLocalAiEngine(parsed.localAiEngine);
+    if (!OPPONENT_MODEL_MODES.includes(parsed.opponentModelMode)) {
+      parsed.opponentModelMode = 'adaptive';
+    }
     return parsed;
   } catch {
     return defaults;

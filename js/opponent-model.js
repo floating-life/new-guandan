@@ -7,11 +7,13 @@
  */
 
 export const OPPONENT_MODEL_SCHEMA = 'guandan-opponent-v1';
-// v2 在不改变 schema 名称的前提下增加：实际应手牌型、普通牌遭遇炸弹的
-// 公开频率，以及真人面对不同相对座位时的应手统计。normalize 会把 v1
-// 画像逐字段迁移，因此旧 localStorage 数据不会丢失。
-export const OPPONENT_MODEL_VERSION = 2;
+// v3 在不改变 schema 名称的前提下增加每 100 副半衰期的证据衰减、实际
+// 观察副数和模式契约。保留 v1/v2 的领出、应手、牌型、实际用炸、残局压力
+// 和相对座次统计；normalize 会逐字段迁移旧 localStorage 数据。
+export const OPPONENT_MODEL_VERSION = 3;
 export const OPPONENT_MODEL_MIN_SAMPLES = 12;
+export const OPPONENT_MODEL_HALF_LIFE_ROUNDS = 100;
+export const OPPONENT_MODEL_MODES = Object.freeze(['off', 'observe', 'adaptive']);
 
 const TYPES = Object.freeze([
   'single', 'pair', 'triple', 'fullhouse', 'straight', 'triple_pair', 'plate',
@@ -71,7 +73,9 @@ export function emptyOpponentProfile() {
     schema: OPPONENT_MODEL_SCHEMA,
     version: OPPONENT_MODEL_VERSION,
     userSeat: 0,
+    halfLifeRounds: OPPONENT_MODEL_HALF_LIFE_ROUNDS,
     rounds: 0,
+    roundsObserved: 0,
     decisions: 0,
     leads: 0,
     responses: 0,
@@ -87,7 +91,7 @@ export function emptyOpponentProfile() {
 }
 
 function boundedCount(value) {
-  return Math.max(0, Math.min(1000000, Math.floor(Number(value) || 0)));
+  return Math.max(0, Math.min(1000000, Number(value) || 0));
 }
 
 function normalizeCounts(raw) {
@@ -162,7 +166,10 @@ export function normalizeOpponentProfile(raw) {
     version: OPPONENT_MODEL_VERSION,
     userSeat: Number.isInteger(Number(raw.userSeat))
       && Number(raw.userSeat) >= 0 && Number(raw.userSeat) < 4 ? Number(raw.userSeat) : 0,
+    halfLifeRounds: OPPONENT_MODEL_HALF_LIFE_ROUNDS,
     rounds: boundedCount(raw.rounds),
+    // 老版本没有物理观察副数；以旧的累计 rounds 作为可解释的迁移下界。
+    roundsObserved: boundedCount(raw.roundsObserved ?? raw.rounds),
     decisions: boundedCount(raw.decisions),
     leads: boundedCount(raw.leads),
     responses: boundedCount(raw.responses),
@@ -208,6 +215,31 @@ function cloneProfile(profile) {
   return normalizeOpponentProfile(profile);
 }
 
+function decayCounts(counts, factor) {
+  counts.play *= factor;
+  counts.pass *= factor;
+}
+
+/** 对一副新公开牌局开始前衰减旧证据。只衰减统计值，不触及用户座位或元数据。 */
+function decayProfile(profile) {
+  const factor = 2 ** (-1 / OPPONENT_MODEL_HALF_LIFE_ROUNDS);
+  for (const key of ['rounds', 'decisions', 'leads', 'responses', 'plays', 'passes']) {
+    profile[key] *= factor;
+  }
+  for (const type of TYPES) {
+    decayCounts(profile.typeStats[type].lead, factor);
+    decayCounts(profile.typeStats[type].response, factor);
+    profile.responseStyles.actualTypes[type] *= factor;
+    const style = profile.responseStyles.byTarget[type];
+    for (const key of ['plays', 'passes', 'bombPlays', 'nonBombPlays']) style[key] *= factor;
+  }
+  for (const bucket of PRESSURE_BUCKETS) decayCounts(profile.pressure[bucket], factor);
+  for (const position of POSITIONS) {
+    decayCounts(profile.responsePositions[position], factor);
+    for (const type of TYPES) decayCounts(profile.responsePositionTypes[position][type], factor);
+  }
+}
+
 function latestPlayInTrick(history, index, trickNumber) {
   for (let cursor = index - 1; cursor >= 0; cursor--) {
     const item = history[cursor];
@@ -228,6 +260,8 @@ export function observePublicRound(profile, publicHistory, options = {}) {
     ? Number(options.userSeat) : next.userSeat;
   next.userSeat = userSeat;
   if (!Array.isArray(publicHistory) || !publicHistory.length) return next;
+
+  decayProfile(next);
 
   let observed = 0;
   for (let index = 0; index < publicHistory.length; index++) {
@@ -263,7 +297,10 @@ export function observePublicRound(profile, publicHistory, options = {}) {
     next[isLead ? 'leads' : 'responses'] += 1;
     observed += 1;
   }
-  if (observed) next.rounds += 1;
+  if (observed) {
+    next.rounds += 1;
+    next.roundsObserved += 1;
+  }
   next.lastUpdated = new Date().toISOString();
   return next;
 }
@@ -382,6 +419,14 @@ export function opponentPlayAdjustment(profile, ctx = {}, candidate = {}) {
     && profile?.typeStats && profile?.pressure
     && profile?.responsePositions && profile?.responsePositionTypes && profile?.responseStyles
     ? profile : normalizeOpponentProfile(profile);
+  const mode = OPPONENT_MODEL_MODES.includes(ctx?.opponentModelMode)
+    ? ctx.opponentModelMode : 'adaptive';
+  if (mode !== 'adaptive') return {
+    score: 0,
+    applied: false,
+    reason: mode === 'off' ? 'opponent_model_off' : 'opponent_model_observe_only',
+    samples: normalized.decisions,
+  };
   if (normalized.decisions < OPPONENT_MODEL_MIN_SAMPLES
     || candidate.action === 'pass' || !candidate.hand) return {
     score: 0, applied: false, reason: 'insufficient_public_samples', samples: normalized.decisions,
@@ -441,7 +486,14 @@ export function opponentPlayAdjustment(profile, ctx = {}, candidate = {}) {
   const bombAdjustment = bombSignal
     * (sameTeam ? 2.5 : -3) * phaseWeight * positionWeight;
   const rawScore = responseAdjustment + pressureAdjustment + leadAdjustment + bombAdjustment;
-  const score = Math.max(-12, Math.min(12, rawScore));
+  // 冷启动、低样本或长时间未复现的习惯都自动降低影响；不以旧画像压过
+  // 当前专家安全候选。100 副半衰期已体现在有效样本，置信系数再避免刚越过
+  // 最小阈值就给满幅偏置。
+  const confidence = 0.35 + 0.65 * Math.max(0, Math.min(1,
+    (normalized.decisions - OPPONENT_MODEL_MIN_SAMPLES)
+      / Math.max(1, OPPONENT_MODEL_MIN_SAMPLES * 3),
+  ));
+  const score = Math.max(-12, Math.min(12, rawScore * confidence));
   const evidence = responseEvidence || Math.abs(leadAdjustment) > 0.01
     || Math.abs(bombAdjustment) > 0.01;
   return {
@@ -450,6 +502,8 @@ export function opponentPlayAdjustment(profile, ctx = {}, candidate = {}) {
     reason: !evidence ? 'type_samples_low'
       : sameTeam ? 'human_handoff_preference' : 'human_pass_preference',
     samples: normalized.decisions,
+    roundsObserved: normalized.roundsObserved,
+    confidence,
     typeSamples: samples,
     positionTypeSamples,
     type,

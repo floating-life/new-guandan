@@ -11,7 +11,6 @@ function finiteNumber(value, fallback = null) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
-
 function seatNumber(value, fallback = null) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 && parsed < 4 ? parsed : fallback;
@@ -141,8 +140,12 @@ export function createPublicAIObservation(ctx = {}) {
     policyFeatures: scalarMap(ctx.policyFeatures, 'boolean'),
     policyThresholds: scalarMap(ctx.policyThresholds, 'number'),
     opponentModel: normalizeOpponentProfile(ctx.opponentModel),
+    opponentModelMode: ['off', 'observe', 'adaptive'].includes(ctx.opponentModelMode)
+      ? ctx.opponentModelMode : 'adaptive',
     leadAfterOwnBomb: ctx.leadAfterOwnBomb === true,
-    decisionEngine: ['hybrid', 'ismcts'].includes(ctx.decisionEngine)
+    decisionEngine: ['hybrid', 'pimc-v1', 'ismcts', 'root-pimc-v1', 'ismcts-v2', 'ismcts-v3',
+      'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe']
+      .includes(ctx.decisionEngine)
       ? ctx.decisionEngine : 'expert',
   };
 }

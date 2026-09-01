@@ -38,8 +38,17 @@
           本地引擎
           <select id="selLocalEngine" aria-label="本地AI决策引擎">
             <option value="expert" selected>专家策略</option>
-            <option value="hybrid">混合搜索（实验）</option>
-            <option value="ismcts">成对根 PIMC（实验）</option>
+            <option value="pimc-v1">PIMC（实验）</option>
+            <option value="root-pimc-v1">成对根 PIMC（实验）</option>
+            <option value="ismcts-v2">ISMCTS v2（实验）</option>
+          </select>
+        </label>
+        <label class="setting-inline" title="只使用本机公开行动；观察模式不影响决策，适应模式只在专家安全候选内作软调整">
+          对手画像
+          <select id="selOpponentModel" aria-label="对手画像模式">
+            <option value="off">关闭</option>
+            <option value="observe">仅观察</option>
+            <option value="adaptive" selected>自适应</option>
           </select>
         </label>
         <button type="button" class="secondary" id="btnValueModel" title="只加载带完整发布回执且通过500组全级牌未见种子镜像门禁的模型；实验模型仅可离线评测">加载晋级模型</button>

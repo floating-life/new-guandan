@@ -8,6 +8,7 @@ import {
 import {
   HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA,
   HYBRID_SEARCH_MODES,
+  availabilityAwareUctBonus,
   chooseHybridFromConsultation, configureHybridValueModel,
   evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
@@ -48,6 +49,17 @@ function baseContext(deck) {
     deterministic: true,
     decisionEngine: 'hybrid',
   };
+}
+
+console.log('availability-aware UCT');
+{
+  const bonus = availabilityAwareUctBonus(15, 3, 2);
+  const expected = 2 * Math.sqrt(Math.log(16) / 3);
+  assert(Math.abs(bonus - expected) < 1e-12,
+    'UCT 探索项以动作 availability 为分子、动作 visits 为分母');
+  assert(availabilityAwareUctBonus(30, 3, 2) > bonus
+    && availabilityAwareUctBonus(15, 6, 2) < bonus,
+  'availability 增加会提高探索项，而同一动作访问增加会降低探索项');
 }
 
 console.log('公平观察白名单');
@@ -195,6 +207,9 @@ console.log('关键残局混合重排与安全回退');
     '关键残局返回合法混合决策及逐候选遥测');
   assert(result.decision.hybrid.samples === 3 && result.decision.hybrid.nodes > 0,
     '信息集采样与受限终局模拟实际执行而非只打标签');
+  assert(result.decision.hybrid.searchAttempted === true
+    && result.decision.hybrid.searchTriggered === true,
+  '实际执行的信息集搜索必须写入显式搜索状态');
 
   const hard = chooseHybridFromConsultation(observation, {
     ...consultation,
@@ -202,7 +217,10 @@ console.log('关键残局混合重排与安全回退');
     cloudConstraint: 'finish_now',
   });
   assert(hard.decision?.hybrid?.applied === false
-    && hard.decision.hybrid.reason === 'hard_constraint_or_single_candidate',
+    && hard.decision.hybrid.reason === 'hard_constraint_or_single_candidate'
+    && hard.decision.hybrid.searchAttempted === false
+    && hard.decision.hybrid.searchTriggered === false
+    && hard.decision.hybrid.fallbackKind === 'expert_safety_fallback',
   '本地硬约束或单一候选时不允许模型/模拟绕过安全策略');
 
   const passCandidate = { id: 'pass', action: 'pass', cards: [], hand: null, signature: null };
@@ -285,7 +303,9 @@ console.log('成对根 PIMC 公平根动作覆盖');
   });
   assert(!thinEvidence.applied && thinEvidence.reason === 'insufficient_search_evidence'
     && thinEvidence.pairedWorlds === 1
-    && thinEvidence.candidateResults.every((item) => item.attempts === 1),
+    && thinEvidence.candidateResults.every((item) => item.attempts === 1)
+    && thinEvidence.searchAttempted === true
+    && thinEvidence.searchTriggered === true,
   '只有单个成对世界时保留搜索遥测，但不允许作为改选证据');
   const oneWorldPimc = evaluateInformationSetCandidates(context, candidates, {
     searchMode: 'pimc-v1', sampleCount: 1, behaviorAttempts: 1,
@@ -316,6 +336,256 @@ console.log('成对根 PIMC 公平根动作覆盖');
   assert(pimcMid.reason === 'not_critical' && rootMid.critical.scope === 'root_extended'
     && rootMid.applied,
   '中残局扩展范围只对显式成对根 PIMC 生效，原 PIMC 触发边界保持不变');
+}
+
+console.log('ISMCTS v2 开放环信息集树');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `tree_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v2', hands: [['hidden-state'], ['never-read']],
+  };
+  const options = {
+    searchMode: 'ismcts-v2', behaviorAttempts: 1, iterationBudget: 12,
+    minimumEffectiveVisits: 3, maxPlies: 48, nodeBudget: 1000, seed: 20260828,
+  };
+  const first = evaluateInformationSetCandidates(context, candidates, options);
+  const second = evaluateInformationSetCandidates({
+    ...context, hands: [['different-hidden-state'], ['also-never-read']],
+  }, candidates, options);
+  assert(first.applied && first.searchMode === HYBRID_SEARCH_MODES.ISMCTS,
+    'ISMCTS v2 在关键局面完成开放环信息集搜索');
+  assert(first.iterations === 12 && first.sampledWorlds === 12 && first.treeNodes > 2,
+    '每个 ISMCTS iteration 都重新采样世界，并产生非根树节点');
+  assert(first.candidateResults.every((item) => (
+    item.availability === 12 && item.visits >= 3 && item.completedSamples === item.visits
+  )), 'UCT 根候选记录可用次数、真实访问数与 rollout 结果，不伪造覆盖');
+  assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults),
+    'ISMCTS v2 固定公开输入和种子时可复现，误传暗牌字段不影响结果');
+}
+
+console.log('ISMCTS v3 根候选成对采样');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `sweep_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3', hands: [['hidden-state'], ['never-read']],
+  };
+  const options = {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 12,
+    minimumEffectiveVisits: 3, maxPlies: 48, nodeBudget: 1000, seed: 20260829,
+  };
+  const first = evaluateInformationSetCandidates(context, candidates, options);
+  const second = evaluateInformationSetCandidates({
+    ...context, hands: [['different-hidden-state'], ['also-never-read']],
+  }, candidates, options);
+  assert(first.applied && first.searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3,
+    'ISMCTS v3 在关键局面完成根候选成对采样搜索');
+  assert(first.pairedSweeps === 6 && first.sampledWorlds === 6
+    && first.iterations === 6 * candidates.length && first.treeNodes > 2,
+  'iterationBudget 与 v2 同口径按 rollout 总预算换算 sweep 数，每次 sweep 对每个根候选各下钻一次');
+  assert(first.candidateResults.every((item) => (
+    item.visits === first.pairedSweeps
+    && item.availability === first.pairedSweeps
+    && item.completedSamples === item.visits
+  )), 'v3 根候选严格成对：visits 与 availability 恒等于成功 sweep 数');
+  assert(first.requiredPairedSweeps === 3 && first.pairedWorlds === 0,
+    'v3 证据门槛按成对 sweep 数判定，不复用成对 PIMC 的世界口径');
+  assert(JSON.stringify(first.candidateResults) === JSON.stringify(second.candidateResults)
+    && first.pairedSweeps === second.pairedSweeps,
+  'ISMCTS v3 固定公开输入和种子时可复现，误传暗牌字段不影响结果');
+
+  const tinyBudget = evaluateInformationSetCandidates(context, candidates, {
+    ...options, iterationBudget: 36, nodeBudget: 100,
+  });
+  assert(tinyBudget.pairedSweeps < 18,
+    '保守预算估计在节点预算耗尽前停止启动新 sweep，不会用完全部 18 次 sweep 配额');
+  assert(tinyBudget.candidateResults.every((item) => (
+    item.visits === tinyBudget.pairedSweeps
+    && item.availability === tinyBudget.pairedSweeps
+  )), '预算受限下根候选仍严格成对，不留半成对状态');
+  const tinyRepeat = evaluateInformationSetCandidates(context, candidates, {
+    ...options, iterationBudget: 36, nodeBudget: 100,
+  });
+  assert(tinyRepeat.pairedSweeps === tinyBudget.pairedSweeps
+    && JSON.stringify(tinyRepeat.candidateResults) === JSON.stringify(tinyBudget.candidateResults),
+  '保守启动估计是确定性的：同种子同输入下停止点逐字节一致');
+
+  const tooFewSweeps = evaluateInformationSetCandidates(context, candidates, {
+    ...options, iterationBudget: 1,
+  });
+  assert(!tooFewSweeps.applied && tooFewSweeps.reason === 'insufficient_search_evidence'
+    && tooFewSweeps.pairedSweeps === 1
+    && tooFewSweeps.candidateResults.every((item) => item.visits === 1),
+  '成对 sweep 数不足时保留搜索遥测，但不允许作为改选证据');
+}
+
+console.log('ISMCTS v3 失败 sweep 深层事务回滚');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const validHand = parseHand([own[0]], 7);
+  // This card is public/absent from the sampled own hand.  It is deliberately
+  // shaped like a legal candidate so the first valid candidate can expand a
+  // deep node before the second candidate makes the sweep fail.
+  const invalidCard = deck[2];
+  const invalidHand = parseHand([invalidCard], 7);
+  const candidates = [
+    {
+      id: 'rollback_valid', action: 'play', cards: [own[0]], hand: validHand,
+      signature: handSignature(validHand), localScore: 10,
+    },
+    {
+      id: 'rollback_invalid', action: 'play', cards: [invalidCard], hand: invalidHand,
+      signature: handSignature(invalidHand), localScore: 9,
+    },
+  ];
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3', hands: [['hidden-state'], ['never-read']],
+  };
+  const result = evaluateInformationSetCandidates(context, candidates, {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 2,
+    minimumEffectiveVisits: 2, maxPlies: 48, nodeBudget: 1000, seed: 20260901,
+  });
+  assert(result.pairedSweeps === 0, '失败 sweep 不得计入成对证据');
+  assert(result.sampleFailures.sweep_outcome_failed === 1,
+    '后置候选失败必须显式计入失败 sweep');
+  assert(result.treeNodes === 1,
+    '后置候选失败后此前候选创建的深层子树必须整棵回滚');
+  assert(result.candidateResults.every((item) => (
+    item.visits === 0 && (item.availability || 0) === 0 && item.completedSamples === 0
+  )), '失败 sweep 不得残留根 visits/availability 或 rollout');
+}
+
+console.log('ISMCTS v3 后置 rollout 失败的深树事务回滚');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `postrollout_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3', hands: [['hidden-state'], ['never-read']],
+  };
+  const result = evaluateInformationSetCandidates(context, candidates, {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 6,
+    minimumEffectiveVisits: 2, maxPlies: 48, nodeBudget: 1000,
+    includeTreeDigest: true, seed: 20260903,
+    testHooks: {
+      forcedOutcome: ({ sweepIndex, offset }) => (
+        sweepIndex === 1 && offset === 1 ? { ok: false, reason: 'test_forced_failure' } : null
+      ),
+    },
+  });
+  const failed = result.rollbackDiagnostics.find((item) => item.kind === 'failed');
+  assert(result.pairedSweeps === 2,
+    '后置 rollout 失败后，之前与之后的成功 sweep 都应保留');
+  assert(result.sampleFailures.sweep_outcome_failed === 1,
+    '后置候选 rollout 失败必须显式计入失败 sweep');
+  assert(failed && failed.reason === 'test_forced_failure',
+    '回滚诊断必须绑定到注入的后置候选失败');
+  assert(failed.snapshotDigest.actions.some((item) => item.child),
+    '失败 sweep 前的快照必须已经包含深层子树');
+  assert(JSON.stringify(failed.mutatedDigest) !== JSON.stringify(failed.snapshotDigest),
+    '后置候选失败前必须确实写入新的深层 availability/子节点状态');
+  assert(JSON.stringify(failed.restoredDigest) === JSON.stringify(failed.snapshotDigest),
+    '后置 rollout 失败后必须恢复整棵深层树');
+  assert(result.treeDigest.actions.every((item) => item.visits === 2
+    && item.availability === 2), '失败 sweep 不得污染最终根证据计数');
+}
+
+console.log('ISMCTS v3 中断 sweep 保留既有深层树');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `interrupt_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3', hands: [['hidden-state'], ['never-read']],
+  };
+  const control = evaluateInformationSetCandidates(context, candidates, {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 2,
+    minimumEffectiveVisits: 2, maxPlies: 16, nodeBudget: 1000,
+    includeTreeDigest: true, seed: 20260902,
+  });
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+  let performanceCalls = 0;
+  Object.defineProperty(globalThis, 'performance', {
+    configurable: true,
+    value: { now: () => { performanceCalls += 1; return performanceCalls <= 27 ? 0 : 100; } },
+  });
+  let interrupted;
+  try {
+    interrupted = evaluateInformationSetCandidates(context, candidates, {
+      searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 4,
+      minimumEffectiveVisits: 2, maxPlies: 16, nodeBudget: 1000,
+      includeTreeDigest: true, deadlineMs: 1, seed: 20260902,
+    });
+  } finally {
+    Object.defineProperty(globalThis, 'performance', performanceDescriptor);
+  }
+  assert(control.pairedSweeps === 1 && control.treeNodes > 1,
+    '控制运行必须先形成一棵带深层节点的成功 sweep');
+  assert(interrupted.pairedSweeps === 1
+    && interrupted.sampleFailures.partial_sweep_discarded === 1,
+  '后续 sweep 中途耗尽预算必须显式丢弃整批');
+  assert(interrupted.treeNodes === control.treeNodes
+    && JSON.stringify(interrupted.treeDigest) === JSON.stringify(control.treeDigest)
+    && JSON.stringify(interrupted.candidateResults) === JSON.stringify(control.candidateResults),
+  '中断回滚后既有深层 availability/子节点/visits/reward 必须与控制树完全一致');
 }
 
 console.log('成对根 PIMC 置信改选门禁');
@@ -383,6 +653,73 @@ console.log('成对根 PIMC 置信改选门禁');
     && result.telemetry.rerankGate.reason === 'confidence_margin_insufficient'
     && result.telemetry.candidates.every((item) => item.visits >= 3),
   '改选门禁同时记录有效访问数、标准误与置信差');
+}
+
+console.log('forceExpertChoice 消融臂');
+{
+  const deck = createDeck();
+  const own = [deck[0], deck[1]];
+  const hidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+  const used = new Set([...own, ...hidden].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const candidates = own.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `fxe_${index}`, action: 'play', cards: [card], hand,
+      signature: handSignature(hand), localScore: 10 - index,
+    };
+  });
+  const weights = new Array(HYBRID_VALUE_FEATURES.length).fill(0);
+  weights[31] = 100; // 与置信门禁探针相同：把第二候选推到综合分首位。
+  const valueModel = validateHybridValueModel({
+    id: 'fxe-probe',
+    schema: HYBRID_VALUE_SCHEMA,
+    layers: [{ weights: [weights], bias: [0], activation: 'linear' }],
+  }).model;
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [2, 2, 2, 2], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts',
+  };
+  const consultation = {
+    action: 'play', cards: own[0], hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  };
+  // 旧 PIMC 模式下根置信门禁不拦截（not_root_search），且样本量放大后
+  // rollout 与价值分同向推第二候选，保证本探针中正常臂确定性改选，
+  // 从而覆盖强制臂的全部遥测分支。
+  const options = {
+    searchMode: 'pimc-v1', sampleCount: 6, iterationBudget: 12,
+    maxPlies: 48, nodeBudget: 2000, behaviorAttempts: 1, seed: 20260829, valueModel,
+  };
+  const normal = chooseHybridFromConsultation(context, consultation, options);
+  const forced = chooseHybridFromConsultation(context, consultation, {
+    ...options, forceExpertChoice: true,
+  });
+  assert(normal.telemetry?.proposedCandidateId === candidates[1].id
+    && normal.telemetry?.changedDecision === true
+    && normal.telemetry?.wouldChangeDecision === true,
+  '探针布局下正常臂确定性改选第二候选');
+  assert(JSON.stringify(normal.telemetry.candidates) === JSON.stringify(forced.telemetry.candidates)
+    && normal.telemetry.proposedCandidateId === forced.telemetry.proposedCandidateId,
+  'forceExpertChoice 不改变任何搜索统计与提议，两臂只有最终选择不同');
+  assert(forced.telemetry?.forceExpertChoice === true
+    && forced.telemetry.finalCandidateId === candidates[0].id
+    && forced.telemetry.changedDecision === false
+    && forced.telemetry.wouldChangeDecision === true
+    && forced.telemetry.searchAttempted === true
+    && forced.telemetry.searchTriggered === true
+    && forced.telemetry.fallbackKind === 'force_expert_choice'
+    && forced.decision.reason === '搜索提议改选，消融臂强制保持专家首选',
+  '消融臂强制保持专家首选，并记录“本会改选”的反事实标记');
+  assert(forced.telemetry.wouldChangeDecision === (normal.telemetry.changedDecision === true),
+  'wouldChangeDecision 与正常臂 changedDecision 互为反事实口径');
+  assert(forced.decision.cards === consultation.cards
+    && forced.decision.hand === consultation.hand
+    && forced.decision.signature === consultation.signature,
+  'forceExpertChoice 逐对象保留专家动作、牌型声明与签名，不经候选重建');
 }
 
 console.log('成对根 PIMC 不伪造额外迭代');
@@ -479,7 +816,10 @@ console.log('晋级模型关键局面门禁');
     localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
   }, { searchMode: 'pimc-v1', sampleCount: 2, valueModel });
   assert(result.decision?.signature === candidates[0].signature
-    && result.telemetry?.reason === 'not_critical' && !result.telemetry?.applied,
+    && result.telemetry?.reason === 'not_critical' && !result.telemetry?.applied
+    && result.telemetry?.searchAttempted === false
+    && result.telemetry?.searchTriggered === false
+    && result.telemetry?.fallbackKind === 'search_evidence_insufficient',
   '晋级模型在非关键局面不能绕过搜索门禁改写专家动作');
 }
 

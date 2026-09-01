@@ -448,10 +448,10 @@ console.log('混合决策设置与公平观察边界');
     difficulty: 'master',
     aiSpeed: 'fast',
     coachMode: false,
-    localAiEngine: 'hybrid',
+    localAiEngine: 'pimc-v1',
   });
   const context = aiDecisionContext(state, 1);
-  assert(context.decisionEngine === 'hybrid', '正式决策上下文收到用户选择的混合引擎');
+  assert(context.decisionEngine === 'pimc-v1', '正式决策上下文收到用户选择的 PIMC 引擎');
   assert(!('hands' in context) && !('deck' in context)
     && !('initialHands' in context) && !('lastReplay' in context),
   '正式决策上下文不暴露四家暗牌、牌堆、初始牌面或终局复盘');
@@ -464,9 +464,17 @@ console.log('混合决策设置与公平观察边界');
   assert(state.aiRequestToken !== token && state.aiThinking === false,
     '切换本地决策引擎会作废正在计算的旧策略请求');
 
-  applySettings(state, { localAiEngine: 'ismcts' });
-  assert(aiDecisionContext(state, 3).decisionEngine === 'ismcts',
+  applySettings(state, { localAiEngine: 'root-pimc-v1' });
+  assert(aiDecisionContext(state, 3).decisionEngine === 'root-pimc-v1',
     '正式决策上下文可把用户选择的成对根 PIMC 引擎传入电脑座位');
+  applySettings(state, { localAiEngine: 'ismcts-v2' });
+  assert(aiDecisionContext(state, 3).decisionEngine === 'ismcts-v2',
+    '正式决策上下文可把用户选择的 ISMCTS v2 引擎传入电脑座位');
+  // 消融引擎不应作为用户设置写入；A/B 评测通过临时逐座配置注入它。该配置
+  // 仍必须穿过公开观察白名单，否则 1-3 号座会静默退回 expert。
+  state.settings.aiDecisionEngineBySeat = ['expert', 'expert', 'expert', 'ismcts-v3-fxe'];
+  assert(aiDecisionContext(state, 3).decisionEngine === 'ismcts-v3-fxe',
+    '正式决策上下文不会把 ISMCTS v3 强制专家消融臂静默降级为 expert');
 }
 
 console.log('非大师难度不产生实验搜索载荷');
@@ -475,7 +483,7 @@ console.log('非大师难度不产生实验搜索载荷');
     difficulty: 'hard',
     aiSpeed: 'fast',
     coachMode: false,
-    localAiEngine: 'ismcts',
+    localAiEngine: 'root-pimc-v1',
     deterministicAI: true,
   });
   state.phase = PHASE.PLAYING;
@@ -489,7 +497,7 @@ console.log('非大师难度不产生实验搜索载荷');
   ];
   state.handCounts = state.hands.map((hand) => hand.length);
   const context = aiDecisionContext(state, 1);
-  assert(context.decisionEngine === 'ismcts' && context.difficulty === 'hard',
+  assert(context.decisionEngine === 'root-pimc-v1' && context.difficulty === 'hard',
     '困难难度仍可记录用户选择的实验引擎');
   const decision = chooseAIPlay(context);
   assert(decision?.action && decision.hybrid == null,
