@@ -1270,7 +1270,11 @@ function runISMCTSSearch(observation, candidates, limits, options) {
     return {
       searchMode,
       iterations,
-      iterationBudget: sweepBudget,
+      // 输入 iterationBudget 是 rollout 总预算；v3 的一次 sweep 会消耗
+      // 全部根候选各一次 rollout。不能把 floor(total/candidates) 继续
+      // 伪标为 iterationBudget，否则会混淆两种计量单位。
+      rolloutBudget,
+      sweepBudget,
       pairedSweeps,
       sampledWorlds,
       sampleFailures,
@@ -1674,7 +1678,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   // v3 的成对单位是 sweep：每次 sweep 覆盖全部根候选，要求至少完成
   // requiredPairedSweeps 次（与成对 PIMC 的 requiredPairedWorlds 同构）。
   const requiredPairedSweeps = Math.max(
-    2, Math.min(rootMinimumEffectiveVisits, Number(search.iterationBudget) || 0),
+    2, Math.min(rootMinimumEffectiveVisits, Number(search.sweepBudget) || 0),
   );
   const rootEvidenceSufficient = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
     ? candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
@@ -1697,7 +1701,10 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     searchAttempted: true,
     searchTriggered: Number(search.iterations) > 0 || nodes.value > 0,
     iterations: search.iterations,
-    iterationBudget: search.iterationBudget || null,
+    ...(searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3 ? {
+      rolloutBudget: search.rolloutBudget || null,
+      sweepBudget: search.sweepBudget || null,
+    } : { iterationBudget: search.iterationBudget || null }),
     pairedWorlds: search.pairedWorlds || 0,
     pairedSweeps: search.pairedSweeps || 0,
     sampledWorlds: search.sampledWorlds || 0,
@@ -2042,7 +2049,10 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     } : null,
     searchMode: informationSet.searchMode || HYBRID_SEARCH_MODES.PIMC,
     iterations: informationSet.iterations || 0,
-    iterationBudget: informationSet.iterationBudget || null,
+    ...(informationSet.searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3 ? {
+      rolloutBudget: informationSet.rolloutBudget || null,
+      sweepBudget: informationSet.sweepBudget || null,
+    } : { iterationBudget: informationSet.iterationBudget || null }),
     pairedWorlds: informationSet.pairedWorlds || 0,
     pairedSweeps: informationSet.pairedSweeps || 0,
     sampledWorlds: informationSet.sampledWorlds || 0,

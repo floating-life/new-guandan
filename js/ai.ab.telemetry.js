@@ -58,6 +58,9 @@ export function collectDecisionTelemetry(state, variantBySeat) {
       samples: Number(hybrid?.samples) || 0,
       nodes: Number(hybrid?.nodes) || 0,
       iterations: Number(hybrid?.iterations) || 0,
+      rolloutBudget: Number(hybrid?.rolloutBudget) || 0,
+      sweepBudget: Number(hybrid?.sweepBudget) || 0,
+      pairedSweeps: Number(hybrid?.pairedSweeps) || 0,
     };
   });
 }

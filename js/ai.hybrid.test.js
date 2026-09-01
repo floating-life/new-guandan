@@ -437,7 +437,10 @@ console.log('ISMCTS v3 根候选成对采样');
     'ISMCTS v3 在关键局面完成根候选成对采样搜索');
   assert(first.pairedSweeps === 6 && first.sampledWorlds === 6
     && first.iterations === 6 * candidates.length && first.treeNodes > 2,
-  'iterationBudget 与 v2 同口径按 rollout 总预算换算 sweep 数，每次 sweep 对每个根候选各下钻一次');
+  '输入 iterationBudget 作为 rollout 总预算换算 sweep 数，每次 sweep 对每个根候选各下钻一次');
+  assert(first.rolloutBudget === 12 && first.sweepBudget === 6
+    && !Object.hasOwn(first, 'iterationBudget'),
+  'v3 输出明确区分 rolloutBudget 与 sweepBudget，不再把 sweepBudget 伪标为 iterationBudget');
   assert(first.candidateResults.every((item) => (
     item.visits === first.pairedSweeps
     && item.availability === first.pairedSweeps
@@ -472,6 +475,32 @@ console.log('ISMCTS v3 根候选成对采样');
     && tooFewSweeps.pairedSweeps === 1
     && tooFewSweeps.candidateResults.every((item) => item.visits === 1),
   '成对 sweep 数不足时保留搜索遥测，但不允许作为改选证据');
+
+  for (let candidateCount = 2; candidateCount <= 6; candidateCount += 1) {
+    const multiOwn = deck.slice(0, candidateCount);
+    const multiHidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+    const multiUsed = new Set([...multiOwn, ...multiHidden].map(physicalKey));
+    const multiCandidates = multiOwn.map((card, index) => {
+      const hand = parseHand([card], 7);
+      return {
+        id: `budget_${candidateCount}_${index}`, action: 'play', cards: [card], hand,
+        signature: handSignature(hand), localScore: candidateCount - index,
+      };
+    });
+    const multi = evaluateInformationSetCandidates({
+      ...context,
+      hand: multiOwn,
+      handCounts: [candidateCount, 2, 2, 2],
+      playedCards: deck.filter((card) => !multiUsed.has(physicalKey(card))),
+    }, multiCandidates, {
+      ...options, iterationBudget: candidateCount * 3, minimumEffectiveVisits: 2,
+      nodeBudget: 4000, seed: 20260910 + candidateCount,
+    });
+    assert(multi.rolloutBudget === candidateCount * 3 && multi.sweepBudget === 3
+      && multi.iterations === multi.pairedSweeps * candidateCount
+      && !Object.hasOwn(multi, 'iterationBudget'),
+    `v3 ${candidateCount} 个候选保持 rollout/sweep/实际 pairedSweeps 三种预算口径一致`);
+  }
 }
 
 console.log('ISMCTS v3 失败 sweep 深层事务回滚');

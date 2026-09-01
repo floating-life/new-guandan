@@ -187,7 +187,7 @@ const TELEMETRY_FIELDS = [
   'searchTelemetryPresent', 'fallbackKindPresent', 'telemetryComplete',
   'latencyMs', 'source', 'fallbackKind', 'fallbackEvaluable', 'timeoutFallback',
   'searchAttempted', 'searchTriggered', 'candidates', 'samples', 'nodes',
-  'iterations',
+  'iterations', 'rolloutBudget', 'sweepBudget', 'pairedSweeps',
 ];
 
 function isRecord(value) {
@@ -486,7 +486,8 @@ function validateTelemetry(telemetry, signature, candidateTeam, label) {
       || typeof item.fallbackKind !== 'string' || !item.fallbackKind) {
       throw new Error(`${label}[${index}] latency/source/fallback 字段无效`);
     }
-    for (const field of ['candidates', 'samples', 'nodes', 'iterations']) {
+    for (const field of ['candidates', 'samples', 'nodes', 'iterations',
+      'rolloutBudget', 'sweepBudget', 'pairedSweeps']) {
       validateNumericCounter(item[field], `${label}[${index}].${field}`);
     }
   }

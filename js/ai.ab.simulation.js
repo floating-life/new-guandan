@@ -478,6 +478,9 @@ function compactDecision(decision) {
         iterations: Number(decision.hybrid.iterations) || 0,
         samples: Number(decision.hybrid.samples) || 0,
         nodes: Number(decision.hybrid.nodes) || 0,
+        rolloutBudget: Number(decision.hybrid.rolloutBudget) || 0,
+        sweepBudget: Number(decision.hybrid.sweepBudget) || 0,
+        pairedSweeps: Number(decision.hybrid.pairedSweeps) || 0,
         candidates: Array.isArray(decision.hybrid.candidates)
           ? decision.hybrid.candidates.slice(0, 3) : [],
       },
@@ -2430,6 +2433,9 @@ function writeRawTelemetry(report, outputPath) {
         samples: item.samples,
         nodes: item.nodes,
         iterations: item.iterations,
+        rolloutBudget: item.rolloutBudget,
+        sweepBudget: item.sweepBudget,
+        pairedSweeps: item.pairedSweeps,
       }))
   ));
   const missingVariantTurns = records.filter((item) => !item.variantPresent).length;
