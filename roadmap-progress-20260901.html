@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>掼蛋 AI 研发进度地图 · 2026-09-01</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --series-1:       #2a78d6;
+    --series-1-track: #cde2fb;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --border:         rgba(11,11,11,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --series-1:       #3987e5;
+      --series-1-track: #184f95;
+      --good:           #0ca30c;
+      --warning:        #fab219;
+      --serious:        #ec835a;
+      --border:         rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --series-1:       #3987e5;
+    --series-1-track: #184f95;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --border:         rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+    max-width: 980px; margin: 0 auto; padding: 28px 20px 40px;
+  }
+  header { margin-bottom: 18px; }
+  h1 { font-size: 22px; margin: 0 0 6px; font-weight: 650; }
+  .subtitle { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
+  .takeaway {
+    font-size: 14px; color: var(--text-primary);
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; margin-top: 10px; line-height: 1.6;
+  }
+  .theme-toggle {
+    float: right; font: inherit; font-size: 12px; color: var(--text-secondary);
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  .tiles { display: flex; gap: 12px; flex-wrap: wrap; margin: 14px 0 22px; }
+  .tile {
+    flex: 1 1 200px; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px;
+  }
+  .tile .t-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .tile .t-value { font-size: 24px; font-weight: 650; }
+  .tile .t-note  { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
+  section { margin-bottom: 30px; }
+  h2 { font-size: 16px; font-weight: 650; margin: 0 0 4px; }
+  .panel-note { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.6; }
+  .chart-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 14px 8px; overflow-x: auto;
+  }
+  .status-legend {
+    display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px;
+    color: var(--text-secondary); margin: 0 0 14px; align-items: center;
+  }
+  .status-legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .chain-title { font-size: 14px; font-weight: 650; margin: 16px 0 2px; }
+  .chain-effort { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 6px; }
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10; max-width: 320px;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-size: 12.5px; line-height: 1.55;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12); display: none;
+  }
+  .tooltip .tt-value { font-weight: 650; display: block; margin-bottom: 2px; }
+  .tooltip .tt-label { color: var(--text-secondary); }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--gridline); vertical-align: top; }
+  th { color: var(--text-secondary); font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; }
+  footer { font-size: 12px; color: var(--text-muted); margin-top: 24px; line-height: 1.6; }
+  svg text { font-family: inherit; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <header>
+    <button class="theme-toggle" id="themeToggle">切换深色</button>
+    <h1>掼蛋 AI 研发进度地图</h1>
+    <p class="subtitle">基线 2026-09-01 · 数据来源：todo.md / 整体项目路线图.md · 当前默认引擎 expert，无 promoted 模型</p>
+    <div class="takeaway">
+      当前位置：<strong>R0 证据门已闭环（100%）</strong>，EVID-9b 远端 CI 通过、正式种子解禁；
+      R1B 实战策略修复代码门 <strong>4/6</strong>（STRAT-1~4 落地、候选默认关闭）。
+      距「对战能力提升进入默认」只差：<strong>STRAT-5 跨引擎统一候选层 → STRAT-6 逐规则镜像消融</strong>；
+      搜索晋级链的 PERF-2b 诊断前置也随之解除，真正瓶颈仍是性能根因与 ≥10 名真人盲评的日历时间。
+    </div>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="status-legend" id="statusLegend"></div>
+
+  <section>
+    <h2>各轨道完成度</h2>
+    <p class="panel-note">按 todo.md 任务勾稽计算；条端数值为完成百分比。悬停或键盘聚焦查看下一步与卡点。</p>
+    <div class="chart-card"><svg id="barChart" width="940" height="330" role="img" aria-label="各轨道完成度条形图"></svg></div>
+  </section>
+
+  <section>
+    <h2>距终点的关键路径</h2>
+    <p class="panel-note">EVID-9b（推送冻结提交 + 远端 CI）同时是两条链的闸门。节点悬停可见详情。</p>
+    <div id="chains"></div>
+  </section>
+
+  <details>
+    <summary>表格视图（与图表同源数据）</summary>
+    <table id="trackTable"></table>
+    <table id="chainTable"></table>
+  </details>
+
+  <footer>
+    口径说明：R1 的 0% 指「封版验收 3 项未闭环」，专家版主体（规则 / Worker / 浏览器主流程 / 自动回归）早已完成；
+    R1B 唯一已关的 STRAT-2 仍是默认关闭的候选，未过镜像收益门；R2 已完成项为诊断与代码门，曾正式跑满 80 区组且强度 CI 为正，但性能门 619/1022ms 失败。
+    本图只读，不构成发布证据。
+  </footer>
+</div>
+
+<div class="tooltip" id="tooltip" role="status"></div>
+
+<script>
+(function () {
+  var NS = 'http://www.w3.org/2000/svg';
+
+  var STATUS = {
+    done:   { icon: '✓',  color: 'var(--good)',    textInk: '#ffffff', label: '已完成' },
+    active: { icon: '►',  color: 'var(--series-1)', textInk: '#ffffff', label: '进行中' },
+    warn:   { icon: '!',  color: 'var(--warning)', textInk: '#0b0b0b', label: '收尾/受阻' },
+    fail:   { icon: '●',  color: 'var(--serious)', textInk: '#0b0b0b', label: '门失败' },
+    todo:   { icon: '○',  color: 'var(--text-muted)', textInk: null,   label: '未启动' },
+    goal:   { icon: '◆',  color: 'var(--good)',    textInk: '#ffffff', label: '目标' }
+  };
+
+  var TILES = [
+    { label: '硬性任务完成', value: '24 / 51', note: 'EVID·SEC·PERF·ALGO·STRAT·DMC 合计' },
+    { label: '当前默认引擎', value: 'expert', note: 'ismcts-v3 仅离线候选' },
+    { label: 'v3 上次正式跑', value: '+0.028/局', note: '强度 CI [+0.005,+0.051] 已过 · 性能 P95/P99 619/1022ms 未过 500/750 门' }
+  ];
+
+  var TRACKS = [
+    { name: 'R0 证据门加固',  pct: 100, done: '15/15', status: 'done',   next: 'EVID-9b 冻结提交 585f099 + 远端 CI run 33470270032 已通过；真实发布证据待 RUN-2~6' },
+    { name: 'R1 专家版封版',  pct: 0,  done: '0/3',   status: 'todo',   next: '三副人工验收 + 隐私/卡顿/回滚记录（主体早已完成）' },
+    { name: 'R1A 实时复盘桥', pct: 0,  done: '0/6',   status: 'todo',   next: 'RT-1 冻结三层数据契约（公开事件/密封训练/注释）' },
+    { name: 'R1B 策略修复',   pct: 67, done: '4/6',   status: 'active', next: 'STRAT-5 跨引擎统一安全候选层 → STRAT-6 逐规则镜像消融（正式种子已解禁）' },
+    { name: 'R2 搜索晋级',    pct: 27, done: '4/15',  status: 'fail',   next: 'EVID-9b 已闭环 → PERF-2b 真实大 checkpoint 诊断可授权 → PERF-3/4 → RUN-1~6' },
+    { name: 'R3 DMC 训练',    pct: 20, done: '1/5',   status: 'todo',   next: 'DMC-1 独立 Python 规则环境 + 10 万条零差异（待 R2）' },
+    { name: 'R4 对手建模',    pct: 0,  done: '0/1',   status: 'todo',   next: 'OPP-1 漂移检测与独立留出（不阻塞主线）' }
+  ];
+
+  var CHAINS = [
+    {
+      title: '近期目标：实战策略修复进入 expert 默认',
+      effort: '剩余：STRAT-5 开发（约 1–2 天）→ STRAT-6 逐规则镜像消融（数小时计算，需预登记未见种子）',
+      nodes: [
+        { s: 'done',   label: 'STRAT-2 收口',  sub: '代码门已关·候选关闭' },
+        { s: 'done',   label: 'STRAT-1 夹具',  sub: '反例 24/24' },
+        { s: 'done',   label: 'STRAT-3 送单',  sub: '代码门已关' },
+        { s: 'done',   label: 'STRAT-4 牌权',  sub: '代码门已关' },
+        { s: 'active', label: 'STRAT-5 共用层', sub: '下一步·跨引擎同候选' },
+        { s: 'done',   label: 'EVID-9b CI',    sub: '585f099 已通过' },
+        { s: 'todo',   label: 'STRAT-6 镜像',  sub: '逐规则消融门' },
+        { s: 'goal',   label: '进 expert 默认', sub: '近期终点' }
+      ]
+    },
+    {
+      title: '远期目标：搜索引擎晋级并正式发布',
+      effort: '预计周级 · 计算仅数小时；瓶颈 = 性能根因诊断 + 组织 ≥10 名真人盲评（日历时间）',
+      nodes: [
+        { s: 'done',   label: 'EVID-9b CI',     sub: '585f099 已通过' },
+        { s: 'active', label: 'PERF-2b 诊断',   sub: '可授权启动' },
+        { s: 'todo',   label: 'PERF-3 优化',    sub: '按根因,不猜' },
+        { s: 'todo',   label: 'PERF-4 探针',    sub: '10 区组新种子' },
+        { s: 'todo',   label: 'RUN-1~4 长跑',   sub: '80 区组 + 连续赛' },
+        { s: 'warn',   label: 'RUN-5 盲评',     sub: '需 ≥10 名真人' },
+        { s: 'todo',   label: 'RUN-6 发布验证', sub: 'M2 统一门' },
+        { s: 'goal',   label: 'v3 上桌发布',    sub: '远期终点' }
+      ]
+    }
+  ];
+
+  var tooltip = document.getElementById('tooltip');
+  function showTip(html, x, y) {
+    tooltip.textContent = '';
+    var v = document.createElement('span'); v.className = 'tt-value'; v.textContent = html[0];
+    var l = document.createElement('span'); l.className = 'tt-label'; l.textContent = html[1];
+    tooltip.appendChild(v); tooltip.appendChild(l);
+    tooltip.style.display = 'block';
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var left = Math.min(x + 14, window.innerWidth - w - 10);
+    var top = Math.max(8, y - h - 12);
+    tooltip.style.left = left + 'px'; tooltip.style.top = top + 'px';
+  }
+  function hideTip() { tooltip.style.display = 'none'; }
+  function bindTip(el, lines) {
+    el.setAttribute('tabindex', '0');
+    el.style.cursor = 'default';
+    el.addEventListener('pointermove', function (e) { showTip(lines, e.clientX, e.clientY); });
+    el.addEventListener('pointerleave', hideTip);
+    el.addEventListener('focus', function () {
+      var r = el.getBoundingClientRect();
+      showTip(lines, r.left + r.width / 2, r.top);
+    });
+    el.addEventListener('blur', hideTip);
+  }
+  function el(name, attrs) {
+    var n = document.createElementNS(NS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function txt(attrs, content) {
+    var t = el('text', attrs);
+    t.textContent = content;
+    return t;
+  }
+
+  // ---- tiles ----
+  var tiles = document.getElementById('tiles');
+  TILES.forEach(function (t) {
+    var d = document.createElement('div'); d.className = 'tile';
+    var a = document.createElement('div'); a.className = 't-label'; a.textContent = t.label;
+    var b = document.createElement('div'); b.className = 't-value'; b.textContent = t.value;
+    var c = document.createElement('div'); c.className = 't-note';  c.textContent = t.note;
+    d.appendChild(a); d.appendChild(b); d.appendChild(c);
+    tiles.appendChild(d);
+  });
+
+  // ---- status legend ----
+  var legend = document.getElementById('statusLegend');
+  ['done', 'active', 'warn', 'fail', 'todo', 'goal'].forEach(function (k) {
+    var st = STATUS[k];
+    var s = document.createElement('span'); s.className = 'key';
+    var dot = document.createElementNS(NS, 'svg');
+    dot.setAttribute('width', '14'); dot.setAttribute('height', '14');
+    var c = el('circle', { cx: 7, cy: 7, r: 5.5, fill: k === 'todo' ? 'none' : st.color,
+                           stroke: st.color, 'stroke-width': k === 'todo' ? 1.6 : 0 });
+    dot.appendChild(c);
+    var ic = txt({ x: 7, y: 10.2, 'text-anchor': 'middle', 'font-size': '8.5',
+                   fill: k === 'todo' ? st.color : st.textInk, 'font-weight': '700' }, st.icon);
+    dot.appendChild(ic);
+    var lab = document.createElement('span'); lab.textContent = st.label;
+    s.appendChild(dot); s.appendChild(lab);
+    legend.appendChild(s);
+  });
+
+  // ---- Panel A: bars ----
+  var svg = document.getElementById('barChart');
+  var X0 = 168, W = 520, BAR_H = 20, ROW = 42, TOP = 14, AXIS_H = 26;
+  var H = TOP + TRACKS.length * ROW + AXIS_H;
+  svg.setAttribute('height', H);
+
+  [0, 25, 50, 75, 100].forEach(function (g) {
+    var x = X0 + W * g / 100;
+    svg.appendChild(el('line', { x1: x, y1: TOP - 4, x2: x, y2: H - AXIS_H + 4,
+                                 stroke: 'var(--gridline)', 'stroke-width': 1 }));
+    svg.appendChild(txt({ x: x, y: H - 8, 'text-anchor': 'middle', 'font-size': 11,
+                          fill: 'var(--text-muted)' }, g + '%'));
+  });
+
+  TRACKS.forEach(function (t, i) {
+    var y = TOP + i * ROW + (ROW - BAR_H) / 2;
+    svg.appendChild(txt({ x: X0 - 10, y: y + BAR_H / 2 + 4.5, 'text-anchor': 'end',
+                          'font-size': 13, fill: 'var(--text-primary)' }, t.name));
+    svg.appendChild(el('rect', { x: X0, y: y, width: W, height: BAR_H, rx: 4,
+                                 fill: 'var(--series-1-track)' }));
+    var fw = W * t.pct / 100;
+    if (fw > 0.5) {
+      svg.appendChild(el('rect', { x: X0, y: y, width: fw, height: BAR_H, rx: 4,
+                                   fill: 'var(--series-1)' }));
+      svg.appendChild(el('rect', { x: X0, y: y, width: 4, height: BAR_H,
+                                   fill: 'var(--series-1)' }));
+    }
+    svg.appendChild(txt({ x: X0 + fw + 8, y: y + BAR_H / 2 + 4.5, 'font-size': 12.5,
+                          fill: 'var(--text-secondary)', 'font-weight': '600' }, t.pct + '%'));
+    var st = STATUS[t.status];
+    var chipX = X0 + W + 56;
+    svg.appendChild(el('circle', { cx: chipX, cy: y + BAR_H / 2, r: 7,
+                                   fill: t.status === 'todo' ? 'none' : st.color,
+                                   stroke: st.color, 'stroke-width': t.status === 'todo' ? 1.6 : 0 }));
+    svg.appendChild(txt({ x: chipX, y: y + BAR_H / 2 + 3.4, 'text-anchor': 'middle',
+                          'font-size': '9', 'font-weight': '700',
+                          fill: t.status === 'todo' ? st.color : st.textInk }, st.icon));
+    svg.appendChild(txt({ x: chipX + 12, y: y + BAR_H / 2 + 4, 'font-size': 12,
+                          fill: 'var(--text-secondary)' }, st.label));
+    var hit = el('rect', { x: 0, y: TOP + i * ROW, width: 940, height: ROW, fill: 'transparent' });
+    bindTip(hit, [t.name + '：' + t.done + '（' + t.pct + '%）· ' + st.label, '下一步：' + t.next]);
+    svg.appendChild(hit);
+  });
+
+  // ---- Panel B: milestone chains ----
+  var chainsHost = document.getElementById('chains');
+  CHAINS.forEach(function (chain) {
+    var h = document.createElement('div'); h.className = 'chain-title'; h.textContent = chain.title;
+    var e = document.createElement('p'); e.className = 'chain-effort'; e.textContent = chain.effort;
+    var card = document.createElement('div'); card.className = 'chart-card';
+    var cw = 940, ch = 96;
+    var csvg = el('svg', { width: cw, height: ch, role: 'img', 'aria-label': chain.title });
+    var n = chain.nodes.length;
+    var pad = 46, step = (cw - pad * 2) / (n - 1), ny = 30;
+    for (var i = 0; i < n - 1; i++) {
+      csvg.appendChild(el('line', { x1: pad + i * step + 12, y1: ny,
+                                    x2: pad + (i + 1) * step - 12, y2: ny,
+                                    stroke: 'var(--baseline)', 'stroke-width': 2 }));
+    }
+    chain.nodes.forEach(function (node, i) {
+      var x = pad + i * step;
+      var st = STATUS[node.s];
+      var r = node.s === 'goal' ? 11 : 9;
+      var g = el('g', {});
+      g.appendChild(el('circle', { cx: x, cy: ny, r: 20, fill: 'transparent' }));
+      if (node.s === 'todo') {
+        g.appendChild(el('circle', { cx: x, cy: ny, r: r, fill: 'var(--surface-1)',
+                                     stroke: st.color, 'stroke-width': 1.8 }));
+      } else {
+        g.appendChild(el('circle', { cx: x, cy: ny, r: r + 1, fill: 'none',
+                                     stroke: 'var(--surface-1)', 'stroke-width': 2 }));
+        g.appendChild(el('circle', { cx: x, cy: ny, r: r, fill: st.color }));
+      }
+      g.appendChild(txt({ x: x, y: ny + 3.8, 'text-anchor': 'middle', 'font-size': '10',
+                          'font-weight': '700',
+                          fill: node.s === 'todo' ? st.color : st.textInk }, st.icon));
+      g.appendChild(txt({ x: x, y: ny + 30, 'text-anchor': 'middle', 'font-size': '11.5',
+                          fill: 'var(--text-primary)', 'font-weight': '600' }, node.label));
+      if (node.sub) {
+        g.appendChild(txt({ x: x, y: ny + 45, 'text-anchor': 'middle', 'font-size': '10.5',
+                            fill: 'var(--text-muted)' }, node.sub));
+      }
+      bindTip(g, [node.label + (node.sub ? ' · ' + node.sub : '') + ' · ' + st.label, chain.title]);
+      csvg.appendChild(g);
+    });
+    card.appendChild(csvg);
+    chainsHost.appendChild(h);
+    chainsHost.appendChild(e);
+    chainsHost.appendChild(card);
+  });
+
+  // ---- tables ----
+  var tt = document.getElementById('trackTable');
+  var head = document.createElement('tr');
+  ['轨道', '完成', '进度', '状态', '下一步'].forEach(function (c) {
+    var th = document.createElement('th'); th.textContent = c; head.appendChild(th);
+  });
+  tt.appendChild(head);
+  TRACKS.forEach(function (t) {
+    var tr = document.createElement('tr');
+    [t.name, t.done, t.pct + '%', STATUS[t.status].label, t.next].forEach(function (c, idx) {
+      var td = document.createElement('td');
+      if (idx === 2) td.className = 'num';
+      td.textContent = c; tr.appendChild(td);
+    });
+    tt.appendChild(tr);
+  });
+  var ct = document.getElementById('chainTable');
+  var head2 = document.createElement('tr');
+  ['目标链', '预计', '节点顺序'].forEach(function (c) {
+    var th = document.createElement('th'); th.textContent = c; head2.appendChild(th);
+  });
+  ct.appendChild(head2);
+  CHAINS.forEach(function (chain) {
+    var tr = document.createElement('tr');
+    var seq = chain.nodes.map(function (nd) { return nd.label; }).join(' → ');
+    [chain.title, chain.effort, seq].forEach(function (c) {
+      var td = document.createElement('td'); td.textContent = c; tr.appendChild(td);
+    });
+    ct.appendChild(tr);
+  });
+
+  // ---- theme toggle ----
+  var btn = document.getElementById('themeToggle');
+  function syncBtn() {
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (!document.documentElement.getAttribute('data-theme') &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches);
+    btn.textContent = dark ? '切换浅色' : '切换深色';
+  }
+  btn.addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var effDark = cur ? cur === 'dark' : osDark;
+    document.documentElement.setAttribute('data-theme', effDark ? 'light' : 'dark');
+    syncBtn();
+  });
+  syncBtn();
+})();
+</script>
+</body>
+</html>

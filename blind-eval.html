@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>掼蛋关键决策盲评</title>
+<style>
+  :root { --bg:#10241a; --panel:#f7f5ef; --ink:#1c2733; --muted:#68788a; --accent:#1f7a4d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--ink); }
+  header { color:#fff; padding:14px 20px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  header .spacer { flex:1; }
+  main { max-width: 1060px; margin: 0 auto; padding: 16px; }
+  .panel { background:var(--panel); border-radius:10px; padding:16px 18px; margin-bottom:14px; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+  .row { display:flex; flex-wrap:wrap; gap:10px 22px; align-items:center; }
+  .label { color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .cards { display:flex; flex-wrap:wrap; gap:5px; }
+  .card { min-width:34px; padding:5px 6px; border:1px solid #b9c2cc; border-radius:6px; background:#fff;
+          text-align:center; font-weight:600; font-size:14px; }
+  .card.red { color:#c0392b; border-color:#e0b4ae; }
+  .card.joker { color:#7d3c98; border-color:#c9a7dd; }
+  .card.level { outline:2px solid var(--accent); }
+  .opts { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:760px){ .opts { grid-template-columns:1fr; } }
+  .opt { border:2px solid #c8d0d8; border-radius:10px; padding:14px; background:#fff; cursor:pointer; transition:all .12s; }
+  .opt:hover { border-color:var(--accent); }
+  .opt.chosen { border-color:var(--accent); background:#eef7f1; box-shadow:0 0 0 3px rgba(31,122,77,.18); }
+  .opt h3 { margin:0 0 8px; font-size:16px; }
+  .opt .type { color:var(--muted); font-size:13px; margin-top:8px; }
+  button { font:inherit; border:none; border-radius:8px; padding:9px 18px; cursor:pointer; background:var(--accent); color:#fff; }
+  button.ghost { background:#dfe6ec; color:var(--ink); }
+  button:disabled { opacity:.45; cursor:default; }
+  .nav { display:flex; gap:10px; align-items:center; justify-content:space-between; }
+  .progress { height:8px; background:#dfe6ec; border-radius:4px; overflow:hidden; margin:8px 0 0; }
+  .progress > div { height:100%; background:var(--accent); width:0; }
+  .history { max-height:150px; overflow:auto; font-size:12px; color:#33414f; background:#eef1f4; border-radius:6px; padding:8px 10px; }
+  .history div { padding:1px 0; }
+  .hint { color:var(--muted); font-size:13px; }
+  .pass { font-size:18px; font-weight:700; color:#8a5a00; padding:8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>掼蛋关键决策盲评</h1>
+  <span class="hint" style="color:#cfe3d8">每题二选一，选你认为更强的一手；两选项来源不标注。</span>
+  <span class="spacer"></span>
+  <button class="ghost" id="exportBtn" disabled>导出作答 JSON</button>
+</header>
+<main>
+  <div class="panel" id="loadPanel">
+    <p>请选择组织者发给你的题目文件（<code>player-N.json</code>）。作答会自动保存在本机浏览器，可随时关闭后继续。</p>
+    <input type="file" id="fileInput" accept=".json,application/json">
+    <p class="hint">答完所有题后点右上角“导出作答 JSON”，把文件发回组织者。</p>
+  </div>
+  <div id="quiz" style="display:none">
+    <div class="panel">
+      <div class="row">
+        <div><div class="label">进度</div><strong id="progressText"></strong></div>
+        <div><div class="label">级牌</div><strong id="levelText"></strong></div>
+        <div><div class="label">你的座位</div><strong id="seatText"></strong></div>
+        <div><div class="label">各家剩余</div><strong id="countsText"></strong></div>
+      </div>
+      <div class="progress"><div id="progressBar"></div></div>
+    </div>
+    <div class="panel">
+      <div class="label">上一手</div>
+      <div id="lastHand"></div>
+      <div class="label" style="margin-top:10px">最近公开行动</div>
+      <div class="history" id="history"></div>
+    </div>
+    <div class="panel">
+      <div class="label">本家手牌</div>
+      <div class="cards" id="hand"></div>
+    </div>
+    <div class="panel">
+      <div class="label">这一手，你选哪个？</div>
+      <div class="opts" id="options"></div>
+    </div>
+    <div class="nav">
+      <button class="ghost" id="prevBtn">← 上一题</button>
+      <button class="ghost" id="skipBtn">跳过（不选）</button>
+      <button class="ghost" id="nextBtn">下一题 →</button>
+    </div>
+  </div>
+</main>
+<script>
+'use strict';
+const RANK_LABEL = {2:'2',3:'3',4:'4',5:'5',6:'6',7:'7',8:'8',9:'9',10:'10',11:'J',12:'Q',13:'K',14:'A',16:'小王',17:'大王'};
+const SUIT_SYMBOL = {S:'♠',H:'♥',D:'♦',C:'♣',J:''};
+const SUIT_CLASS = {S:'',H:'red',D:'red',C:'',J:'joker'};
+const TYPE_NAME = {single:'单张',pair:'对子',triple:'三同张',triple_pair:'三连对',plate:'钢板',fullhouse:'三带二',straight:'顺子',bomb:'炸弹',flush_straight:'同花顺',joker_bomb:'天王炸'};
+const SEAT_NAME = ['下家(1)','对家(2)','上家(3)','本家(0)'];
+
+let quiz = null;      // { player, questions }
+let index = 0;
+let answers = {};     // id -> 'A' | 'B'
+let storeKey = null;
+
+document.getElementById('fileInput').addEventListener('change', (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      if (data.schema !== 'guandan-blind-eval-questions-v2' || !Array.isArray(data.questions)) {
+        alert('这不是有效的盲评题目文件');
+        return;
+      }
+      quiz = data;
+      storeKey = 'blind-eval:v2:' + (quiz.assignmentSha256 || ('player-' + quiz.player));
+      try { answers = JSON.parse(localStorage.getItem(storeKey) || '{}'); } catch { answers = {}; }
+      index = 0;
+      document.getElementById('loadPanel').style.display = 'none';
+      document.getElementById('quiz').style.display = '';
+      document.getElementById('exportBtn').disabled = false;
+      render();
+    } catch (e) { alert('读取失败：' + e.message); }
+  };
+  reader.readAsText(file);
+});
+document.getElementById('prevBtn').addEventListener('click', () => { if (index > 0) { index -= 1; render(); } });
+document.getElementById('nextBtn').addEventListener('click', () => { if (index < quiz.questions.length - 1) { index += 1; render(); } });
+document.getElementById('skipBtn').addEventListener('click', () => {
+  delete answers[quiz.questions[index].id];
+  persist();
+  if (index < quiz.questions.length - 1) { index += 1; render(); } else { render(); }
+});
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const payload = {
+    schema: 'guandan-blind-eval-answers-v2',
+    player: quiz.player,
+    assignmentSha256: quiz.assignmentSha256,
+    exportedAt: new Date().toISOString(),
+    answers: Object.entries(answers).map(([id, choice]) => ({ id, choice })),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `player-${quiz.player}.answers.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+function persist() { localStorage.setItem(storeKey, JSON.stringify(answers)); }
+
+function render() {
+  const q = quiz.questions[index];
+  const obs = q.observation;
+  const total = quiz.questions.length;
+  const done = Object.keys(answers).length;
+  document.getElementById('progressText').textContent = `第 ${index + 1} / ${total} 题 · 已答 ${done}`;
+  document.getElementById('progressBar').style.width = `${(done / total) * 100}%`;
+  document.getElementById('levelText').textContent = RANK_LABEL[obs.level] || obs.level;
+  document.getElementById('seatText').textContent = `座位 ${obs.seat}`;
+  document.getElementById('countsText').textContent = (obs.handCounts || [])
+    .map((n, seat) => `${seat === obs.seat ? '本家' : '座位' + seat}:${n}`).join('  ');
+
+  const last = obs.lastHand;
+  document.getElementById('lastHand').innerHTML = last && last.cards
+    ? `座位 ${obs.lastSeat}：${renderCards(last.cards, obs.level)} <span class="hint">${typeName(last.hand)}</span>`
+    : '<span class="hint">你领出（无上手牌）</span>';
+
+  const hist = (obs.publicHistory || []).slice(-12);
+  document.getElementById('history').innerHTML = hist.map((h) => {
+    const who = h.seat === obs.seat ? '本家' : `座位${h.seat}`;
+    const what = h.action === 'pass' ? '过牌' : `${cardsText(h.cards)}（${typeName(h.hand)}）`;
+    return `<div>第${h.turn}手 · ${who}：${what}</div>`;
+  }).join('') || '<div class="hint">尚无</div>';
+
+  document.getElementById('hand').innerHTML = renderCards(sortCards(obs.hand || []), obs.level);
+
+  const optsEl = document.getElementById('options');
+  optsEl.innerHTML = '';
+  for (const letter of ['A', 'B']) {
+    const opt = q.options[letter];
+    const div = document.createElement('div');
+    div.className = 'opt' + (answers[q.id] === letter ? ' chosen' : '');
+    div.innerHTML = opt.action === 'pass'
+      ? `<h3>选项 ${letter}</h3><div class="pass">过牌</div>`
+      : `<h3>选项 ${letter}</h3><div class="cards">${renderCards(sortCards(opt.cards || []), obs.level)}</div><div class="type">${typeNameFromSignature(opt.signature)}</div>`;
+    div.addEventListener('click', () => { answers[q.id] = letter; persist(); render(); });
+    optsEl.appendChild(div);
+  }
+  document.getElementById('prevBtn').disabled = index === 0;
+  document.getElementById('nextBtn').disabled = index === total - 1;
+}
+
+function typeName(hand) {
+  if (!hand || !hand.type) return '';
+  const base = TYPE_NAME[hand.type] || hand.type;
+  return hand.size ? `${base}（${hand.size}张）` : base;
+}
+function typeNameFromSignature(sig) {
+  if (!sig) return '';
+  const [type, size] = String(sig).split('|');
+  const base = TYPE_NAME[type] || type;
+  return size ? `${base}（${size}张）` : base;
+}
+function sortCards(cards) {
+  const suitOrder = { J: 0, H: 1, S: 2, D: 3, C: 4 };
+  return cards.slice().sort((a, b) => (b.rank - a.rank) || ((suitOrder[a.suit] || 0) - (suitOrder[b.suit] || 0)));
+}
+function renderCards(cards, level) {
+  return (cards || []).map((c) => {
+    const isJoker = c.rank === 16 || c.rank === 17;
+    const label = isJoker ? RANK_LABEL[c.rank] : `${SUIT_SYMBOL[c.suit] || ''}${RANK_LABEL[c.rank] || c.rank}`;
+    const cls = isJoker ? 'joker' : (SUIT_CLASS[c.suit] || '');
+    const lvl = (!isJoker && c.rank === level) ? ' level' : '';
+    return `<span class="card ${cls}${lvl}">${label}</span>`;
+  }).join('');
+}
+function cardsText(cards) {
+  return (cards || []).map((c) => {
+    const isJoker = c.rank === 16 || c.rank === 17;
+    return isJoker ? RANK_LABEL[c.rank] : `${SUIT_SYMBOL[c.suit] || ''}${RANK_LABEL[c.rank] || c.rank}`;
+  }).join(' ');
+}
+</script>
+</body>
+</html>

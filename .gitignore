@@ -33,3 +33,8 @@ ab_*.err
 data/*
 !data/*promoted*.json
 !data/*.promoted.json
+
+# 其他 AI 工具会话/预览产物（不入库）
+.zcode/
+.dsh-vision-router/
+pelican-bike.html

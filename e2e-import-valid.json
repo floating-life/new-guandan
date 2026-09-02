@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "exportedAt": "2026-08-28T00:00:00.000Z",
+  "stats": {
+    "totalRounds": 7,
+    "teamWins": 4,
+    "teamLosses": 3,
+    "finishes": [3, 2, 1, 1]
+  },
+  "settings": {
+    "difficulty": "master",
+    "localAiEngine": "expert"
+  },
+  "replays": []
+}
