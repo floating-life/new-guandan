@@ -2,7 +2,7 @@
 
 > 更新：2026-09-02
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1/RT-2 定向代码门已完成，但完整统一入口当前因目标外既有改动删除 `tools/test_ai_ab_simulation.mjs` 而在该步骤退出 1；实时复盘智能体桥仍仅部分满足。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
+> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1/RT-2 定向代码门已完成；0902 迁移收尾恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（含闭包 21 配套），统一入口已在合并树上通过 42 checks。实时复盘智能体桥仍仅部分满足。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
 
 ## 当前停止线
 
@@ -12,7 +12,7 @@
 - [x] 暂不启动正式 DMC/DanZero 训练，不把 `trainingEligible=false` 的外部轨迹并入训练。
 - [ ] R1A 完成前，不把 active-match 完整快照暴露给智能体，不把真人复盘或智能体意见直接并入训练；所有新增真人轨迹默认 `trainingEligible=false`。
 - [ ] STRAT-1～6 完成前，0831 复盘派生规则和当前“满手保留 A/级牌三带二”工作区修复只算候选；不得无开关进入 expert 默认，也不得用单测全绿替代镜像收益与灾难回归。
-- [ ] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子。
+- [x] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子；EVID-9b 已在冻结提交上经远端 CI 闭环。
 - [x] SEC-1～3 已完成：不在聊天、日志或文档中展示抽取到的令牌值；EVID-9b 仅提交已验证候选快照。
 
 ## P0-A：浏览器导出安全处置与产品诚实性
@@ -34,7 +34,7 @@
 - [x] **EVID-8：建立 M2 统一发布验证器（本地代码门已关闭）。** `tools/validate_m2_release.mjs` 现在互绑正常臂报告/checkpoint/原始遥测、严格性能回执、当前源码连续赛和真人盲评的场景载荷/灾难复核；逐对象复算完整性、真实测量覆盖、源码/机器 provenance、CI 下界、连续赛和盲评 gate。盲评 allocation 的 `assignmentSha256/mappingSha256` 会按冻结场景顺序、`randomSeed` 和参与者分支确定性重建，答案 ledger 逐题核对 mapping 与 `side === mapping[choice]`；同步篡改 mapping、side、聚合和摘要绑定的负例仍返回非 0。`tools/test_validate_m2_release.mjs` 以完整合成正例和 20 余类缺失/篡改/矛盾/跨零 CI 负例回归，均要求非 0；`verify.ps1` 的 ReleaseEvidence 入口已显式传入 selected scenarios 与 catastrophic review。fxe 仍只作机制归因，不能替代正常臂门禁。**本地代码门通过不等于真实发布证据通过。**
 - [x] **EVID-9a：形成无冲突、可验证的候选快照。** 逐侧核对后以无冲突的现行工作文件解决 `js/ai.ab.simulation.js`、`js/ai.hybrid.test.js`、`tools/analyze_force_expert_ablation.mjs`、`tools/test_ai_ab_simulation.mjs`、`tools/test_analyze_force_expert_ablation.mjs` 五个未合并索引路径，未用旧暂存版本覆盖实现；清除了 7 个 EOF 空白行，并将评测运行时模块、验证器和其回归文件纳入候选快照。`verify.ps1` 新增 staged diff 格式检查及 `git ls-files -u` 零结果门。`git ls-files -u`、工作区/staged `git diff --check` 均为零，完整统一验证 **36/36** 通过。边界：这只是本地可验证快照，不是冻结提交或远端 CI。
 - [x] **VERIFY-1：恢复 `-FullData` 独立契约。** `verify.ps1` 将 FullData 与 ReleaseEvidence 的输入解析拆分：前者只保留历史完整性所需的 checkpoint，后者才要求连续赛报告及 M2 专属工件。`tools/test_verify_full_data_contract.mjs` 固定这一分支契约；以故意不存在的 `-ContinuousReport` 执行 `-FullData` 仍完整通过，证明不依赖本机恰有默认报告。
-- [x] **EVID-9b：代码门同一提交与远端 CI 闭环。** SEC-1～3、UI-0 和 VERIFY-1 后的冻结提交 [`585f099`](https://github.com/floating-life/new-guandan/commit/585f0996c727abe77709a3b864f3d1f7ac3819e0) 已在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**，并单独通过 A/B checkpoint 原子写入/Windows 锁/恢复及环境遥测回归；其远端 Windows CI [run `33470270032`](https://github.com/floating-life/new-guandan/actions/runs/33470270032) 已通过。真实 ReleaseEvidence/M2 工件仍到 RUN-2～6 后才可能形成，不作为 R0 代码门循环前置，也不消费新的正式种子。
+- [x] **EVID-9b：代码门同一提交与远端 CI 闭环。** SEC-1～3、UI-0 和 VERIFY-1 后的冻结候选 [`585f099`](https://github.com/floating-life/new-guandan/commit/585f0996c727abe77709a3b864f3d1f7ac3819e0) 已在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**，并单独通过 A/B checkpoint 原子写入/Windows 锁/恢复及环境遥测回归；完整数据只经绝对路径只读引用，未复制工件。该精确提交的 [远端 Windows CI run 33470270032](https://github.com/floating-life/new-guandan/actions/runs/33470270032) 已通过。真实 ReleaseEvidence/M2 工件仍到 RUN-2～6 后才可能形成，不作为 R0 代码门循环前置，也不消费新的正式种子。
 
 ### 0901–0902 本轮 EVID-8 / EVID-9a / EVID-9b / STRAT / RT 证据记录
 
@@ -42,7 +42,7 @@
 - 0901 前序工作树的默认统一验证为 **39/39**、`-FullData` 为 **45/45**（后者只读引用既有本地数据工件）；这两个数字以及此前性能 provenance、M2 正负例、环境遥测、Windows 目录别名冲突、checkpoint 原子锁/恢复和 STRAT 夹具回归的通过记录，均仅作 0901 历史记录。RT-2 修复后于 0902 重新执行默认统一验证：RT-2 相关步骤均通过，但在目标外既有改动删除 `tools/test_ai_ab_simulation.mjs` 后，于该步骤以 `MODULE_NOT_FOUND` 退出 1，不能记为全仓通过；`verify.ps1` 同时检查工作区与 staged diff，并显式拒绝 unmerged index。当前定向回归为契约 **41/41**、队列 **39/39**、观察器 **12/12**，完整一副集成回归通过；本轮未重跑 `-FullData`、远端 CI 或发布晋级验证。
 - 独立复算：直接读取 43,653,388 字节 legacy v2 checkpoint，确认 2,080 局 / 1,040 镜像组 / 80 区组、无重复/缺失/失败，效用 `+0.028/局`、区组 bootstrap 95% CI `[+0.005,+0.051]`；6,677 个搜索代理回合 P95/P99 `619/1022ms`，1–60 为 `421.8/550ms`，61–80 为 `942/1481ms`。报告/checkpoint SHA-256 分别为 `3b4ebd543d56af0d9c860eef1c07d5fc294b3817a7da006612f3b0e04161762a` / `1a8ed1de8a4a67d6b474bd0bbf1a16f38cebcbff2f1294edd12c91aa26f9a887`。
 - 未通过/未完成：真实 M2 所需 checkpoint、raw telemetry、正式性能回执和盲评工件均不存在；严格旧价值模型发布校验按预期退出 1。STRAT-1～4 尚未冻结、未跑正式镜像赛，expert 默认和现有性能停止线保持不变。
-- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2 和 STRAT-1/2/3/4 的本地回归通过；EVID-9b 冻结提交远端 CI 已完成。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 为 **81/81**。预算遥测语义缺口仍待 TEL-1；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
+- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2 和 STRAT-1/2/3/4 的本地回归通过；EVID-9b 冻结提交远端 CI 已完成。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 合并双侧回归后为 **93/93**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
 
 ## P1-A：实时复盘智能体桥与真人训练候选（RT-1/RT-2 代码门完成；RT-3～6 未满足）
 
@@ -84,12 +84,12 @@
 
 - [x] **PERF-1：固化分段复算器（历史诊断已完成，正式性能门仍阻断）。** 新增只读 `tools/analyze_statefix_performance.mjs` 与自包含 `tools/test_analyze_statefix_performance.mjs`；仅接受 legacy v2 checkpoint，按每 10 区组、1–60/61–80、座位、来源、级牌和 candidateTeam 重算，并将外部分段 sidecar 明确标为 `externally_declared/provenanceVerified=false`。报告与 checkpoint 的 search-triggered 总体计数、均值/P95/P99、最大值、回退、四项资源计数及 coverage 均逐项绑定；不得输出含义模糊的 `pass`，`formalGateEligible=false`。真实 statefix 复算得到总体 `6677`、P95/P99 `619/1022ms`，1–60 为 `5058`、`421.8/550ms`，61–80 为 `1619`、`942/1481ms`；run/resume provenance unavailable，因此仅作历史诊断，不能生成正式性能回执或晋级证据。
 - [x] **PERF-2a：接通运行环境遥测与短 fresh→resume smoke。** `--environment-telemetry` 仅显式 opt-in；每段记录 RSS/heap、GC 暂停、checkpoint 构建+校验、序列化、写入/fsync、临时重读+校验、备份/rename及总耗时、进程与系统 CPU、频率、电源方案和外部负载。Windows `os.loadavg()` 的无效 0 值保持 unavailable，并以 `os.cpus()` 累计时序/频率作为明确标注的外部负载代理；sidecar 与 checkpoint、`.last-valid`、report、raw telemetry 路径冲突时启动前拒绝。artifact 状态、peaks、系统 CPU/外部负载摘要和 checkpoint 序号由内容复算，sidecar 损坏/缺段只降级 unavailable，不阻断核心 checkpoint resume。`tools/test_environment_telemetry.mjs` 已覆盖完整性负例、路径保护、短 fresh→中断→resume、损坏/缺段 sidecar 和唯一递增 checkpoint 计时。
-- [ ] **PERF-2b：真实大 checkpoint 诊断。** 仍待在 R0 假绿缺口关闭且获授权后，对比从零运行与加载大 checkpoint 后 resume，按运行段审计大对象恢复/GC、云盘 I/O、系统负载和热/电源状态；短 smoke 不能替代正式性能门证据，也不能据此归因于算法。
+- [x] **PERF-2b：真实大 checkpoint 诊断。** 已按预登记在隔离临时目录完成当前 v3 的 40 区组 fresh→resume（`ismcts-v3` / `expert`、`opponentModelMode=off`、全 13 级、`20260941–20260980`）：20 区组时外部中断，严格恢复后完成 1,040 局/520 镜像组，零 failure/deadlock/mismatch；`guandan-ai-ab-checkpoint-v3` 的两段 provenance、内容摘要与 sidecar 均可复算，最终 checkpoint 为 47,851,028 字节。fresh 0–20 区组用时 **33m53.851s**、峰值 RSS/heap `716/528MiB`，20 次 checkpoint 总计 `14.664s`、末次 24,685,236 字节/`918.683ms`；resume 20–40 区组用时 **20m18.642s**、峰值 `1,355/1,052MiB`，读取 24,685,236 字节 checkpoint 的 read/parse/validate 为 `48.737/72.232/125.245ms`（总 `246.278ms`），20 次 checkpoint 总计 `28.757s`、末次 47,851,028 字节/`1,657.466ms`。两段均为 complete telemetry、无观测 GC event；Windows `loadavg` 不可用，只记录 `os.cpus` 代理（忙碌率 `49.641%/41.635%`）与 `powercfg active_scheme`，且工件在本地 Temp，云盘同步 I/O/热状态未观测。该诊断证明大对象恢复和保存成本存在，但两段运行负载与外部环境不同，不能归因于历史尾延迟或作为性能、收益、强度/晋级证据；PERF-3 继续等待根因证据。
 - [ ] **PERF-3：只做有证据的优化。** 若根因是 checkpoint 体积或 GC，改为分块/流式保存并保持可复算；若根因在搜索，先用 profile 锁定热点再优化。不得通过放宽阈值或静默减少搜索覆盖过门。
 - [x] **ALGO-1：修正失败 sweep 的深层事务语义。** v3 每个 sweep 在完整候选集合完成前暂存整棵开放环树；中断或后置候选 rollout 失败时恢复 depth、节点、availability、visits、reward、outcomes、failures 和终端/截断计数。`includeTreeDigest` 下的回归先形成成功深树，再注入后置候选失败并继续下一成功 sweep，逐字段证明 snapshot/mutated/restored 一致；普通决策不启用测试 hook 或树序列化。
-- [x] **ALGO-2：固定 rollout 首出不变量。** `chooseRolloutPlay` 现要求 `lastHand=null` 的非空手牌返回合法出牌；若牌型生成器异常只提供非收官炸弹候选，则按确定性最小结构成本回退，并留下 `lead_no_ordinary_fallback` 诊断，跟牌时仍保留原有结构成本/点力排序和合法过牌；整手炸弹收官不误记为异常。`js/ai-hybrid.test.js` 覆盖当前代表性手牌、7/9 张只返回炸弹异常夹具、候选实体牌合法性/乱序确定性、finishing 边界、跟牌回归和四种搜索诊断传播；`node js/ai.hybrid.test.js` 为 **81/81**，当前统一 `verify.ps1` 为 **39 checks**。这只是代码/机制门，不构成性能、强度或发布证据。
-- [ ] **ALGO-3：量化炸弹分支覆盖。** 当前 `branchLimit=5`、专家动作/pass 先占槽且炸弹成本 +32，确会让非专家炸弹分支靠后；先建立含紧急阻断、收官、无目的领炸的牌面集，比较“预留一个最小炸弹槽”对合法动作覆盖、灾难率、节点数和 P95/P99 的影响。未通过收益与性能证据前不直接改排序。
-- [ ] **TEL-1：澄清 v3 预算遥测。** 输入 `iterationBudget` 保持 rollout 总预算；输出新增/改名为 `rolloutBudget`、`sweepBudget` 与实际 `pairedSweeps`，不得把 `floor(rolloutBudget/candidateCount)` 继续标成同名 `iterationBudget`。补 2～6 个候选的兼容与跨引擎回归，并同步 checkpoint/report schema。
+- [x] **ALGO-2：固定 rollout 首出不变量（双侧实现已合并）。** `chooseRolloutPlay` 现要求 `lastHand=null` 的非空手牌返回合法出牌，覆盖两层异常路径：牌型生成器异常只提供非收官炸弹候选时，按确定性最小结构成本回退并留下 `lead_no_ordinary_fallback` 诊断；生成器异常返回空集时，从实体牌重新解析、按结构成本/牌力选择最便宜合法单张并写入 `leadFallbackUsed` 诊断，若连独立单张解析也失败，rollout 以 `rollout_lead_missing_legal_play` 显式失败，绝不把领出伪装为过牌或静默保留 sweep。跟牌时仍保留原有结构成本/点力排序和合法过牌；整手炸弹收官不误记为异常。`js/ai-hybrid.test.js` 覆盖当前代表性手牌、7/9 张只返回炸弹异常夹具、候选实体牌合法性/乱序确定性、finishing 边界、跟牌回归和四种搜索诊断传播；合并双侧回归后 `node js/ai.hybrid.test.js` 为 **93/93**。这只是代码/机制门，不构成性能、强度或发布证据。
+- [ ] **ALGO-3：量化炸弹分支覆盖。** 当前 `branchLimit=5`、专家动作/pass 先占槽且炸弹成本 +32，确会让非专家炸弹分支靠后。已建立只读 `inspectOpenLoopBombCoverage`，以紧急阻断、收官、无目的领炸三类牌面证明：前两类默认有限分支可能漏掉合法炸弹，诊断性“最小炸弹槽”可恢复覆盖；整手收官炸弹本已被专家首选保留。该函数未接入正式树和默认排序。仍需预登记新种子，量化预留槽对灾难率、节点数、P95/P99 和收益的影响；未通过这些证据前不直接改排序。
+- [x] **TEL-1：澄清 v3 预算遥测。** 输入 `iterationBudget` 保持 rollout 总预算，兼容既有配置与冻结解析；`ismcts-v3` 输出已明确改为 `rolloutBudget`、`sweepBudget` 与实际 `pairedSweeps`，不再把 `floor(rolloutBudget/candidateCount)` 伪标为 `iterationBudget`。v2/PIMC 仍保留其真实 iteration 口径。每手 checkpoint/raw telemetry 与 M2/fxe 严格字段校验同步记录三项新计数；混合层回归覆盖 2～6 个候选，验证 `iterations == pairedSweeps × candidateCount`，共 **80 passed**；`js/ai.test.js` **328 passed**、A/B checkpoint/M2/fxe 定向回归均通过。
 - [ ] **PERF-4：全新诊断种子性能探针。** R0 和 PERF-1～3 完成后，预登记仅供诊断的新种子，跑 10 区组 × 全 13 级 × 双腿；要求整体及每个足量运行段均满足 ≥100 触发、覆盖≥99%、P95≤500ms、P99≤750ms、回退<0.5%。收益与 CI 只记录，不作强度主张。
 
 ## P2：重新进入 v3 正式跑道
@@ -121,4 +121,4 @@
 - availability-aware UCT 已改为 `log(availability + 1) / visits`；旧错误实现报告全部退出正式证据集。
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
-- 默认验证在 0831 审核时为 31 项通过；0901 前序工作树的默认统一验证曾为 **39 checks**、`-FullData` 曾为 **45 checks**，均为历史记录。本轮 0902 当前工作树统一入口在 `node tools/test_ai_ab_simulation.mjs` 因目标外既有删除而以 `MODULE_NOT_FOUND`、退出 **1** 停止；本轮未运行 `-FullData`，`git ls-files -u` 与工作区/staged 差异检查均为零。SEC-1～3 与 EVID-9b 冻结提交的远端 CI 均已完成；STRAT 改动尚未冻结，严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。

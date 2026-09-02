@@ -557,6 +557,25 @@ function responseRolloutPlay(plays, hand, level) {
   ))[0] || null;
 }
 
+function countRolloutDiagnostic(state, key) {
+  if (!state.rolloutDiagnostics) state.rolloutDiagnostics = {};
+  state.rolloutDiagnostics[key] = (state.rolloutDiagnostics[key] || 0) + 1;
+}
+
+// 领出时规则生成器理论上总会提供至少一个单张。这个独立兜底不依赖其
+// 枚举结果：若未来的生成器回归遗漏了所有着法，仍从本家实体牌重建最便宜
+// 的单张，避免把领出错误地降格为 pass 并静默丢弃整次 sweep。
+function cheapestLeadFallback(hand, level) {
+  const candidates = hand.flatMap((card) => parseHandVariants([card], level).map((parsed) => ({
+    cards: [card], hand: parsed,
+  })));
+  return candidates.sort((left, right) => (
+    rolloutStructureCost(left, hand, level) - rolloutStructureCost(right, hand, level)
+    || left.hand.power - right.hand.power
+    || handSignature(left.hand).localeCompare(handSignature(right.hand))
+  ))[0] || null;
+}
+
 function finishingRolloutPlay(plays) {
   return plays.slice().sort((left, right) => (
     Number(isBomb(left.hand)) - Number(isBomb(right.hand))
@@ -565,14 +584,27 @@ function finishingRolloutPlay(plays) {
 }
 
 /**
- * Choose an expert-oriented rollout action.  The optional legalPlaysOverride
- * is kept for the unit test that simulates a future generator returning only
- * bomb candidates; production callers always use generateLegalPlays.
+ * Choose an expert-oriented rollout action.  The optional third argument
+ * accepts either a legalPlays array override (unit tests simulating future
+ * generators returning only bomb candidates) or an options object with a
+ * custom legalPlayGenerator; production callers always use generateLegalPlays.
  */
-export function chooseRolloutPlay(state, seat, legalPlaysOverride = null) {
+export function chooseRolloutPlay(state, seat, legalPlaysOverrideOrOptions = null) {
   const hand = state.hands[seat];
-  const plays = legalPlaysOverride || generateLegalPlays(hand, state.level, state.lastHand);
-  if (!plays.length) return null;
+  const plays = Array.isArray(legalPlaysOverrideOrOptions)
+    ? legalPlaysOverrideOrOptions
+    : (legalPlaysOverrideOrOptions?.legalPlayGenerator || generateLegalPlays)(
+      hand, state.level, state.lastHand);
+  if (!plays.length) {
+    if (state.lastHand) return null;
+    const fallback = cheapestLeadFallback(hand, state.level);
+    if (fallback) {
+      countRolloutDiagnostic(state, 'leadFallbackUsed');
+      return fallback;
+    }
+    countRolloutDiagnostic(state, 'leadFallbackUnavailable');
+    return null;
+  }
   const finishing = plays.filter((play) => play.cards.length === hand.length);
   if (finishing.length) {
     return finishingRolloutPlay(finishing);
@@ -756,6 +788,9 @@ function simulateCandidate(sample, observation, candidate, limits) {
     limits.nodes.value += 1;
     plies += 1;
     if (!play) {
+      if (!state.lastHand) {
+        return { ok: false, utility: null, plies, reason: 'rollout_lead_missing_legal_play' };
+      }
       state.passed.add(seat);
       if (!closeTrickIfComplete(state)) state.currentSeat = nextResponder(state, seat);
       continue;
@@ -862,6 +897,49 @@ function selectOpenLoopActions(state, seat, maxBranch) {
   return actions.slice(0, maxBranch);
 }
 
+// 只读诊断：量化“专家首选 + pass + 低成本普通着法”在有限分支内是否挤掉
+// 合法炸弹。它不接入正式树搜索，不改变默认排序或搜索预算；若未来实验要
+// 预留炸弹槽，必须另行通过收益、灾难率和尾延迟门。
+export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5) {
+  const branch = clamp(Math.floor(Number(maxBranch) || 5), 2, 10);
+  const legal = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
+    .map(actionFromPlay);
+  const baseline = selectOpenLoopActions(state, seat, branch);
+  const bombs = legal.filter((action) => isBomb(action.hand)).sort((left, right) => (
+    rolloutStructureCost(left, state.hands[seat], state.level)
+    - rolloutStructureCost(right, state.hands[seat], state.level)
+    || left.hand.power - right.hand.power
+    || publicActionKey(left).localeCompare(publicActionKey(right))
+  ));
+  const reserved = baseline.slice();
+  let reservationApplied = false;
+  if (bombs.length && !reserved.some((action) => isBomb(action.hand))) {
+    const expert = chooseRolloutPlay(state, seat);
+    const protectedKeys = new Set([
+      expert ? publicActionKey(actionFromPlay(expert)) : null,
+      state.lastHand ? 'pass' : null,
+    ]);
+    const replaceIndex = reserved.map((action, index) => ({ action, index }))
+      .reverse()
+      .find(({ action }) => !protectedKeys.has(publicActionKey(action)))?.index;
+    if (replaceIndex != null) {
+      reserved[replaceIndex] = bombs[0];
+      reservationApplied = true;
+    }
+  }
+  const summary = (actions) => ({
+    actionCount: actions.length,
+    bombActions: actions.filter((action) => isBomb(action.hand)).length,
+    actionKeys: actions.map(publicActionKey),
+  });
+  return {
+    legalBombActions: bombs.length,
+    baseline: summary(baseline),
+    reserved: summary(reserved),
+    reservationApplied,
+  };
+}
+
 function rolloutFromSimulationState(state, rootTeam, limits) {
   let plies = 0;
   while (plies < limits.maxPlies && limits.nodes.value < limits.nodeBudget) {
@@ -888,6 +966,9 @@ function rolloutFromSimulationState(state, rootTeam, limits) {
     }
     const seat = state.currentSeat;
     const play = chooseRolloutPlay(state, seat);
+    if (!play && !state.lastHand) {
+      return { ok: false, utility: null, plies, reason: 'rollout_lead_missing_legal_play' };
+    }
     recordRolloutDiagnostic(limits, play?.rolloutDiagnostic);
     const action = play ? actionFromPlay(play) : { action: 'pass', cards: [], hand: null };
     limits.nodes.value += 1;
@@ -1283,7 +1364,11 @@ function runISMCTSSearch(observation, candidates, limits, options) {
     return {
       searchMode,
       iterations,
-      iterationBudget: sweepBudget,
+      // 输入 iterationBudget 是 rollout 总预算；v3 的一次 sweep 会消耗
+      // 全部根候选各一次 rollout。不能把 floor(total/candidates) 继续
+      // 伪标为 iterationBudget，否则会混淆两种计量单位。
+      rolloutBudget,
+      sweepBudget,
       pairedSweeps,
       sampledWorlds,
       sampleFailures,
@@ -1692,7 +1777,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   // v3 的成对单位是 sweep：每次 sweep 覆盖全部根候选，要求至少完成
   // requiredPairedSweeps 次（与成对 PIMC 的 requiredPairedWorlds 同构）。
   const requiredPairedSweeps = Math.max(
-    2, Math.min(rootMinimumEffectiveVisits, Number(search.iterationBudget) || 0),
+    2, Math.min(rootMinimumEffectiveVisits, Number(search.sweepBudget) || 0),
   );
   const rootEvidenceSufficient = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
     ? candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
@@ -1715,7 +1800,10 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     searchAttempted: true,
     searchTriggered: Number(search.iterations) > 0 || nodes.value > 0,
     iterations: search.iterations,
-    iterationBudget: search.iterationBudget || null,
+    ...(searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3 ? {
+      rolloutBudget: search.rolloutBudget || null,
+      sweepBudget: search.sweepBudget || null,
+    } : { iterationBudget: search.iterationBudget || null }),
     pairedWorlds: search.pairedWorlds || 0,
     pairedSweeps: search.pairedSweeps || 0,
     sampledWorlds: search.sampledWorlds || 0,
@@ -2094,7 +2182,10 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     } : null,
     searchMode: informationSet.searchMode || HYBRID_SEARCH_MODES.PIMC,
     iterations: informationSet.iterations || 0,
-    iterationBudget: informationSet.iterationBudget || null,
+    ...(informationSet.searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3 ? {
+      rolloutBudget: informationSet.rolloutBudget || null,
+      sweepBudget: informationSet.sweepBudget || null,
+    } : { iterationBudget: informationSet.iterationBudget || null }),
     pairedWorlds: informationSet.pairedWorlds || 0,
     pairedSweeps: informationSet.pairedSweeps || 0,
     sampledWorlds: informationSet.sampledWorlds || 0,

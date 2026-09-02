@@ -680,6 +680,9 @@ function rawTelemetry(primary, checkpoint) {
     samples: item.samples,
     nodes: item.nodes,
     iterations: item.iterations,
+    rolloutBudget: item.rolloutBudget,
+    sweepBudget: item.sweepBudget,
+    pairedSweeps: item.pairedSweeps,
   })));
   return {
     schema: 'guandan-ai-raw-telemetry-v1',
@@ -765,6 +768,9 @@ function makeGamesAndPairs(baseSeed, blocks, levelValues, segments, config) {
           samples: 1,
           nodes: 1,
           iterations: 1,
+          rolloutBudget: 0,
+          sweepBudget: 0,
+          pairedSweeps: 0,
         }];
         const hybrid = {
           turns: 1,

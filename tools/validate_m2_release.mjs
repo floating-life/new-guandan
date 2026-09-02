@@ -74,7 +74,7 @@ const TELEMETRY_FIELDS = Object.freeze([
   'searchTelemetryPresent', 'fallbackKindPresent', 'telemetryComplete',
   'latencyMs', 'source', 'fallbackKind', 'fallbackEvaluable', 'timeoutFallback',
   'searchAttempted', 'searchTriggered', 'candidates', 'samples', 'nodes',
-  'iterations',
+  'iterations', 'rolloutBudget', 'sweepBudget', 'pairedSweeps',
 ]);
 const CONTINUOUS_ROUND_FIELDS = Object.freeze([
   'round', 'level', 'levelsAfter', 'levelOwner', 'order', 'upgrade',
@@ -286,7 +286,8 @@ function validateTelemetry(telemetry, candidate, candidateTeam, label) {
     if (item.timeoutFallback !== (item.fallbackKind === 'local_timeout')) {
       throw new Error(`${label}[${index}] timeoutFallback 与 fallbackKind 不一致`);
     }
-    for (const field of ['candidates', 'samples', 'nodes', 'iterations']) {
+    for (const field of ['candidates', 'samples', 'nodes', 'iterations',
+      'rolloutBudget', 'sweepBudget', 'pairedSweeps']) {
       safeInteger(item[field], `${label}[${index}].${field}`, { min: 0 });
     }
   }
@@ -1098,7 +1099,7 @@ function validateRawTelemetry(input, report, checkpoint, candidate, implementati
     'variantPresent', 'localDecisionPresent', 'searchTelemetryPresent', 'fallbackKindPresent',
     'telemetryComplete', 'latencyMs', 'source', 'fallbackKind', 'fallbackEvaluable',
     'timeoutFallback', 'searchAttempted', 'searchTriggered', 'candidates', 'samples', 'nodes',
-    'iterations',
+    'iterations', 'rolloutBudget', 'sweepBudget', 'pairedSweeps',
   ];
   const segmentIds = new Set(checkpoint.provenance.runSegments.map((segment) => segment.runSegmentId));
   const expectedRecords = new Map();
@@ -1129,6 +1130,9 @@ function validateRawTelemetry(input, report, checkpoint, candidate, implementati
         samples: item.samples,
         nodes: item.nodes,
         iterations: item.iterations,
+        rolloutBudget: item.rolloutBudget,
+        sweepBudget: item.sweepBudget,
+        pairedSweeps: item.pairedSweeps,
       };
       const key = `${game.seed}/${game.level}/${game.candidateTeam}/${index + 1}/${item.seat}`;
       if (expectedRecords.has(key)) throw new Error(`${label} checkpoint 决策坐标重复`);
@@ -1177,6 +1181,10 @@ function validateRawTelemetry(input, report, checkpoint, candidate, implementati
       && Number.isFinite(record.latencyMs) && record.latencyMs >= 0
     )) {
       throw new Error(`${label}.records[${index}] telemetryComplete 与字段不一致`);
+    }
+    for (const field of ['candidates', 'samples', 'nodes', 'iterations',
+      'rolloutBudget', 'sweepBudget', 'pairedSweeps']) {
+      safeInteger(record[field], `${label}.records[${index}].${field}`, { min: 0 });
     }
     return record;
   });

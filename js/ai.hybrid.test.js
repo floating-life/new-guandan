@@ -14,6 +14,7 @@ import {
   chooseHybridFromConsultation, chooseRolloutPlay, configureHybridValueModel,
   evaluateInformationSetCandidates,
   evaluateHybridValueModel, extractHybridValueFeatures,
+  inspectOpenLoopBombCoverage,
   samplePublicInformationSets, validateHybridValueModel,
 } from './ai-hybrid.js';
 import { makePromotedValueModel } from './value-model.test-fixture.js';
@@ -62,6 +63,63 @@ console.log('availability-aware UCT');
   assert(availabilityAwareUctBonus(30, 3, 2) > bonus
     && availabilityAwareUctBonus(15, 6, 2) < bonus,
   'availability 增加会提高探索项，而同一动作访问增加会降低探索项');
+}
+
+console.log('rollout 首出不变量');
+{
+  const deck = createDeck();
+  const state = {
+    hands: [deck.slice(0, 9), [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  };
+  const normal = chooseRolloutPlay(state, 0);
+  assert(normal && normal.cards.length > 0 && normal.hand,
+    '9 张代表性首出总能选择实际牌型，不会返回 pass/null');
+
+  const fallbackState = {
+    ...state,
+    hands: state.hands.map((hand) => hand.slice()),
+    rolloutDiagnostics: {},
+  };
+  const fallback = chooseRolloutPlay(fallbackState, 0, { legalPlayGenerator: () => [] });
+  const legalSingles = generateLegalPlays(fallbackState.hands[0], fallbackState.level, null)
+    .filter((play) => play.cards.length === 1);
+  assert(fallback && legalSingles.some((play) => (
+    handSignature(play.hand) === handSignature(fallback.hand)
+      && play.cards[0].id === fallback.cards[0].id
+  )), '生成器异常时从实体牌重建最便宜的合法单张，而非把领出误作过牌');
+  assert(fallbackState.rolloutDiagnostics.leadFallbackUsed === 1,
+    '领出兜底会留下显式诊断，避免静默丢弃搜索 sweep');
+}
+
+console.log('开放环炸弹分支覆盖诊断');
+{
+  const deck = createDeck();
+  const cards = (rank, count = 1) => deck.filter((card) => card.rank === rank).slice(0, count);
+  const bomb = cards(6, 4);
+  const response = {
+    hands: [[...bomb, ...cards(10), ...cards(11), ...cards(12), ...cards(13), ...cards(14)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: parseHand(cards(9), 7), lastSeat: 1,
+  };
+  const urgent = inspectOpenLoopBombCoverage(response, 0, 5);
+  assert(urgent.legalBombActions >= 1 && urgent.baseline.bombActions === 0
+    && urgent.reserved.bombActions === 1 && urgent.reservationApplied,
+  '紧急可接局面量化出默认有限分支遗漏炸弹，诊断性预留槽能保留最小炸弹');
+
+  const finishing = inspectOpenLoopBombCoverage({
+    hands: [bomb, [], [], []], teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  }, 0, 5);
+  assert(finishing.legalBombActions === 1 && finishing.baseline.bombActions === 1
+    && !finishing.reservationApplied,
+  '收官整手炸弹本来就在专家首选中，诊断不会重复保留或改变其分支');
+
+  const lead = inspectOpenLoopBombCoverage({
+    hands: [[...bomb, ...cards(3), ...cards(4), ...cards(5), ...cards(8), ...cards(9), ...cards(10)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
+  }, 0, 5);
+  assert(lead.legalBombActions >= 1 && lead.baseline.bombActions === 0
+    && lead.reserved.bombActions === 1 && lead.reservationApplied,
+  '无目的领炸局面同样记录覆盖差异，但正式默认排序仍不接入预留槽');
 }
 
 console.log('公平观察白名单');
@@ -490,7 +548,10 @@ console.log('ISMCTS v3 根候选成对采样');
     'ISMCTS v3 在关键局面完成根候选成对采样搜索');
   assert(first.pairedSweeps === 6 && first.sampledWorlds === 6
     && first.iterations === 6 * candidates.length && first.treeNodes > 2,
-  'iterationBudget 与 v2 同口径按 rollout 总预算换算 sweep 数，每次 sweep 对每个根候选各下钻一次');
+  '输入 iterationBudget 作为 rollout 总预算换算 sweep 数，每次 sweep 对每个根候选各下钻一次');
+  assert(first.rolloutBudget === 12 && first.sweepBudget === 6
+    && !Object.hasOwn(first, 'iterationBudget'),
+  'v3 输出明确区分 rolloutBudget 与 sweepBudget，不再把 sweepBudget 伪标为 iterationBudget');
   assert(first.candidateResults.every((item) => (
     item.visits === first.pairedSweeps
     && item.availability === first.pairedSweeps
@@ -527,6 +588,32 @@ console.log('ISMCTS v3 根候选成对采样');
     && tooFewSweeps.pairedSweeps === 1
     && tooFewSweeps.candidateResults.every((item) => item.visits === 1),
   '成对 sweep 数不足时保留搜索遥测，但不允许作为改选证据');
+
+  for (let candidateCount = 2; candidateCount <= 6; candidateCount += 1) {
+    const multiOwn = deck.slice(0, candidateCount);
+    const multiHidden = [deck[27], deck[28], deck[54], deck[55], deck[81], deck[82]];
+    const multiUsed = new Set([...multiOwn, ...multiHidden].map(physicalKey));
+    const multiCandidates = multiOwn.map((card, index) => {
+      const hand = parseHand([card], 7);
+      return {
+        id: `budget_${candidateCount}_${index}`, action: 'play', cards: [card], hand,
+        signature: handSignature(hand), localScore: candidateCount - index,
+      };
+    });
+    const multi = evaluateInformationSetCandidates({
+      ...context,
+      hand: multiOwn,
+      handCounts: [candidateCount, 2, 2, 2],
+      playedCards: deck.filter((card) => !multiUsed.has(physicalKey(card))),
+    }, multiCandidates, {
+      ...options, iterationBudget: candidateCount * 3, minimumEffectiveVisits: 2,
+      nodeBudget: 4000, seed: 20260910 + candidateCount,
+    });
+    assert(multi.rolloutBudget === candidateCount * 3 && multi.sweepBudget === 3
+      && multi.iterations === multi.pairedSweeps * candidateCount
+      && !Object.hasOwn(multi, 'iterationBudget'),
+    `v3 ${candidateCount} 个候选保持 rollout/sweep/实际 pairedSweeps 三种预算口径一致`);
+  }
 }
 
 console.log('ISMCTS v3 失败 sweep 深层事务回滚');

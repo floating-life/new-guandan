@@ -237,6 +237,9 @@ function telemetry(candidate, candidateTeam, seat) {
     samples: 0,
     nodes: 0,
     iterations: 0,
+    rolloutBudget: 0,
+    sweepBudget: 0,
+    pairedSweeps: 0,
   };
 }
 
