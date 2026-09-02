@@ -2,7 +2,7 @@
 
 > 更新：2026-09-02
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；`EXPERT_POLICY_FEATURES` 的 STRAT-2/3/4 开关全部为 `false`。** 最新 v3 正常臂收益 CI 为正但性能门失败。EVID-9b 冻结提交 `585f099` 远端 CI 已通过。STRAT-5/RT 残余与本轮 STRAT-6/REL 已随提交 `c7e4c9b` 入库（main 领先 origin 11、未推送、远端 CI 未跑）；0903 独立审计：工作树 22/22 评测闭包文件 SHA 与正式报告一致、该提交树上统一验证 **48 checks** 通过，但提交 blob 因 `core.autocrlf` EOL 归一在 3 个闭包文件（ai-hybrid / ai.ab.simulation / ai.ab.telemetry）上与评测时字节不同（blob 聚合 `8c6b1224…`≠`94cccadd…`），**字节级提交冻结未达成**。STRAT-6 正式三臂已在实现 SHA `94cccadd…`（= 评测时工作树闭包）、种子 `20268111–20268150` 上收割：STRAT-2 数字门通过（0903 只读晋级审查经 checkpoint 独立复算属实），但审查裁定 **not-eligible**（唯一阻断＝字节冻结），不得进入 expert 默认；STRAT-3 CI/灾难未过门；STRAT-4 与 expert 完全等价（CI `[0,0]`，消融对该规则无证据力）。REL-1 是脚本化三副而非真人手打；笔记本/手机卡顿未测。ALGO-2 仅为代码门，不构成性能/强度/发布证据。
+> 当前结论：**expert 保持默认（含 0903 晋级翻转为 true 的 STRAT-2）；没有 `promoted` 模型；`EXPERT_POLICY_FEATURES` 的 STRAT-3/4 开关仍为 `false`。** 最新 v3 正常臂收益 CI 为正但性能门失败。EVID-9b 冻结提交 `585f099` 远端 CI 已通过。STRAT-5/RT 残余与 STRAT-6/REL 已随 `c7e4c9b` 入库；0903 独立审计发现提交 blob 因 `core.autocrlf` EOL 归一导致字节级冻结未达成，已以 `.gitattributes` closure-eol（22 个闭包文件 `-text`）修复，提交 blob 22/22 逐文件与聚合 `94cccadd…` 完全复现（0903 字节冻结提交），并在该提交树上复跑统一验证 **48 checks** 通过。STRAT-6 正式三臂（实现 SHA `94cccadd…`、种子 `20268111–20268150`）：STRAT-2 数字门通过且经字节冻结修复与用户授权后**翻转进入正式大师默认**（本提交，baseline 保持 false）；STRAT-3 CI/灾难未过门；STRAT-4 与 expert 完全等价（CI `[0,0]`，消融对该规则无证据力）。REL-1 是脚本化三副而非真人手打；笔记本/手机卡顿未测。ALGO-2 仅为代码门，不构成性能/强度/发布证据。
 
 ## 当前停止线
 
@@ -12,7 +12,7 @@
 - [x] 暂不启动正式 DMC/DanZero 训练，不把 `trainingEligible=false` 的外部轨迹并入训练。
 - [ ] R1A 完成前，不把 active-match 完整快照暴露给智能体，不把真人复盘或智能体意见直接并入训练；所有新增真人轨迹默认 `trainingEligible=false`。
 - [x] STRAT-6 已用预登记未见种子 `20268111–20268150` 完成三条独立正式镜像臂（各 40 区组 × 13 级 = 520 对）；未达门或未 git 提交冻结的规则保持关闭。
-- [ ] 0903 只读晋级审查（STRAT-2）：四门数字经 checkpoint 独立复算属实、`searchTriggered` 门按路线图 §3 语义不适用（纯 expert 策略臂零触发）、级牌/先手分层负项属样本噪声不阻断（翻转时须披露残余风险）；唯一阻断为字节级提交冻结，**已修复**——0903 新增 `.gitattributes` 对 22 个评测闭包文件声明 `-text` 并 `git add --renormalize` 后，索引/提交 blob 22/22 逐文件与聚合 `94cccadd…` 完全复现。用户已授权按审查条件自动翻转；翻转提交落地并重跑统一验证前，expert 默认仍不变，也不得打开 STRAT-3/4。
+- [x] STRAT-2 已按 0903 审查条件完成翻转：字节冻结修复（`.gitattributes` closure-eol，blob 22/22 复现 `94cccadd…`）→ 本提交仅改 `js/ai.js` 的 `EXPERT_POLICY_FEATURES.reserveHighControlLead: true`（baseline 保持 false）并刷新夹具指纹（新聚合 `2d37d72c…`），统一验证 49 checks 退出 0；`searchTriggered` 门不适用与分层残余风险（级牌 2/6/8/10 负效用、级牌 8 -0.125、下家 -0.154/上家 -0.385、队伍不对称 team0 -0.042 / team1 +0.273）已如实披露于 0903 台账。STRAT-3/4 保持关闭；翻转后不得宣称 promoted 模型或 `releaseEvidenceReady=true`，后续发布证据须与新提交重新互绑。
 - [x] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子；EVID-9b 已在冻结提交上经远端 CI 闭环。
 - [x] SEC-1～3 已完成：不在聊天、日志或文档中展示抽取到的令牌值；EVID-9b 仅提交已验证候选快照。
 
@@ -96,7 +96,7 @@
 ## P1-B：复盘驱动的专家策略修复（新增，可与 R0/R1A 并行）
 
 - [x] **STRAT-1：冻结可复算反例与证据边界。** 新增 `tools/strategy-counterexamples.json` 与 `tools/test_strategy_counterexamples.mjs`：只保存行动座位手牌、公开历史、合法候选和预期不变量，observation 顶层采用严格白名单，绑定 `guandan-rules-v1`、`js/ai.js`/`js/cards.js`/`js/evaluator.js`/`js/rules.js`/`js/strategy-core.js` 文件摘要及聚合 SHA；4 个 STRAT-4 机制夹具与换名暗牌负例验证 24/24。历史复盘原始导出已删除，旧命中数仍只作不可独立复算线索，不作为失误率。
-- [x] **STRAT-2：收口当前满手保留大三张修复。** 新增独立 `policyFeatures.reserveHighControlLead` 与 `with-reserved-high-control-lead` 候选变体，正式 expert/baseline 默认关闭；AI、共享策略和教练统一按出牌后剩余张数 `>8` 判定，特殊惩罚只由共享策略源产生，移除 `ai.js` 对三带二的重复 `power×系数` 惩罚，并移除教练入口的重复事件。已覆盖 11/13/14 张边界、三带二主张/带对、逢人配多解声明、默认关闭、候选开启时的两手收官豁免和单次扣分。STRAT-6 正式臂数字门通过（见下）；0903 晋级审查数字属实但裁定 not-eligible（字节冻结未达成），保持关闭。
+- [x] **STRAT-2：收口当前满手保留大三张修复。** 新增独立 `policyFeatures.reserveHighControlLead` 与 `with-reserved-high-control-lead` 候选变体，正式 expert/baseline 默认关闭；AI、共享策略和教练统一按出牌后剩余张数 `>8` 判定，特殊惩罚只由共享策略源产生，移除 `ai.js` 对三带二的重复 `power×系数` 惩罚，并移除教练入口的重复事件。已覆盖 11/13/14 张边界、三带二主张/带对、逢人配多解声明、候选开启时的两手收官豁免和单次扣分。STRAT-6 正式臂数字门通过（见下）；0903 字节冻结修复后按审查条件翻转，`reserveHighControlLead` 自本提交起进入正式大师默认（baseline 保持 false），旧"默认关闭"断言已更新为晋级状态并加严守住 STRAT-3/4 关闭；分层残余风险见 0903 台账。
 - [x] **STRAT-3：实现任一对手报单的安全领牌约束。** 新增默认关闭的 `enemyReportLeadSafety` 与 `with-enemy-report-lead-safety` 候选；共享 `strategy-core` 按所有未出完敌方座位识别报单，并仅在完整合法候选含不拆炸/逢人配/王的安全非单或 `public_lock_lead` 路线时过滤 J 及以下低单。无替代动作、整手收官或跟牌分支不触发，避免机械“永不出 ≤J”；AI、教练与本地混合候选池复用同一过滤器。领牌解释、云端咨询和旧式混合首选回退也经过同一安全门，不能把被过滤低单重新送入搜索。已覆盖上家/下家双报单、仅炸弹回退、默认关闭、唯一共享事件、紧凑顶层 `tags`、`{play,strategy}` 包装和跨入口回归。STRAT-6 正式臂 CI 下界跨 0 且灾难门失败，保持关闭。
 - [x] **STRAT-4：修正队友牌权的硬优先级。** `assessPartnerTrickControl` 先用公开历史确认对家仍是本圈赢家，再确认活跃对手均已过牌/出完；`partnerTrickControl` 候选开关默认关闭。AI、教练评价和混合咨询在进入 P3、紧急拦截或普通接牌前优先接风，并写入唯一 `tacticalConstraint`/共享标签；整手出完保留明确例外，`partnerFinished=true` 不再静默落入接对手。已补未行动对手、刚出完、无历史证据和整手收官回归。STRAT-6 正式臂与 expert 完全等价（CI `[0,0]`），下界未严格大于 0，保持关闭；规则已接入 expert 决策路径但触发条件苛刻（对家持本圈牌权且全部活跃对手已让牌），1040 局零分歧说明本消融对该规则无证据力，而非证明无用。
 - [x] **STRAT-5：把同一安全约束放在搜索候选入口（本地代码门）。** `js/strategy-core.js` 新增 `filterEligibleStrategyActions`：STRAT-3 后 STRAT-4，feature 关闭返回同一数组引用；STRAT-3 阻断后不再还原原集合。expert 领出、`getAIConsultation`、`chooseHybridFromConsultation`、`evaluateInformationSetCandidates`（PIMC / 成对根 PIMC / ISMCTS v2/v3 根）共用该层；ISMCTS 内节点仅当 `seat === observation.seat` 时过滤，对手/对家内节点与 `chooseRolloutPlay` 不套用本家规则。空集：跟牌注入/回退过牌，领出不合成 pass、不执行被阻断首选。`enemyReportLeadSafety` / `partnerTrickControl` 仍默认关闭。逐引擎回归：`node js/ai.test.js` **369/369**，`node js/ai.hybrid.test.js` **105/105**，夹具指纹 **24/24**。独立 Sol 审查 PASS（有残余风险）：根执行不能选出被排除着法；内节点仍用根 `publicHistory` 判断 STRAT-4（后续模拟圈可能漏过滤），rollout 估值仍可走被禁线。这不是镜像收益、灾难率、性能或 expert 默认晋级。

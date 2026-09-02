@@ -86,8 +86,11 @@ const EXPERT_POLICY_FEATURES = Object.freeze({
   // 真实复盘实验：对手跨牌型连续控圈且短时间大量减牌时，允许用最低损伤
   // 普通牌截断。先保留为独立实验臂，镜像赛通过后再发布到大师默认策略。
   highShedRunBlock: false,
-  // STRAT-2：长手保留 A/级牌三张或三带二。必须先经过独立消融与镜像门。
-  reserveHighControlLead: false,
+  // STRAT-2：长手保留 A/级牌三张或三带二。已通过 STRAT-6 未见种子镜像门
+  // （40 区组×13 级，CI [0.047,0.188]，双下 220≤255，零失败），证据随
+  // .gitattributes 字节冻结绑定到提交（0903 只读晋级审查），进入正式大师
+  // 默认；baseline 保持 false 以保留可比性，翻转残余风险见 todo.md 0903 台账。
+  reserveHighControlLead: true,
   // STRAT-4：队友仍持有本圈牌权且对手均已让牌时，优先接风；先过代码门，
   // 通过独立变体和镜像门后再讨论是否进入正式策略。
   partnerTrickControl: false,

@@ -422,8 +422,8 @@ console.log('满手不先甩三个A或三个级牌');
     { cards: aceFullHouse, hand: parseHand(aceFullHouse, level) },
     { ...ctx, policyFeatures: resolvePolicyVariant('expert').policyFeatures, mode: 'lead' },
   );
-  assert(!defaultStrategy.tags.includes('premature_high_control'),
-    '正式 expert 默认关闭 STRAT-2，不把候选修复偷渡到默认策略');
+  assert(defaultStrategy.tags.includes('premature_high_control'),
+    '正式 expert 默认启用 STRAT-2（0903 晋级），满手先交AAA三带二被标记保留');
 
   const coach = evaluatePlay({
     action: 'play',
@@ -2906,15 +2906,17 @@ console.log('P0-P5 独立消融开关');
       && full.policyFeatures.controlV2 && !full.policyFeatures.controlRiskV2
       && full.policyFeatures.cheapControl && !full.policyFeatures.partnerCover
       && full.policyFeatures.placementControl && full.policyFeatures.publicLockLead
-      && !full.policyFeatures.reserveHighControlLead,
-    '正式 expert 显式启用 P0-P5，STRAT-2 候选和旧控权V2概率实验仍保持关闭');
+      && full.policyFeatures.reserveHighControlLead
+      && !full.policyFeatures.partnerTrickControl
+      && !full.policyFeatures.enemyReportLeadSafety,
+    '正式 expert 显式启用 P0-P5 与已晋级的 STRAT-2；旧控权V2实验与 STRAT-3/4 仍保持关闭');
   assert(reservedHighControl.policyProfile === 'expert'
       && reservedHighControl.policyFeatures.reserveHighControlLead
       && reservedHighControl.policyFeatures.p0
       && reservedHighControl.policyFeatures.p1
       && JSON.stringify(reservedHighControl.policyFeatures)
-        !== JSON.stringify(full.policyFeatures),
-    'STRAT-2 通过独立变体开启，且不改变其它 expert 特征');
+        === JSON.stringify(full.policyFeatures),
+    'STRAT-2 晋级后独立变体与正式 expert 特征一致（保留变体用于历史消融复现）');
   assert(p2On.policyProfile === 'expert' && p2On.policyFeatures.p0
       && p2On.policyFeatures.p1 && p2On.policyFeatures.p2 && p2On.policyFeatures.endgame,
     'p2-on 旧命令继续映射到含新版 P2 的正式策略');
