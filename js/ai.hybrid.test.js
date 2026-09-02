@@ -1253,6 +1253,34 @@ console.log('STRAT-5：搜索入口共用 eligible-action 层');
   const controlInner = inspectOpenLoopBombCoverage(innerState, 0, 5);
   assert(JSON.stringify(offInner.baseline.actionKeys) === JSON.stringify(controlInner.baseline.actionKeys),
     'feature 关闭时内节点 4 参数路径与 3 参数对照相同');
+
+  // STRAT-5 P2-a：内节点让牌判定必须封闭于模拟世界——根 publicHistory 里的
+  // 过时让牌不得并入本圈判定（修复前会把模拟世界内已接牌/未行动的对手
+  // 误判为已让牌，错误把本家内节点剪枝成过牌+整手）。
+  const staleHistory = [
+    { action: 'play', seat: 2, trickNumber: 7 },
+    { action: 'pass', seat: 1, trickNumber: 7 },
+    { action: 'pass', seat: 3, trickNumber: 7 },
+  ];
+  const freshWorldState = { ...innerState, passed: new Set() };
+  const staleObservation = { ...innerObservation, publicHistory: staleHistory };
+  const staleInner = inspectOpenLoopBombCoverage(freshWorldState, 0, 5, { observation: staleObservation });
+  assert(staleInner.baseline.actionKeys.some((key) => key.startsWith('play:7:S:0|')),
+    '内节点 STRAT-4 封闭于模拟世界，根历史里的过时让牌不得触发剪枝');
+
+  const worldPassedAll = { ...innerState, passed: new Set([1, 3]) };
+  const worldPassObservation = { ...innerObservation, publicHistory: [] };
+  const worldPassInner = inspectOpenLoopBombCoverage(worldPassedAll, 0, 5, { observation: worldPassObservation });
+  assert(worldPassInner.baseline.actionKeys.includes('pass')
+      && !worldPassInner.baseline.actionKeys.some((key) => key.startsWith('play:7:S:0|')),
+    '模拟世界自身的让牌仍驱动内节点 STRAT-4，不因隔离根历史而回退');
+
+  const staleOff = inspectOpenLoopBombCoverage(freshWorldState, 0, 5, {
+    observation: { ...staleObservation, policyFeatures: { enemyReportLeadSafety: false, partnerTrickControl: false } },
+  });
+  const staleControl = inspectOpenLoopBombCoverage(freshWorldState, 0, 5);
+  assert(JSON.stringify(staleOff.baseline.actionKeys) === JSON.stringify(staleControl.baseline.actionKeys),
+    'feature 关闭时过时根历史也不影响内节点扩展');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

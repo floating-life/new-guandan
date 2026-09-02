@@ -885,6 +885,11 @@ function selectOpenLoopActions(state, seat, maxBranch, options = null) {
     mode: state.lastHand ? 'beat' : 'lead',
     seat,
     teams: state.teams,
+    // 根 observation 的 publicHistory 在模拟世界内已过时：推进若干圈后，
+    // 根时刻的对手让牌不得并入本圈让牌判定。置空使判定封闭于本模拟世界
+    // 的 state.passed——与根层语义一致（根层也只数最近一次真实出牌之后
+    // 的让牌）。见 ai.hybrid.test.js 的内节点封闭性断言。
+    publicHistory: [],
   } : null;
   const plays = filterCtx
     ? filterEligibleStrategyActions(rawPlays, filterCtx, { allowPlacementExceptions: false }).entries
