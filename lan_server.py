@@ -1225,6 +1225,10 @@ class ReplayEventStore:
         self._reader_last_at = None
         self._reader_last_sequence = None
         self._chain_floors = self._load_chain_floors()
+        # 进程内事件索引（惰性构建）：一次全量扫描建立，此后 append/read/status
+        # 复用，消除"每次请求全量重扫日志"的平方级成本。分片字节数与记录状态
+        # 不一致（外部截断/删除）即失效重建，重建仍走全量校验并锁存链缺口。
+        self._index = None
         if enabled:
             self.enable(capability_token, token_ttl_seconds)
 
@@ -1294,6 +1298,7 @@ class ReplayEventStore:
             self._enabled = True
             self._gap = False
             self._last_error = None
+            self._index = None
             return self._capability_token
 
     def disable(self) -> None:
@@ -1308,7 +1313,8 @@ class ReplayEventStore:
             last_sequence = None
             last_match_id = None
             try:
-                records = self._scan_locked()
+                index = self._ensure_index_locked()
+                records = index["order"]
                 if records:
                     last_sequence = records[-1]["sequence"]
                     last_match_id = records[-1]["matchId"]
@@ -1445,6 +1451,50 @@ class ReplayEventStore:
                 previous = event
         return records
 
+    def _shard_sizes_locked(self) -> dict[str, int]:
+        try:
+            return {file.name: file.stat().st_size for file in self._files_locked()}
+        except OSError as exc:
+            raise ReplayStoreError("storage_unavailable", f"无法读取复盘采集目录：{exc}") from exc
+
+    def _index_valid_locked(self) -> bool:
+        if self._index is None:
+            return False
+        try:
+            return self._shard_sizes_locked() == self._index["shard_sizes"]
+        except ReplayStoreError:
+            return False
+
+    def _ensure_index_locked(self) -> dict:
+        """返回进程内事件索引；失效（首次访问/清理后/外部改动）时重建。
+
+        重建走 _scan_locked 的全量读取、契约校验与链缺口锁存——索引只加速，
+        绝不替代校验：任何异常都退回全量扫描并按原语义 fail closed。"""
+        if self._index is not None and self._index_valid_locked():
+            return self._index
+        records = self._scan_locked()
+        if self._gap:
+            self._index = None
+            return {"order": [], "by_event": {}, "tails": {}, "shard_sizes": {}}
+        by_event: dict[str, str] = {}
+        tails: dict[str, dict] = {}
+        for event in records:
+            by_event[event["eventId"]] = event["eventSha256"]
+            tails[event["matchId"]] = {
+                "sequence": event["sequence"],
+                "eventSha256": event["eventSha256"],
+            }
+        self._index = {
+            "order": records,
+            "by_event": by_event,
+            "tails": tails,
+            "shard_sizes": self._shard_sizes_locked(),
+        }
+        return self._index
+
+    def _index_invalidate_locked(self) -> None:
+        self._index = None
+
     def _record_chain_floors_locked(self) -> None:
         """有意的保留期/容量清理之后，为不再从 sequence=0 开始的留存链记录链楼层。"""
         records = self._read_records_locked()
@@ -1468,12 +1518,14 @@ class ReplayEventStore:
         now = time.time()
         files = self._files_locked()
         pruned_committed = False
+        removed_any = False
         for file in files:
             try:
                 if now - file.stat().st_mtime > self.retention_seconds:
                     if file.stat().st_size > 0:
                         pruned_committed = True
                     file.unlink()
+                    removed_any = True
             except OSError as exc:
                 raise ReplayStoreError("storage_unavailable", f"无法轮转旧复盘文件：{exc}") from exc
         files = self._files_locked()
@@ -1487,10 +1539,14 @@ class ReplayEventStore:
                 if sizes[file] > 0:
                     pruned_committed = True
                 file.unlink()
+                removed_any = True
                 total -= sizes[file]
                 capacity_pruned = True
             except OSError as exc:
                 raise ReplayStoreError("storage_unavailable", f"无法释放复盘空间：{exc}") from exc
+        if removed_any:
+            # 任何 unlink（含空分片）都改变分片集合：索引失效，由调用方重建。
+            self._index = None
         if capacity_pruned and total + needed_bytes > self.max_bytes:
             # 删完仍超容量：已删除文件的链楼层不会登记，后续扫描按结构损坏锁存。
             raise ReplayStoreError("storage_full", "复盘采集空间已满")
@@ -1523,15 +1579,15 @@ class ReplayEventStore:
             if not self._enabled:
                 raise ReplayStoreError("collector_disabled", "复盘采集未启用")
             try:
-                records = self._scan_locked()
+                index = self._ensure_index_locked()
                 if self._gap:
                     raise ReplayStoreError("storage_corrupt", "复盘事件链存在缺口，采集已停止")
-                for existing in reversed(records):
-                    if existing["eventId"] == event["eventId"]:
-                        if existing["eventSha256"] == event["eventSha256"]:
-                            return {"ok": True, "duplicate": True, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
-                        raise ReplayStoreError("event_conflict", "相同 eventId 的事件摘要不一致")
-                previous = next((item for item in reversed(records) if item["matchId"] == event["matchId"]), None)
+                known_sha = index["by_event"].get(event["eventId"])
+                if known_sha is not None:
+                    if known_sha == event["eventSha256"]:
+                        return {"ok": True, "duplicate": True, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
+                    raise ReplayStoreError("event_conflict", "相同 eventId 的事件摘要不一致")
+                previous = index["tails"].get(event["matchId"])
                 if previous is None:
                     if event["sequence"] != 0 or event["previousEventSha256"] is not None:
                         raise ReplayStoreError("event_chain_gap", "新事件链必须从 sequence=0 开始")
@@ -1539,6 +1595,12 @@ class ReplayEventStore:
                     raise ReplayStoreError("event_chain_gap", "复盘事件 sequence 或前序摘要不连续")
                 self.root.mkdir(parents=True, exist_ok=True)
                 pruned_committed = self._prune_locked(len(line))
+                if self._index is None:
+                    # prune 删除了分片（含空分片）：分片集合已变，先重建索引，
+                    # 保证后续的尾部状态与分片快照来自同一份已校验数据。
+                    index = self._ensure_index_locked()
+                    if self._gap:
+                        raise ReplayStoreError("storage_corrupt", "复盘事件链存在缺口，采集已停止")
                 target = self._target_file_locked(len(line))
                 original_size = target.stat().st_size if target.exists() else 0
                 descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -1556,11 +1618,24 @@ class ReplayEventStore:
                     os.close(descriptor)
                 if pruned_committed:
                     # 有意的保留期/容量清理之后，新事件已落盘成为留存链的新头，
-                    # 此刻才能把链楼层登记到它的序号与前序摘要上。
+                    # 此刻才能把链楼层登记到它的序号与前序摘要上。清理改变分片
+                    # 集合：索引失效，由紧随的全量扫描重建并裁决链完整性。
+                    self._index = None
                     self._record_chain_floors_locked()
-                self._scan_locked()
-                if self._gap:
-                    raise ReplayStoreError("storage_corrupt", "容量或保留期清理造成复盘事件链缺口，采集已停止")
+                    self._scan_locked()
+                    if self._gap:
+                        raise ReplayStoreError("storage_corrupt", "容量或保留期清理造成复盘事件链缺口，采集已停止")
+                else:
+                    # 正常路径：写入全程持有 _condition，状态在锁内单调推进，
+                    # 等价于原先的写后全量扫描；外部改动由下一次
+                    # _ensure_index_locked 的分片字节数比对捕获并失效重建。
+                    index["order"].append(event)
+                    index["by_event"][event["eventId"]] = event["eventSha256"]
+                    index["tails"][event["matchId"]] = {
+                        "sequence": event["sequence"],
+                        "eventSha256": event["eventSha256"],
+                    }
+                    index["shard_sizes"][target.name] = original_size + len(line)
                 self._last_error = None
                 self._condition.notify_all()
                 return {"ok": True, "duplicate": False, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
@@ -1586,13 +1661,14 @@ class ReplayEventStore:
             if not self._enabled:
                 raise ReplayStoreError("collector_disabled", "复盘采集未启用")
             while True:
-                records = self._scan_locked()
+                index = self._ensure_index_locked()
                 if self._gap:
                     # fail-closed 读取：链缺口/结构损坏锁存后不得再返回任何记录，
                     # 避免只按 nextSequence 翻页的读取方静默吞掉有洞的事件链。
                     raise ReplayStoreError(
                         "storage_corrupt", self._last_error or "复盘事件链存在缺口，读取已停止",
                     )
+                records = index["order"]
                 selected_match = match_id
                 if selected_match is None and records:
                     selected_match = records[-1]["matchId"]

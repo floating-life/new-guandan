@@ -453,6 +453,76 @@ def main() -> int:
             passed += 1
             print("  [OK] 未登记楼层的外部删除锁存缺口，读取与写入均 fail closed")
 
+            indexed_root = Path(temporary) / "indexed"
+            indexed_store = lan_server.ReplayEventStore(
+                indexed_root, enabled=True, capability_token="i" * 40,
+            )
+            i_first = replay_event(0, None, "indexed-0")
+            i_second = replay_event(1, i_first["eventSha256"], "indexed-1")
+            indexed_store.append(i_first)
+            indexed_store.append(i_second)
+            duplicate = indexed_store.append(i_second)
+            assert duplicate["ok"] and duplicate["duplicate"] is True
+            conflict = dict(i_second)
+            conflict["round"] = conflict["round"] + 9
+            conflict_payload = dict(conflict)
+            conflict_payload.pop("eventSha256")
+            conflict["eventSha256"] = lan_server._replay_sha256(lan_server._replay_stable_json(conflict_payload))
+            try:
+                indexed_store.append(conflict)
+                raise AssertionError("索引路径未拒绝相同 eventId 的不同摘要")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "event_conflict"
+            page = indexed_store.read(0, 10, i_first["matchId"])
+            assert [item["sequence"] for item in page["events"]] == [1]
+            assert indexed_store.status()["lastSequence"] == 1
+            passed += 1
+            print("  [OK] 进程内索引支持幂等、冲突拒绝、游标续读与状态统计")
+
+            truncated_root = Path(temporary) / "truncated"
+            truncated_store = lan_server.ReplayEventStore(
+                truncated_root, enabled=True, capability_token="r" * 40,
+            )
+            tr0 = replay_event(0, None, "trunc-0")
+            tr1 = replay_event(1, tr0["eventSha256"], "trunc-1")
+            truncated_store.append(tr0)
+            truncated_store.append(tr1)
+            shard = next(truncated_root.glob("events-*.ndjson"))
+            with shard.open("r+b") as handle:
+                handle.truncate(shard.stat().st_size - 40)
+            try:
+                truncated_store.append(replay_event(2, tr1["eventSha256"], "trunc-2"))
+                raise AssertionError("外部截断未被发现")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            assert truncated_store.status()["gap"] is True
+            try:
+                truncated_store.read(-1, 10)
+                raise AssertionError("外部截断锁存后读取未 fail closed")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            passed += 1
+            print("  [OK] 分片被外部截断后索引失效重建并锁存结构缺口")
+
+            deleted_root = Path(temporary) / "deleted"
+            deleted_store = lan_server.ReplayEventStore(
+                deleted_root, enabled=True, capability_token="d" * 40,
+            )
+            d0 = replay_event(0, None, "deleted-0")
+            deleted_store.append(d0)
+            next(deleted_root.glob("events-*.ndjson")).unlink()
+            try:
+                deleted_store.append(replay_event(1, d0["eventSha256"], "deleted-1"))
+                raise AssertionError("外部整分片删除未按链规则拒绝")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "event_chain_gap"
+            fresh_chain = replay_event(0, None, "deleted-fresh-0")
+            assert deleted_store.append(fresh_chain)["ok"] is True
+            fresh_page = deleted_store.read(-1, 10, fresh_chain["matchId"])
+            assert [item["sequence"] for item in fresh_page["events"]] == [0]
+            passed += 1
+            print("  [OK] 整分片外部删除后索引重建按空链处理，新链仍可正常采集")
+
             full_store = lan_server.ReplayEventStore(
                 Path(temporary) / "full", enabled=True, capability_token="f" * 40,
             )
