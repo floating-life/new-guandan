@@ -209,6 +209,12 @@ export function createReplayEventQueue({
   // no longer be trusted. Keep it separate from a temporarily recoverable
   // out-of-order enqueue gap, which may be repaired before a refresh.
   let integrityLock = false;
+  // Matches whose pending tail was cleared mid-game. Their server-side chain
+  // can never be completed, so continued play must stop cleanly (existing
+  // unreproducible_match path) instead of enqueueing into an unbridgeable gap.
+  // Persisted so a refresh cannot silently resume collection into the hole.
+  let brokenMatches = [];
+  let clearAfterFlushMatches = null;
 
   function persisted() {
     return {
@@ -220,6 +226,7 @@ export function createReplayEventQueue({
       integrityGap,
       integrityLock,
       durabilityGap,
+      brokenMatches: clone(brokenMatches),
     };
   }
 
@@ -331,6 +338,9 @@ export function createReplayEventQueue({
       // durable lock: a refresh must not turn an earlier integrity alarm into
       // a clean queue merely because the remaining events happen to be linked.
       integrityLock = parsed.integrityGap === true || parsed.integrityLock === true;
+      brokenMatches = Array.isArray(parsed.brokenMatches)
+        ? [...new Set(parsed.brokenMatches.filter((id) => typeof id === 'string' && id))].slice(-limit)
+        : [];
       durabilityGap = !storageIsDurable || parsed.durabilityGap === true;
       durable = storageIsDurable && !durabilityGap;
       const loaded = Array.isArray(parsed.events) ? parsed.events : [];
@@ -456,6 +466,10 @@ export function createReplayEventQueue({
         // remaining pending events now that no await is outstanding.
         clearAfterFlush = false;
         events = [];
+        if (clearAfterFlushMatches) {
+          brokenMatches = [...new Set([...brokenMatches, ...clearAfterFlushMatches])];
+          clearAfterFlushMatches = null;
+        }
         persist();
       }
       if (retryAfter != null) scheduleFlush(retryAfter);
@@ -485,6 +499,12 @@ export function createReplayEventQueue({
           latchIntegrityGap('相同 eventId 的事件摘要不一致');
           persist();
           return { ok: false, reason: 'event_conflict' };
+        }
+        if (event.sequence > 0 && brokenMatches.includes(event.matchId)) {
+          // Mid-game clear destroyed this match's pending tail: new events
+          // would leave a permanent server-side hole. Reject with the existing
+          // stop-collection reason so the UI shows the "new match" recovery hint.
+          return { ok: false, reason: 'unreproducible_match', queued: false };
         }
         if (event.sequence > 0 && !hasMatchTrace(event.matchId)) {
           return { ok: false, reason: 'unreproducible_match', queued: false };
@@ -527,12 +547,16 @@ export function createReplayEventQueue({
         // Never clear underneath an in-flight submission: its acknowledgement
         // must still match the head event. Defer the clear to flush's finally.
         clearAfterFlush = true;
+        clearAfterFlushMatches = brokenMatchIds;
         return {
           ok: true, deferred: true, pendingCount: events.length, brokenMatchIds,
           gap: integrityGap || durabilityGap || droppedCount > 0,
         };
       }
       events = [];
+      if (brokenMatchIds.length) {
+        brokenMatches = [...new Set([...brokenMatches, ...brokenMatchIds])];
+      }
       persist();
       return {
         ok: true, pendingCount: 0, brokenMatchIds,

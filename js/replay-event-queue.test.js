@@ -568,6 +568,77 @@ console.log('RT-2 本机复盘待发队列');
     '同一对局后续序号在已有轨迹上继续入队');
 }
 
+{
+  // RT#13 残余：对局进行中清空待发后，cursor/acked 仍保留轨迹，继续出牌
+  // 必须干净停采（既有 unreproducible_match 恢复路径），而不是把缺口写进队列。
+  const target = storage();
+  const jobs = scheduler();
+  const queue = createReplayEventQueue({
+    storage: target,
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+  });
+  const first = event(0, null, 'rt13:event-0', 'rt13-match');
+  const second = event(1, first.eventSha256, 'rt13:event-1', 'rt13-match');
+  queue.enqueue(first);
+  queue.enqueue(second);
+  queue.setEnabled(false);
+  const cleared = queue.clearPending();
+  assert(cleared.ok && cleared.brokenMatchIds.includes('rt13-match'),
+    '对局进行中清空待发会登记断链对局');
+  const persisted = JSON.parse(target.values.get('guandan_replay_pending_v1'));
+  assert(Array.isArray(persisted.brokenMatches) && persisted.brokenMatches.includes('rt13-match'),
+    '断链标记随队列持久化，刷新后仍生效');
+  const resumed = createReplayEventQueue({
+    storage: target,
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+  });
+  const continuation = resumed.enqueue(event(2, second.eventSha256, 'rt13:event-2', 'rt13-match'));
+  assert(!continuation.ok && continuation.reason === 'unreproducible_match'
+    && resumed.snapshot().pendingCount === 0,
+    '刷新恢复后继续出牌被干净停采，不把缺口写进队列');
+  assert(!resumed.snapshot().integrityGap && !resumed.snapshot().integrityLock,
+    '停采不误锁存全局完整性缺口，保留新开一局恢复路径');
+  const fresh = event(0, null, 'rt13:fresh-0', 'rt13-fresh');
+  const queuedFresh = resumed.enqueue(fresh);
+  assert(queuedFresh.ok && queuedFresh.queued,
+    '新对局 sequence=0 不受旧断链标记影响');
+}
+
+{
+  // RT#13 残余：flush 进行中推迟的清空，落地后同样登记断链并拒绝续写。
+  const jobs = scheduler();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const queue = createReplayEventQueue({
+    storage: storage(),
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+    submit: async (item) => { await gate; return accepted(item); },
+  });
+  const first = event(0, null, 'rt13d:event-0', 'rt13-deferred');
+  const second = event(1, first.eventSha256, 'rt13d:event-1', 'rt13-deferred');
+  queue.enqueue(first);
+  queue.enqueue(second);
+  const flushing = queue.flush();
+  queue.setEnabled(false);
+  const cleared = queue.clearPending();
+  assert(cleared.ok && cleared.deferred === true && cleared.brokenMatchIds.includes('rt13-deferred'),
+    '进行中清空同样登记断链对局');
+  release();
+  await flushing;
+  const blocked = queue.enqueue(event(2, second.eventSha256, 'rt13d:event-2', 'rt13-deferred'));
+  assert(!blocked.ok && blocked.reason === 'unreproducible_match'
+    && queue.snapshot().pendingCount === 0,
+    '推迟清空落地后断链标记同样生效，不把缺口写进队列');
+  assert(!queue.snapshot().integrityGap && !queue.snapshot().integrityLock,
+    '推迟清空的断链同样不锁存全局完整性缺口');
+}
+
 await new Promise((resolve) => setTimeout(resolve, 0));
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

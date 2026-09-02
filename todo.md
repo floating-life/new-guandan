@@ -67,11 +67,11 @@
 6. ~~`tools/replay_consumer.mjs` 单次模式 drain 循环为死代码~~ **已修复（0902 本轮）**：`--once` 持续分页直到 `hasMore=false`；超过一页的事件流完整消费后才退出 0。`--follow` 仍在空页后短轮询。
 7. ~~`js/replay-event-queue.js` `clearPending()` 与进行中的 flush 竞争~~ **已修复（0902）**：flush 进行中时清空被推迟到回执落地之后，在途事件正常投递并推进游标，不再误锁存完整性缺口；回归覆盖推迟清空、游标推进与不重复投递。
 8. ~~`js/replay-event-queue.js` + `js/ui.js` 对局中途清空待发破坏链但无警告~~ **已修复（0902）**：`clearPending()` 返回 `brokenMatchIds`，UI 明确提示"当前对局剩余事件将无法采集，下一副新对局自动恢复"；UI 静态回归锁定该文案。
-9. ~~`tools/replay_consumer.mjs` 半行 NDJSON 无恢复路径~~ **已修复（0902 本轮）**：加载时仅当**最后一行** JSON 解析失败才截断并 `fsync`，中间行损坏仍 fail closed，不发明 annotation。**残余**：最后一行能 parse 但 `validateStoredAnnotation` 失败时仍不截断。
+9. ~~`tools/replay_consumer.mjs` 半行 NDJSON 无恢复路径~~ **已修复（0902 本轮）**：加载时仅当**最后一行** JSON 解析失败才截断并 `fsync`，中间行损坏仍 fail closed，不发明 annotation。**残余已修复（0903）**：末行以无换行结尾且 JSON 完整但 `validateStoredAnnotation` 失败（`annotation_invalid`）时同样截断并 `fsync`（无换行末段是撕裂写的唯一位置）；已终止末行与中间行校验失败仍 fail closed，重复 `annotationId` 仍 fail closed。
 10. ~~`js/sealed-training.js` `upgradeCode` 不与名次交叉校验~~ **已修复（0902 本轮）**：若提供则必须等于 `teamUtilitiesFromFinishOrder(finishOrder).upgradeCode`，批次始终持久化派生值；转换器重放同样拒绝不一致。
 11. ~~`js/sealed-training.js` 牌张守恒仅按座位检查~~ **已修复（0902 本轮）**：开局手牌与每手后剩余牌按 `cardIdentity` 跨座位唯一；重复物理牌 fail closed。仅作用于伪造/损坏转换器输入，真实捕获不会产生。
 12. ~~`js/ai.ab.simulation.js` 无开关地支付密封捕获成本~~ **已修复（0902）**：`createMatch` 支持 `sealedTraining: false`（经 settings 传递，`startMatch` 重建后仍然保持），A/B 评测显式 opt-out，跳过每动作合法候选枚举与每轮末全量重放；存档剥离捕获开关，恢复的浏览器对局永远回到默认开启；集成回归现双向覆盖捕获开启/关闭两副完整对局。
-13. ~~刷新后续局 seq≥1 落入空队列永久 fail-closed~~ **已修复（0902 本轮）**：恢复对局若 `replaySequence>0` 且队列对本 `matchId` 无待发/已确认游标，观察器以 `unreproducible_match` 停采（不锁存完整性缺口），UI 提示“当前对局采集链已中断、请新开一局以恢复采集”；胶囊文案含“新开一局自动恢复”。`startMatch`/新开一局清除该标记，从 seq 0 恢复采集。**残余**：对局进行中 `clearPending()` 仍保留 cursor，`hasMatchTrace` 为真，继续出牌仍会缺口（#8 已警告）。
+13. ~~刷新后续局 seq≥1 落入空队列永久 fail-closed~~ **已修复（0902 本轮）**：恢复对局若 `replaySequence>0` 且队列对本 `matchId` 无待发/已确认游标，观察器以 `unreproducible_match` 停采（不锁存完整性缺口），UI 提示“当前对局采集链已中断、请新开一局以恢复采集”；胶囊文案含“新开一局自动恢复”。`startMatch`/新开一局清除该标记，从 seq 0 恢复采集。**残余已修复（0903）**：对局进行中 `clearPending()`（含 flush 推迟路径）把受影响 matchId 登记进持久化 `brokenMatches` 断链标记集，`enqueue` 对其 seq>0 事件返回既有 `unreproducible_match` 干净停采且不入队，不再绕过恢复路径；刷新后标记仍生效，新对局 seq=0 不受影响，不锁存全局完整性缺口。
 - 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2、STRAT-1/2/3/4/5 和 RT-1～RT-6 的当前本地回归通过；EVID-9b 冻结提交远端 CI 已完成。RT-6 证明回环 HTTP、合成收束对局和一次真人长局公开链，仍不是密封刷新持久化或训练准入。STRAT-1～5 仅形成可复算代码门，正式 expert 仍关闭候选；本轮 `node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **369/369**，`node js/ai.hybrid.test.js` 为 **105/105**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
 
 ## P1-A：实时复盘智能体桥与真人训练候选（RT-1～RT-6 本地代码门完成；训练准入未满足）
