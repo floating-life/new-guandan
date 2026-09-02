@@ -149,6 +149,46 @@ body.reduced-motion *::after {
 .llm-status.error { color: #ffb4a8; border-color: rgba(255, 107, 107, 0.6); }
 .llm-status.checking { color: var(--accent); border-color: rgba(61, 214, 198, 0.55); }
 
+.replay-collector {
+  position: relative;
+  align-self: center;
+  font-size: 0.74rem;
+}
+
+.replay-collector > summary {
+  cursor: pointer;
+  color: var(--muted);
+  list-style: none;
+}
+
+.replay-collector > summary::-webkit-details-marker { display: none; }
+
+.replay-collector-body {
+  position: absolute;
+  right: 0;
+  z-index: 8;
+  width: min(360px, 86vw);
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.replay-collector-body p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  white-space: normal;
+  line-height: 1.4;
+}
+
+.replay-collector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .llm-prompt {
   align-self: center;
   max-width: 270px;

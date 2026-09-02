@@ -6,6 +6,7 @@ import {
   setReplayEventObserver, PHASE,
 } from './game.js';
 import { validateLiveEventChain } from './replay-contracts.js';
+import { getSealedTrainingBatch } from './sealed-training.js';
 
 let passed = 0;
 let failed = 0;
@@ -59,8 +60,12 @@ console.log('RT-2 真实动作提交边界');
       '成功真人出牌在 applyPlay 后发出一次 play 事件');
     assert(events[0]?.seat === 0 && events[0]?.action === 'play'
       && events[0]?.cards.length === 1 && !('id' in events[0].cards[0])
-      && !('deckIndex' in events[0].cards[0]),
-    '真人事件只含公开牌面，不带实体牌 ID 或副本索引');
+      && !('deckIndex' in events[0].cards[0])
+      && !('legalCandidates' in events[0]),
+    '真人事件只含公开牌面，不带实体牌 ID、副本索引或密封候选');
+    assert(state.sealedTrainingTurns?.[0]?.sourceEventId === events[0].eventId
+      && !('id' in (state.sealedTrainingTurns[0].publicObservation.hand[0] || {})),
+    '密封 turn 独立绑定公开事件，公开 observation 不含实体牌 ID');
   } finally {
     setReplayEventObserver(null);
     globalThis.setTimeout = realSetTimeout;
@@ -182,6 +187,9 @@ console.log('RT-2 真实动作提交边界');
   setReplayEventObserver(null);
   assert(result.ok && state.phase === PHASE.ROUND_END && observerCalls === 3,
     '观察器抛错不阻断 play/trick_end/round_end 状态推进，并记录三次尝试');
+  const sealedBatch = getSealedTrainingBatch(state);
+  assert(sealedBatch && sealedBatch.trainingEligible === false && sealedBatch.turns.length >= 1,
+    '观察器抛错仍在副末生成不可训练的密封批次');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

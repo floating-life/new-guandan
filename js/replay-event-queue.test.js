@@ -498,6 +498,21 @@ console.log('RT-2 本机复盘待发队列');
     '非持久化内存回退在恢复持久化前阻断网络提交');
 }
 
+{
+  const target = storage();
+  const queue = createReplayEventQueue({ storage: target, enabled: true });
+  queue.enqueue(event(0));
+  const blocked = queue.clearPending();
+  assert(!blocked.ok && blocked.reason === 'must_pause' && queue.snapshot().pendingCount === 1,
+    '未暂停时拒绝清空待发队列');
+  queue.setEnabled(false);
+  const cleared = queue.clearPending();
+  const persisted = JSON.parse(target.values.get('guandan_replay_pending_v1'));
+  assert(cleared.ok && cleared.pendingCount === 0 && queue.snapshot().pendingCount === 0
+    && persisted.events.length === 0,
+    '暂停后可清空本机待发队列并持久化空队列');
+}
+
 await new Promise((resolve) => setTimeout(resolve, 0));
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

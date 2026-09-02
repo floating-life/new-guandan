@@ -36,10 +36,12 @@ const state = restoredState || createMatch();
 // RT-2 先把公开事件可靠地落入有界本机队列；RT-3 的用户显式启用后，
 // 再调用 queue.setEnabled(true) 让同一队列异步提交到本机采集端点。
 const replayEventQueue = createReplayEventQueue({ enabled: false });
+let replaySubmitPaused = false;
 const $ = (sel) => document.querySelector(sel);
 let llmHealth = getLLMHealth();
 let llmHealthEpoch = 0;
 let llmConfig = { apiUrl: '', model: '', configured: false, apiKeyConfigured: false };
+let replayCollectorStatus = null;
 let valueModelStatus = '未加载晋级模型';
 
 /** 用于 shift 连选 */
@@ -325,6 +327,86 @@ function llmStatusView() {
   };
 }
 
+function replayStatusView() {
+  const snapshot = replayEventQueue.snapshot();
+  if (replayCollectorStatus?.gap) {
+    return {
+      text: '复盘采集有缺口',
+      className: 'error',
+      title: replayCollectorStatus.lastError || '本机采集器检测到公开事件链缺口，已停止安全消费',
+    };
+  }
+  if (snapshot.gap) {
+    return {
+      text: '复盘采集有缺口',
+      className: 'error',
+      title: snapshot.lastError || '公开复盘事件存在持久化、顺序或采集失败，已停止提交',
+    };
+  }
+  if (snapshot.enabled) {
+    return {
+      text: snapshot.pendingCount ? `复盘待发送 · ${snapshot.pendingCount}` : '复盘采集已启用',
+      className: snapshot.pendingCount ? 'warn' : 'online',
+      title: snapshot.pendingCount ? '公开复盘事件已安全留在本机队列，等待本机采集器确认' : '公开复盘事件正在按序提交到本机采集器',
+    };
+  }
+  if (replayCollectorStatus && !replayCollectorStatus.enabled) {
+    return {
+      text: snapshot.pendingCount ? `复盘待启用 · ${snapshot.pendingCount}` : '复盘采集关闭',
+      className: snapshot.pendingCount ? 'warn' : 'local',
+      title: snapshot.pendingCount
+        ? '本机采集器尚未启用；公开事件已安全留在本机队列'
+        : '实时复盘采集默认关闭；使用启动脚本的显式启用选项后自动连接',
+    };
+  }
+  return {
+    text: '复盘采集关闭',
+    className: 'local',
+    title: '实时复盘采集默认关闭；启用本机采集器后才会提交公开事件',
+  };
+}
+
+function replayCollectorDetailText() {
+  const snapshot = replayEventQueue.snapshot();
+  const collector = replayCollectorStatus || {};
+  const lastSequence = collector.lastSequence == null ? '无' : collector.lastSequence;
+  const retentionHours = Number.isFinite(Number(collector.retentionSeconds))
+    ? Math.max(1, Math.round(Number(collector.retentionSeconds) / 3600))
+    : '未知';
+  const reader = collector.readerConnected
+    ? `已连接（读到 ${collector.readerLastSequence}）`
+    : '未连接';
+  return [
+    `服务端：${collector.enabled ? '已启用' : '未启用'}`,
+    `缺口：${collector.gap ? '有' : '无'}`,
+    `最后序号：${lastSequence}`,
+    `保留期：${retentionHours} 小时`,
+    `智能体：${reader}`,
+    `本机待发：${snapshot.pendingCount}`,
+    `提交：${snapshot.enabled ? '进行中' : (replaySubmitPaused ? '已暂停' : '未启用')}`,
+  ].join('；') + '。启用采集请用启动脚本的显式选项。';
+}
+
+async function refreshReplayCollectorStatus() {
+  if (typeof globalThis.fetch !== 'function') return;
+  try {
+    const response = await globalThis.fetch('/api/replay/status', {
+      cache: 'no-store',
+      headers: { accept: 'application/json' },
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload?.ok || !payload.collector) throw new Error('本机采集器状态不可用');
+    replayCollectorStatus = payload.collector;
+    replayEventQueue.setEnabled(
+      payload.collector.enabled === true && payload.collector.gap !== true && !replaySubmitPaused,
+    );
+  } catch {
+    replayCollectorStatus = null;
+    replayEventQueue.setEnabled(false);
+  }
+  render();
+}
+
 async function refreshLLMHealth({ silent = false, recover = false, deep = false } = {}) {
   const requestEpoch = ++llmHealthEpoch;
   const status = $('#llmStatus');
@@ -381,6 +463,7 @@ function renderTop() {
   const reduced = $('#chkReducedMotion');
   const llmMode = $('#selLLMMode');
   const llmStatus = $('#llmStatus');
+  const replayStatus = $('#replayStatus');
   const llmPrompt = $('#llmPrompt');
   const modelStatus = $('#valueModelStatus');
   if (d && d.value !== s.difficulty) d.value = s.difficulty || 'normal';
@@ -412,6 +495,14 @@ function renderTop() {
     llmStatus.className = `llm-status ${view.className}`;
     llmStatus.title = view.title || '';
   }
+  if (replayStatus) {
+    const view = replayStatusView();
+    replayStatus.textContent = view.text;
+    replayStatus.className = `llm-status ${view.className}`;
+    replayStatus.title = view.title || '';
+  }
+  const replayDetail = $('#replayCollectorDetail');
+  if (replayDetail) replayDetail.textContent = replayCollectorDetailText();
   if (modelStatus) modelStatus.textContent = valueModelStatus;
   if (llmPrompt) {
     const mode = s.llmPolicyMode || LLM_POLICY_MODE.LOCAL;
@@ -1479,6 +1570,31 @@ function setupChrome() {
     }
   };
 
+  $('#btnReplayPause')?.addEventListener('click', () => {
+    replaySubmitPaused = true;
+    replayEventQueue.setEnabled(false);
+    flash('已暂停向本机采集器提交公开复盘事件');
+    render();
+  });
+  $('#btnReplayResume')?.addEventListener('click', () => {
+    replaySubmitPaused = false;
+    const collector = replayCollectorStatus;
+    if (!collector?.enabled || collector.gap) {
+      flash('本机采集器尚未启用或存在缺口；请用启动脚本显式启用后再恢复提交');
+    } else {
+      replayEventQueue.setEnabled(true);
+      flash('已恢复向本机采集器提交公开复盘事件');
+    }
+    render();
+  });
+  $('#btnReplayClear')?.addEventListener('click', () => {
+    const result = replayEventQueue.clearPending();
+    flash(result.ok
+      ? '已清空本机待发公开复盘队列'
+      : '请先暂停提交，再清空本机待发队列');
+    render();
+  });
+
   $('#btnReplay').onclick = () => openReplay(state.lastReplay?.id);
   $('#btnCloseReplay').onclick = () => closeModal('#replayModal');
   $('#replayModal').addEventListener('click', (e) => {
@@ -1615,10 +1731,16 @@ function setupChrome() {
       render();
     }
   });
+
+  void refreshReplayCollectorStatus();
+  if (typeof globalThis.setInterval === 'function') {
+    globalThis.setInterval(() => { void refreshReplayCollectorStatus(); }, 5000);
+  }
 }
 
 setReplayEventObserver((event) => {
   replayEventQueue.enqueue(event);
+  render();
 });
 
 setUpdateCallback(() => {

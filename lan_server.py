@@ -11,9 +11,11 @@ import functools
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import posixpath
 import re
+import secrets
 import threading
 import time
 import urllib.error
@@ -26,12 +28,24 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 LOOPBACK_HOST = "127.0.0.1"
 FIXED_PORT = 20801
+_LOOPBACK_HOST_PORT = re.compile(rf"^{re.escape(LOOPBACK_HOST)}:(?:[1-9]\d{{0,3}}|[1-5]\d{{4}}|6[0-4]\d{{3}}|65[0-4]\d{{2}}|655[0-2]\d|6553[0-5])$")
 WEB_ROOT = Path(__file__).resolve().parent
 SERVICE_API_VERSION = 3
 SERVICE_BUILD = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:12]
 PROJECT_FINGERPRINT = hashlib.sha256(str(WEB_ROOT).lower().encode("utf-8")).hexdigest()[:12]
 _LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".local" / "share"))
 LLM_CONFIG_PATH = _LOCAL_APP_DATA / "GuandanTrainer" / "llm-config.json"
+REPLAY_ROOT = _LOCAL_APP_DATA / "GuandanTrainer" / "replays"
+REPLAY_CAPABILITY_HEADER = "X-Guandan-Replay-Capability"
+REPLAY_PUBLIC_SCHEMA = "guandan-live-public-event-v1"
+REPLAY_MAX_EVENT_BYTES = 64 * 1024
+REPLAY_DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+REPLAY_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+REPLAY_DEFAULT_ROTATE_BYTES = 4 * 1024 * 1024
+REPLAY_DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
+REPLAY_MAX_WAIT_MS = 5000
+REPLAY_RATE_LIMIT = 240
+REPLAY_RATE_WINDOW_SECONDS = 60
 _ENV_LLM_API_URL = os.environ.get("GUANDAN_LLM_API_URL", "").strip()
 _ENV_LLM_API_KEY = os.environ.get("GUANDAN_LLM_API_KEY", "").strip()
 _ENV_LLM_MODEL = os.environ.get("GUANDAN_LLM_MODEL", "").strip()
@@ -870,6 +884,595 @@ def _parse_decision(payload: dict, candidate_ids: set[str]) -> dict:
     }
 
 
+_REPLAY_FORBIDDEN_KEYS = {
+    "hands", "deck", "initialHands", "remainingHands", "allHands",
+    "opponentHands", "partnerHand", "hiddenCards", "roundInitialHands",
+    "lastReplay", "trainingLabel", "reward", "outcome",
+}
+_REPLAY_EVENT_KEYS = {
+    "schema", "matchId", "round", "trick", "turn", "eventId", "sequence",
+    "occurredAt", "ruleVersion", "implementationSha256", "eventSha256",
+    "previousEventSha256", "eventType", "seat", "action", "cards", "hand",
+    "countsBefore", "countsAfter", "tribute", "engine", "decisionMeta",
+}
+_REPLAY_EVENT_TYPES = {"play", "pass", "trick_end", "round_end"}
+_REPLAY_ACTIONS = {"play", "pass"}
+_REPLAY_DECISION_SOURCES = {"human", "local", "consultation", "worker", "unknown"}
+_REPLAY_FALLBACK_KINDS = {
+    "none", "forced_lead", "local_timeout", "local_decision_error",
+    "expert_safety_fallback", "search_evidence_insufficient",
+    "selected_candidate_invalid", "force_expert_choice", "hybrid_exception", "unknown",
+}
+_REPLAY_SHA256 = re.compile(r"^[a-f0-9]{64}$")
+
+
+class ReplayStoreError(RuntimeError):
+    """A replay store could not safely accept or read an event."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _replay_number(value) -> str:
+    """Serialize JSON numbers with the same notation choices as JSON.stringify."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("复盘摘要只接受 JSON 数字")
+    if isinstance(value, int):
+        return str(value)
+    if not math.isfinite(value):
+        raise ValueError("摘要内容不得包含非有限数")
+    if value == 0:
+        return "0"
+    raw = repr(value).lower()
+    magnitude = abs(value)
+    if "e" in raw:
+        mantissa, exponent = raw.split("e", 1)
+        exponent_value = int(exponent)
+        if 1e-6 <= magnitude < 1e21:
+            from decimal import Decimal
+            expanded = format(Decimal(raw), "f")
+            if "." in expanded:
+                expanded = expanded.rstrip("0").rstrip(".")
+            return expanded
+        if "." in mantissa:
+            mantissa = mantissa.rstrip("0").rstrip(".")
+        return f"{mantissa}e{'+' if exponent_value >= 0 else ''}{exponent_value}"
+    if raw.endswith(".0"):
+        raw = raw[:-2]
+    return raw
+
+
+def _replay_stable_json(value) -> str:
+    if isinstance(value, list):
+        return "[" + ",".join(_replay_stable_json(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{json.dumps(key, ensure_ascii=False)}:{_replay_stable_json(value[key])}"
+            for key in sorted(value)
+        ) + "}"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _replay_number(value)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _replay_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _replay_string(value, name: str, maximum: int) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        raise ReplayStoreError("invalid_event", f"{name} 字符串长度无效")
+    return value
+
+
+def _replay_integer(value, name: str, minimum: int, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ReplayStoreError("invalid_event", f"{name} 必须是整数")
+    if maximum is not None and value > maximum:
+        raise ReplayStoreError("invalid_event", f"{name} 超出范围")
+    return value
+
+
+def _replay_sha(value, name: str, nullable: bool = False) -> None:
+    if nullable and value is None:
+        return
+    if not isinstance(value, str) or not _REPLAY_SHA256.fullmatch(value):
+        raise ReplayStoreError("invalid_event", f"{name} 必须是小写 64 位 SHA-256")
+
+
+def _replay_forbidden(value, path="$#") -> None:
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _replay_forbidden(item, f"{path}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key in _REPLAY_FORBIDDEN_KEYS:
+                raise ReplayStoreError("invalid_event", f"{path}.{key} 不得出现在公开复盘事件中")
+            _replay_forbidden(item, f"{path}.{key}")
+
+
+def _replay_card(value, path: str) -> None:
+    if not isinstance(value, dict) or set(value) != {"rank", "suit"}:
+        raise ReplayStoreError("invalid_event", f"{path} 必须是脱敏牌面")
+    _replay_integer(value["rank"], f"{path}.rank", 2, 17)
+    _replay_string(value["suit"], f"{path}.suit", 8)
+
+
+def _replay_cards(value, path: str) -> None:
+    if not isinstance(value, list):
+        raise ReplayStoreError("invalid_event", f"{path} 必须是数组")
+    for index, card in enumerate(value):
+        _replay_card(card, f"{path}[{index}]")
+
+
+def _replay_hand(value, path: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) - {"type", "mainRank", "size", "power", "meta"}:
+        raise ReplayStoreError("invalid_event", f"{path} 字段无效")
+    _replay_string(value.get("type"), f"{path}.type", 40)
+    if value.get("mainRank") is not None:
+        _replay_integer(value["mainRank"], f"{path}.mainRank", 2, 17)
+    _replay_integer(value.get("size"), f"{path}.size", 0, 27)
+    power = value.get("power")
+    if isinstance(power, bool) or not isinstance(power, (int, float)) or not float(power) == power:
+        raise ReplayStoreError("invalid_event", f"{path}.power 必须是有限数")
+    if value.get("meta") is not None:
+        if not isinstance(value["meta"], dict) or set(value["meta"]) - {"sequence", "pairRank", "suit", "wildAs"}:
+            raise ReplayStoreError("invalid_event", f"{path}.meta 字段无效")
+        meta = value["meta"]
+        if "sequence" in meta:
+            sequence = meta["sequence"]
+            if not isinstance(sequence, list):
+                raise ReplayStoreError("invalid_event", f"{path}.meta.sequence 必须是数组")
+            for index, rank in enumerate(sequence):
+                _replay_integer(rank, f"{path}.meta.sequence[{index}]", 1, 14)
+        if "pairRank" in meta:
+            _replay_integer(meta["pairRank"], f"{path}.meta.pairRank", 2, 17)
+        if "suit" in meta:
+            _replay_string(meta["suit"], f"{path}.meta.suit", 8)
+        if "wildAs" in meta:
+            wild_as = meta["wildAs"]
+            if isinstance(wild_as, list):
+                for index, rank in enumerate(wild_as):
+                    _replay_integer(rank, f"{path}.meta.wildAs[{index}]", 2, 17)
+            else:
+                _replay_integer(wild_as, f"{path}.meta.wildAs", 2, 17)
+
+
+def _validate_replay_event(event: dict) -> None:
+    if not isinstance(event, dict):
+        raise ReplayStoreError("invalid_event", "公开复盘事件必须是 JSON 对象")
+    _replay_forbidden(event)
+    unknown = set(event) - _REPLAY_EVENT_KEYS
+    if unknown:
+        raise ReplayStoreError("invalid_event", f"公开复盘事件含未知字段：{','.join(sorted(unknown))}")
+    if event.get("schema") != REPLAY_PUBLIC_SCHEMA:
+        raise ReplayStoreError("invalid_event", "公开复盘事件 schema 不匹配")
+    _replay_string(event.get("matchId"), "matchId", 120)
+    for name in ("round", "trick", "turn"):
+        _replay_integer(event.get(name), name, 1)
+    _replay_string(event.get("eventId"), "eventId", 160)
+    _replay_integer(event.get("sequence"), "sequence", 0)
+    _replay_string(event.get("occurredAt"), "occurredAt", 80)
+    _replay_string(event.get("ruleVersion"), "ruleVersion", 80)
+    _replay_sha(event.get("implementationSha256"), "implementationSha256")
+    _replay_sha(event.get("eventSha256"), "eventSha256")
+    _replay_sha(event.get("previousEventSha256"), "previousEventSha256", nullable=True)
+    event_type = _replay_string(event.get("eventType"), "eventType", 20)
+    action = event.get("action")
+    if action is not None:
+        _replay_string(action, "action", 12)
+    if event_type not in _REPLAY_EVENT_TYPES:
+        raise ReplayStoreError("invalid_event", "eventType 不在公开事件白名单中")
+    if event_type in _REPLAY_ACTIONS and action != event_type:
+        raise ReplayStoreError("invalid_event", f"{event_type} 事件 action 不匹配")
+    if event_type not in _REPLAY_ACTIONS and action is not None:
+        raise ReplayStoreError("invalid_event", "结束事件不得携带 action")
+    seat = event.get("seat")
+    if seat is not None:
+        _replay_integer(seat, "seat", 0, 3)
+    _replay_cards(event.get("cards"), "cards")
+    _replay_hand(event.get("hand"), "hand")
+    for name in ("countsBefore", "countsAfter"):
+        counts = event.get(name)
+        if not isinstance(counts, list) or len(counts) != 4:
+            raise ReplayStoreError("invalid_event", f"{name} 必须是 4 个座位的数组")
+        for value in counts:
+            _replay_integer(value, f"{name}[]", 0, 27)
+    tribute = event.get("tribute")
+    if not isinstance(tribute, list):
+        raise ReplayStoreError("invalid_event", "tribute 必须是数组")
+    for item in tribute:
+        if not isinstance(item, dict) or set(item) != {"kind", "from", "to", "card"}:
+            raise ReplayStoreError("invalid_event", "tribute 项字段无效")
+        if item["kind"] not in {"tribute", "return"}:
+            raise ReplayStoreError("invalid_event", "tribute.kind 无效")
+        _replay_integer(item["from"], "tribute.from", 0, 3)
+        _replay_integer(item["to"], "tribute.to", 0, 3)
+        _replay_card(item["card"], "tribute.card")
+    engine = event.get("engine")
+    if engine is not None:
+        if not isinstance(engine, dict) or set(engine) != {"name", "version"}:
+            raise ReplayStoreError("invalid_event", "engine 字段无效")
+        _replay_string(engine["name"], "engine.name", 80)
+        _replay_string(engine["version"], "engine.version", 80)
+    decision = event.get("decisionMeta")
+    if decision is not None:
+        if not isinstance(decision, dict) or set(decision) - {
+            "source", "fallbackKind", "searchAttempted", "searchTriggered", "budgetMs", "latencyMs",
+        }:
+            raise ReplayStoreError("invalid_event", "decisionMeta 字段无效")
+        if "source" in decision and decision["source"] not in _REPLAY_DECISION_SOURCES:
+            raise ReplayStoreError("invalid_event", "decisionMeta.source 无效")
+        if "fallbackKind" in decision and decision["fallbackKind"] not in _REPLAY_FALLBACK_KINDS:
+            raise ReplayStoreError("invalid_event", "decisionMeta.fallbackKind 无效")
+        for name in ("searchAttempted", "searchTriggered"):
+            if name in decision and not isinstance(decision[name], bool):
+                raise ReplayStoreError("invalid_event", f"decisionMeta.{name} 必须是布尔值")
+        for name in ("budgetMs", "latencyMs"):
+            if name in decision:
+                value = decision[name]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or not float(value) == value:
+                    raise ReplayStoreError("invalid_event", f"decisionMeta.{name} 必须是非负有限数")
+    if event_type == "play" and (seat is None or not event["cards"] or event["hand"] is None):
+        raise ReplayStoreError("invalid_event", "play 事件必须有座位、牌和牌型")
+    if event_type == "pass" and (seat is None or event["cards"] or event["hand"] is not None):
+        raise ReplayStoreError("invalid_event", "pass 事件必须有座位且不得有牌/牌型")
+    if event_type in {"trick_end", "round_end"} and (
+        seat is not None or action is not None or event["cards"] or event["hand"] is not None
+        or tribute or engine is not None or decision is not None
+    ):
+        raise ReplayStoreError("invalid_event", f"{event_type} 事件只能携带边界身份、余牌数和空动作载荷")
+    payload = dict(event)
+    supplied = payload.pop("eventSha256")
+    if _replay_sha256(_replay_stable_json(payload)) != supplied:
+        raise ReplayStoreError("invalid_event", "eventSha256 与事件内容不匹配")
+
+
+def _replay_path_is_safe(path: Path) -> bool:
+    resolved = path.expanduser().resolve()
+    root = WEB_ROOT.resolve()
+    try:
+        if os.path.commonpath((str(resolved), str(root))) == str(root):
+            return False
+    except ValueError:
+        # Different Windows volumes cannot share a project-directory prefix;
+        # a separate volume is safe unless its own path is a forbidden sync root.
+        pass
+    return not any(part.casefold() in {"wpsdrive", "wps云盘"} for part in resolved.parts)
+
+
+class ReplayEventStore:
+    """Durable, loopback-only public replay stream with fail-closed reads."""
+
+    def __init__(
+        self, root: Path | str = REPLAY_ROOT, *, enabled: bool = False,
+        capability_token: str | None = None, token_ttl_seconds: int = REPLAY_DEFAULT_TOKEN_TTL_SECONDS,
+        retention_seconds: int = REPLAY_DEFAULT_RETENTION_SECONDS,
+        max_bytes: int = REPLAY_DEFAULT_MAX_BYTES, rotate_bytes: int = REPLAY_DEFAULT_ROTATE_BYTES,
+    ):
+        self.root = Path(root).expanduser()
+        if not _replay_path_is_safe(self.root):
+            raise ValueError("复盘采集目录不得位于项目目录或 WPSDrive")
+        self.retention_seconds = max(3600, int(retention_seconds))
+        self.max_bytes = max(REPLAY_MAX_EVENT_BYTES, int(max_bytes))
+        self.rotate_bytes = max(REPLAY_MAX_EVENT_BYTES, min(int(rotate_bytes), self.max_bytes))
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._enabled = False
+        self._capability_token = ""
+        self._capability_expires_at = 0.0
+        self._capability_ttl = 0.0
+        self._gap = False
+        self._last_error = None
+        self._reader_last_at = None
+        self._reader_last_sequence = None
+        if enabled:
+            self.enable(capability_token, token_ttl_seconds)
+
+    @property
+    def capability_token(self) -> str:
+        with self._lock:
+            return self._capability_token
+
+    def enable(self, token: str | None = None, ttl_seconds: int = REPLAY_DEFAULT_TOKEN_TTL_SECONDS) -> str:
+        if token is not None and (not isinstance(token, str) or not 32 <= len(token) <= 256):
+            raise ValueError("复盘 capability token 长度无效")
+        ttl = max(60, min(int(ttl_seconds), 3600))
+        with self._lock:
+            self._capability_token = token or secrets.token_urlsafe(32)
+            self._capability_ttl = float(ttl)
+            self._capability_expires_at = time.time() + ttl
+            self._enabled = True
+            self._gap = False
+            self._last_error = None
+            return self._capability_token
+
+    def disable(self) -> None:
+        with self._lock:
+            self._enabled = False
+            self._capability_token = ""
+            self._capability_expires_at = 0.0
+            self._condition.notify_all()
+
+    def status(self) -> dict:
+        with self._lock:
+            last_sequence = None
+            last_match_id = None
+            try:
+                records = self._scan_locked()
+                if records:
+                    last_sequence = records[-1]["sequence"]
+                    last_match_id = records[-1]["matchId"]
+            except ReplayStoreError as exc:
+                self._gap = True
+                self._last_error = str(exc)
+            reader_age = None if self._reader_last_at is None else time.time() - self._reader_last_at
+            return {
+                "enabled": self._enabled,
+                "gap": self._gap,
+                "lastError": self._last_error,
+                "lastSequence": last_sequence,
+                "lastMatchId": last_match_id,
+                "retentionSeconds": self.retention_seconds,
+                "readerLastSequence": self._reader_last_sequence,
+                "readerConnected": reader_age is not None and reader_age <= 30,
+                "capabilityExpiresAt": (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._capability_expires_at))
+                    if self._capability_expires_at else None
+                ),
+            }
+
+    def authorize(self, token: str | None) -> bool:
+        with self._lock:
+            if not (
+                self._enabled and self._capability_token
+                and isinstance(token, str) and secrets.compare_digest(token, self._capability_token)
+            ):
+                return False
+            now = time.time()
+            if now >= self._capability_expires_at:
+                return False
+            # 滑动续期：活跃读取者（follow 消费者每隔数秒轮询一次）在每次成功授权后续期，
+            # 长局不会中途断链；闲置 token 仍在原 TTL 后过期。
+            self._capability_expires_at = now + self._capability_ttl
+            return True
+
+    def capability_failure_code(self, token: str | None) -> str:
+        """区分 401 原因：持有正确但已过期的 token 与缺失/错误 token 给出不同错误码。"""
+        with self._lock:
+            if (
+                self._enabled and self._capability_token
+                and isinstance(token, str) and secrets.compare_digest(token, self._capability_token)
+                and time.time() >= self._capability_expires_at
+            ):
+                return "capability_expired"
+            return "capability_required"
+
+    def _files_locked(self) -> list[Path]:
+        try:
+            if not self.root.exists():
+                return []
+            files = list(self.root.glob("events-*.ndjson"))
+            if any(not file.is_file() or file.is_symlink() for file in files):
+                raise ReplayStoreError("storage_unavailable", "复盘采集目录含不安全文件")
+            return sorted(files, key=lambda file: (file.stat().st_mtime_ns, file.name))
+        except OSError as exc:
+            raise ReplayStoreError("storage_unavailable", f"无法读取复盘采集目录：{exc}") from exc
+
+    def _scan_locked(self) -> list[dict]:
+        records = []
+        try:
+            for file in self._files_locked():
+                with file.open("r", encoding="utf-8") as stream:
+                    for line_number, line in enumerate(stream, 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise ReplayStoreError("storage_corrupt", f"复盘事件文件无法解析：{file.name}:{line_number}") from exc
+                        _validate_replay_event(event)
+                        records.append(event)
+        except ReplayStoreError:
+            raise
+        except OSError as exc:
+            raise ReplayStoreError("storage_unavailable", f"无法读取复盘事件：{exc}") from exc
+        grouped: dict[str, list[dict]] = {}
+        for event in records:
+            grouped.setdefault(event["matchId"], []).append(event)
+        for match_records in grouped.values():
+            ordered = sorted(match_records, key=lambda item: item["sequence"])
+            previous = None
+            for event in ordered:
+                if previous is None:
+                    broken = event["sequence"] != 0 or event["previousEventSha256"] is not None
+                else:
+                    broken = (
+                        event["sequence"] != previous["sequence"] + 1
+                        or event["previousEventSha256"] != previous["eventSha256"]
+                    )
+                if broken:
+                    self._gap = True
+                    if self._last_error is None:
+                        self._last_error = "复盘事件链存在缺口，已停止安全消费"
+                    break
+                previous = event
+        return records
+
+    def _prune_locked(self, needed_bytes: int = 0) -> bool:
+        now = time.time()
+        files = self._files_locked()
+        pruned_committed = False
+        for file in files:
+            try:
+                if now - file.stat().st_mtime > self.retention_seconds:
+                    if file.stat().st_size > 0:
+                        pruned_committed = True
+                    file.unlink()
+            except OSError as exc:
+                raise ReplayStoreError("storage_unavailable", f"无法轮转旧复盘文件：{exc}") from exc
+        files = self._files_locked()
+        sizes = {file: file.stat().st_size for file in files}
+        total = sum(sizes.values())
+        capacity_pruned = False
+        for file in files:
+            if total + needed_bytes <= self.max_bytes:
+                break
+            try:
+                if sizes[file] > 0:
+                    pruned_committed = True
+                file.unlink()
+                total -= sizes[file]
+                capacity_pruned = True
+            except OSError as exc:
+                raise ReplayStoreError("storage_unavailable", f"无法释放复盘空间：{exc}") from exc
+        if pruned_committed:
+            self._gap = True
+            self._last_error = "复盘保留期或容量清理删除了已提交事件，已停止安全消费"
+            raise ReplayStoreError("storage_corrupt", self._last_error)
+        if total + needed_bytes > self.max_bytes:
+            raise ReplayStoreError("storage_full", "复盘采集空间已满")
+        return capacity_pruned
+
+    def _target_file_locked(self, line_bytes: int) -> Path:
+        today = time.strftime("%Y%m%d", time.localtime())
+        candidates = [file for file in self._files_locked() if file.name.startswith(f"events-{today}")]
+        target = candidates[-1] if candidates else self.root / f"events-{today}.ndjson"
+        if target.exists() and target.stat().st_size + line_bytes > self.rotate_bytes:
+            index = 1
+            while True:
+                candidate = self.root / f"events-{today}-{index:02d}.ndjson"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                index += 1
+        return target
+
+    def append(self, event: dict) -> dict:
+        _validate_replay_event(event)
+        line = (_replay_stable_json(event) + "\n").encode("utf-8")
+        if len(line) > REPLAY_MAX_EVENT_BYTES:
+            raise ReplayStoreError("event_too_large", "复盘事件超过请求大小上限")
+        with self._condition:
+            if not self._enabled:
+                raise ReplayStoreError("collector_disabled", "复盘采集未启用")
+            try:
+                records = self._scan_locked()
+                if self._gap:
+                    raise ReplayStoreError("storage_corrupt", "复盘事件链存在缺口，采集已停止")
+                for existing in reversed(records):
+                    if existing["eventId"] == event["eventId"]:
+                        if existing["eventSha256"] == event["eventSha256"]:
+                            return {"ok": True, "duplicate": True, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
+                        raise ReplayStoreError("event_conflict", "相同 eventId 的事件摘要不一致")
+                previous = next((item for item in reversed(records) if item["matchId"] == event["matchId"]), None)
+                if previous is None:
+                    if event["sequence"] != 0 or event["previousEventSha256"] is not None:
+                        raise ReplayStoreError("event_chain_gap", "新事件链必须从 sequence=0 开始")
+                elif event["sequence"] != previous["sequence"] + 1 or event["previousEventSha256"] != previous["eventSha256"]:
+                    raise ReplayStoreError("event_chain_gap", "复盘事件 sequence 或前序摘要不连续")
+                self.root.mkdir(parents=True, exist_ok=True)
+                capacity_pruned = self._prune_locked(len(line))
+                if capacity_pruned:
+                    self._gap = True
+                    self._last_error = "容量清理删除了既有复盘分片，已停止安全采集"
+                    raise ReplayStoreError("storage_corrupt", self._last_error)
+                self._scan_locked()
+                if self._gap:
+                    raise ReplayStoreError("storage_corrupt", "容量或保留期清理造成复盘事件链缺口，采集已停止")
+                target = self._target_file_locked(len(line))
+                original_size = target.stat().st_size if target.exists() else 0
+                descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try:
+                    try:
+                        written = os.write(descriptor, line)
+                        if written != len(line):
+                            raise OSError("复盘事件未完整写入")
+                        os.fsync(descriptor)
+                    except OSError:
+                        os.ftruncate(descriptor, original_size)
+                        os.fsync(descriptor)
+                        raise
+                finally:
+                    os.close(descriptor)
+                self._last_error = None
+                self._condition.notify_all()
+                return {"ok": True, "duplicate": False, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
+            except ReplayStoreError as exc:
+                self._gap = True if exc.code in {"storage_full", "storage_unavailable", "storage_corrupt"} else self._gap
+                self._last_error = str(exc)
+                raise
+            except OSError as exc:
+                self._gap = True
+                self._last_error = str(exc)
+                raise ReplayStoreError("storage_unavailable", "复盘事件写入失败，已标记采集缺口") from exc
+
+    def read(self, after_sequence: int = -1, limit: int = 100, match_id: str | None = None, wait_ms: int = 0) -> dict:
+        after_sequence = _replay_integer(after_sequence, "afterSequence", -1)
+        if after_sequence >= 0 and match_id is None:
+            raise ReplayStoreError("match_id_required", "续读必须同时提供 matchId，避免跨副游标漂移")
+        limit = max(1, min(int(limit), 256))
+        wait_ms = max(0, min(int(wait_ms), REPLAY_MAX_WAIT_MS))
+        deadline = time.monotonic() + wait_ms / 1000
+        with self._condition:
+            if not self._enabled:
+                raise ReplayStoreError("collector_disabled", "复盘采集未启用")
+            while True:
+                records = self._scan_locked()
+                selected_match = match_id
+                if selected_match is None and records:
+                    selected_match = records[-1]["matchId"]
+                selected = [
+                    event for event in records
+                    if (selected_match is None or event["matchId"] == selected_match)
+                    and event["sequence"] > after_sequence
+                ]
+                if selected or time.monotonic() >= deadline:
+                    page = selected[:limit]
+                    if page:
+                        self._reader_last_at = time.time()
+                        self._reader_last_sequence = page[-1]["sequence"]
+                    return {
+                        "ok": True,
+                        "matchId": selected_match,
+                        "events": page,
+                        "nextSequence": page[-1]["sequence"] if page else after_sequence,
+                        "hasMore": len(selected) > len(page),
+                        "collector": self.status(),
+                    }
+                self._condition.wait(timeout=max(0.01, deadline - time.monotonic()))
+
+
+_REPLAY_STORE = ReplayEventStore()
+_REPLAY_CALLS = deque()
+_REPLAY_CALLS_LOCK = threading.Lock()
+
+
+def configure_replay_collector(*, enabled: bool = False, token: str | None = None, token_ttl_seconds: int = REPLAY_DEFAULT_TOKEN_TTL_SECONDS,
+                               retention_seconds: int = REPLAY_DEFAULT_RETENTION_SECONDS, max_bytes: int = REPLAY_DEFAULT_MAX_BYTES,
+                               rotate_bytes: int = REPLAY_DEFAULT_ROTATE_BYTES, root: Path | str = REPLAY_ROOT) -> ReplayEventStore:
+    global _REPLAY_STORE
+    _REPLAY_STORE = ReplayEventStore(
+        root, enabled=enabled, capability_token=token, token_ttl_seconds=token_ttl_seconds,
+        retention_seconds=retention_seconds, max_bytes=max_bytes, rotate_bytes=rotate_bytes,
+    )
+    return _REPLAY_STORE
+
+
+def _within_replay_rate_limit() -> bool:
+    now = time.monotonic()
+    with _REPLAY_CALLS_LOCK:
+        while _REPLAY_CALLS and now - _REPLAY_CALLS[0] >= REPLAY_RATE_WINDOW_SECONDS:
+            _REPLAY_CALLS.popleft()
+        if len(_REPLAY_CALLS) >= REPLAY_RATE_LIMIT:
+            return False
+        _REPLAY_CALLS.append(now)
+        return True
+
+
 class LocalOnlyHandler(SimpleHTTPRequestHandler):
     """Static handler that exposes only the browser assets, not the project folder."""
 
@@ -877,7 +1480,7 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
 
     def _same_local_origin(self) -> bool:
         host = (self.headers.get("Host") or "").strip().lower()
-        if host not in {LOOPBACK_HOST, f"{LOOPBACK_HOST}:{FIXED_PORT}"}:
+        if host != LOOPBACK_HOST and not _LOOPBACK_HOST_PORT.fullmatch(host):
             return False
         origin = (self.headers.get("Origin") or "").strip()
         if origin and origin.rstrip("/") != LOCAL_ORIGIN:
@@ -945,6 +1548,75 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
 
     def _llm_config(self, head_only: bool = False) -> None:
         self._send_json(_llm_config_payload(), head_only=head_only)
+
+    def _replay_status(self, head_only: bool = False) -> None:
+        self._send_json({"ok": True, "schema": REPLAY_PUBLIC_SCHEMA, "collector": _REPLAY_STORE.status()}, head_only=head_only)
+
+    def _replay_capability(self) -> str | None:
+        return self.headers.get(REPLAY_CAPABILITY_HEADER)
+
+    def _replay_events(self) -> None:
+        if not _REPLAY_STORE.authorize(self._replay_capability()):
+            failure = _REPLAY_STORE.capability_failure_code(self._replay_capability())
+            message = (
+                "复盘 capability token 已过期：活跃读取会滑动续期；闲置过期后请重新运行 "
+                "start-lan.ps1 -EnableReplayCollector 签发新 token"
+                if failure == "capability_expired"
+                else "需要有效的短期复盘 capability token"
+            )
+            self._send_json({"ok": False, "code": failure, "message": message}, status=401)
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            after = int(query.get("afterSequence", ["-1"])[0])
+            limit = int(query.get("limit", ["100"])[0])
+            wait_ms = int(query.get("waitMs", ["0"])[0])
+            match_id = query.get("matchId", [None])[0]
+            if match_id is not None:
+                _replay_string(match_id, "matchId", 120)
+            result = _REPLAY_STORE.read(after, limit, match_id, wait_ms)
+            self._send_json(result)
+        except (ValueError, ReplayStoreError) as exc:
+            code = exc.code if isinstance(exc, ReplayStoreError) else "bad_request"
+            status = 400 if code in {"bad_request", "invalid_event", "match_id_required"} else 503
+            self._send_json({"ok": False, "code": code, "message": str(exc)[:200]}, status=status)
+
+    def _replay_append(self) -> None:
+        if not _REPLAY_STORE.status()["enabled"]:
+            self._send_json({
+                "ok": False, "code": "collector_disabled", "message": "复盘采集默认关闭，请显式启用本机采集器",
+            }, status=503)
+            return
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send_json({"ok": False, "code": "unsupported_media_type", "message": "复盘事件仅接受 application/json"}, status=415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > REPLAY_MAX_EVENT_BYTES:
+            self._send_json({"ok": False, "code": "bad_request", "message": "复盘事件请求体大小无效"}, status=413)
+            return
+        if not _within_replay_rate_limit():
+            self._send_json({"ok": False, "code": "rate_limited", "message": "复盘采集请求过于频繁，请稍后重试", "retryable": True}, status=429)
+            return
+        try:
+            event = json.loads(self.rfile.read(length).decode("utf-8"))
+            result = _REPLAY_STORE.append(event)
+            self._send_json(result)
+        except ReplayStoreError as exc:
+            status = {
+                "collector_disabled": 503, "event_conflict": 409, "event_chain_gap": 409,
+                "storage_full": 507, "storage_unavailable": 507, "storage_corrupt": 507,
+                "event_too_large": 413,
+            }.get(exc.code, 400)
+            self._send_json({
+                "ok": False, "code": exc.code, "message": str(exc)[:200],
+                "gap": exc.code in {"storage_full", "storage_unavailable", "storage_corrupt"},
+            }, status=status)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._send_json({"ok": False, "code": "invalid_event", "message": str(exc)[:200]}, status=400)
 
     def _update_llm_config(self) -> None:
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1164,6 +1836,12 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
         if path == "/api/llm/config":
             self._llm_config(head_only=head_only)
             return
+        if path == "/api/replay/status":
+            self._replay_status(head_only=head_only)
+            return
+        if path == "/api/replay/events":
+            self._replay_events()
+            return
         if not self._asset_is_allowed():
             self.send_error(404, "Not found")
             return
@@ -1195,6 +1873,9 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
             return
         if self._request_path() == "/api/llm/config":
             self._update_llm_config()
+            return
+        if self._request_path() == "/api/replay/events":
+            self._replay_append()
             return
         self.send_error(404, "Not found")
 
@@ -1231,12 +1912,24 @@ class LocalHTTPServer(ThreadingHTTPServer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve Guandan Trainer at http://127.0.0.1:20801/")
     parser.add_argument("--open-browser", action="store_true", help="open the local URL in this computer's browser")
+    parser.add_argument("--enable-replay-collector", action="store_true", help="opt in to the local public replay collector")
+    parser.add_argument("--replay-capability-token", default=None, help="optional short-lived token for replay readers")
+    parser.add_argument("--replay-retention-hours", type=int, default=REPLAY_DEFAULT_RETENTION_SECONDS // 3600)
+    parser.add_argument("--replay-max-bytes", type=int, default=REPLAY_DEFAULT_MAX_BYTES)
+    parser.add_argument("--replay-rotate-bytes", type=int, default=REPLAY_DEFAULT_ROTATE_BYTES)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     _initialize_llm_config()
+    replay_store = configure_replay_collector(
+        enabled=args.enable_replay_collector,
+        token=args.replay_capability_token,
+        retention_seconds=max(3600, args.replay_retention_hours * 3600),
+        max_bytes=args.replay_max_bytes,
+        rotate_bytes=args.replay_rotate_bytes,
+    )
     url = f"http://{LOOPBACK_HOST}:{FIXED_PORT}/"
     handler = functools.partial(LocalOnlyHandler, directory=str(WEB_ROOT))
 
@@ -1249,6 +1942,11 @@ def main() -> int:
 
     print("\nGuandan Trainer local service is running")
     print(f"Local URL: {url}")
+    if replay_store.status()["enabled"]:
+        print("Replay collector: enabled on loopback")
+        print(f"Replay capability token (active readers keep it alive; idle expiry {REPLAY_DEFAULT_TOKEN_TTL_SECONDS // 60} minutes): {replay_store.capability_token}")
+    else:
+        print("Replay collector: disabled (use --enable-replay-collector to opt in)")
     print("Keep this window open. Press Ctrl+C to stop.\n")
 
     if args.open_browser:

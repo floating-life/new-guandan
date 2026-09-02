@@ -115,6 +115,7 @@ const EVALUATION_IMPLEMENTATION_SOURCES = Object.freeze([
   'opponent-model.js',
   'replay-contracts.js',
   'rules.js',
+  'sealed-training.js',
   'stats.js',
   'strategy-core.js',
   'value-model-gate.js',

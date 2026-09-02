@@ -29,6 +29,13 @@ import {
   REPLAY_CONTRACT_IMPLEMENTATION_SHA256,
 } from './replay-contracts.js';
 import {
+  SEALED_STATE_KEYS,
+  appendSealedTrainingTurn,
+  finalizeSealedTrainingBatch,
+  resetSealedTrainingRound,
+  snapshotSealedAction,
+} from './sealed-training.js';
+import {
   loadSettings, saveSettings, recordRoundResult, saveReplay, loadStats, avgScore,
   unassistedAvgScore, saveActiveMatch, loadActiveMatch, clearActiveMatch,
   sanitizeUserSettings,
@@ -344,6 +351,13 @@ export function createMatch(preserveSettings = null) {
     replayEventFailures: 0,
     replayLastEventError: null,
     replayObserverErrors: 0,
+    sealedTrainingTurns: [],
+    sealedTrainingBatch: null,
+    sealedTrainingHistory: [],
+    sealedTrainingFailures: 0,
+    sealedTrainingLastError: null,
+    sealedPreviousTurnSha256: null,
+    sealedSequence: 0,
     trickLog: [],
     round: 0,
     winner: null,
@@ -477,6 +491,7 @@ export function startRound(state) {
   state.replayClosedTrick = null;
   state.replayRoundEndEmitted = false;
   state.replayPendingTribute = [];
+  resetSealedTrainingRound(state);
   state.reported = [false, false, false, false];
   state.selectedIds = new Set();
   state.selectedDeclaration = null;
@@ -977,7 +992,29 @@ export function humanPass(state) {
   return { ok: true, eval: ev };
 }
 
+function captureSealedAction(state, seat, action, cards, hand) {
+  try {
+    return snapshotSealedAction({
+      seat,
+      action,
+      cards,
+      playedHand: hand,
+      actingHand: state.hands[seat],
+      level: state.currentLevel,
+      lastHand: state.lastHand,
+      lastSeat: state.lastSeat,
+      observation: aiDecisionContext(state, seat),
+      turn: (state.trickLog?.length || 0) + 1,
+    });
+  } catch (error) {
+    state.sealedTrainingFailures = (Number(state.sealedTrainingFailures) || 0) + 1;
+    state.sealedTrainingLastError = String(error?.message || error || '密封训练快照失败').slice(0, 240);
+    return null;
+  }
+}
+
 function applyPlay(state, seat, cards, hand, evaluation = null, decisionMeta = null) {
+  const sealedCapture = captureSealedAction(state, seat, 'play', cards, hand);
   const countsBefore = state.handCounts.slice();
   state.hands[seat] = sortHand(removeCards(state.hands[seat], cards), state.currentLevel);
   state.handCounts[seat] = state.hands[seat].length;
@@ -1013,10 +1050,11 @@ function applyPlay(state, seat, cards, hand, evaluation = null, decisionMeta = n
     pushMsg(state, `🏆 ${seatName(seat)} → ${place}`);
   }
   if (seat === 0) state.handTips = analyzeHandStructure(state.hands[0], state.currentLevel);
-  emitReplayAction(state, state.trickLog[state.trickLog.length - 1]);
+  emitReplayAction(state, state.trickLog[state.trickLog.length - 1], sealedCapture);
 }
 
 function applyPass(state, seat, evaluation = null, decisionMeta = null) {
+  const sealedCapture = captureSealedAction(state, seat, 'pass', [], null);
   state.passCount += 1;
   state.trickLog.push({
     turn: state.trickLog.length + 1,
@@ -1030,7 +1068,7 @@ function applyPass(state, seat, evaluation = null, decisionMeta = null) {
     text: `${seatName(seat)} 过`,
   });
   pushMsg(state, `${seatName(seat)} 过`);
-  emitReplayAction(state, state.trickLog[state.trickLog.length - 1]);
+  emitReplayAction(state, state.trickLog[state.trickLog.length - 1], sealedCapture);
 }
 
 // 座位视觉：南0 → 东1 → 北2 → 西3。
@@ -1168,6 +1206,7 @@ function captureRoundStart(state) {
 
 export function serializeMatchState(state) {
   return JSON.parse(JSON.stringify(state, (key, value) => {
+    if (SEALED_STATE_KEYS.includes(key)) return undefined;
     if (value instanceof Set) return [...value];
     return value;
   }));
@@ -1277,7 +1316,6 @@ function deepFreezeReplay(value) {
 }
 
 function emitReplayEvent(state, eventType, item = null) {
-  if (typeof _replayEventObserver !== 'function') return null;
   const sequence = Number.isSafeInteger(state.replaySequence) ? state.replaySequence : 0;
   const turn = (Number.isSafeInteger(state.replayTurn) ? state.replayTurn : 0) + 1;
   const tribute = eventType === 'play' || eventType === 'pass'
@@ -1324,16 +1362,25 @@ function emitReplayEvent(state, eventType, item = null) {
   state.replayTurn = turn;
   state.replayPreviousEventSha256 = event.eventSha256;
   if (tribute.length) state.replayPendingTribute = [];
-  try {
-    _replayEventObserver(event);
-  } catch {
-    state.replayObserverErrors = (Number(state.replayObserverErrors) || 0) + 1;
+  if (typeof _replayEventObserver === 'function') {
+    try {
+      _replayEventObserver(event);
+    } catch {
+      state.replayObserverErrors = (Number(state.replayObserverErrors) || 0) + 1;
+    }
   }
   return event;
 }
 
-function emitReplayAction(state, item) {
-  emitReplayEvent(state, item?.action || 'play', item);
+function emitReplayAction(state, item, sealedCapture = null) {
+  const event = emitReplayEvent(state, item?.action || 'play', item);
+  if (event && sealedCapture) {
+    appendSealedTrainingTurn(state, event, {
+      ...sealedCapture,
+      turn: item?.turn || sealedCapture.turn,
+    });
+  }
+  return event;
 }
 
 function closeReplayTrick(state) {
@@ -2314,6 +2361,9 @@ function endRound(state) {
   });
   state.opponentModel = updatedStats.opponentModel;
 
+  finalizeSealedTrainingBatch(state, {
+    publicImplementationSha256: REPLAY_IMPLEMENTATION_SHA256,
+  });
   emitReplayRoundEnd(state);
 
   notify(state);

@@ -71,6 +71,18 @@
           </select>
         </label>
         <span id="llmStatus" class="llm-status local" role="status" aria-live="polite">本地 AI</span>
+        <span id="replayStatus" class="llm-status local" role="status" aria-live="polite">复盘采集关闭</span>
+        <details class="replay-collector" id="replayCollectorPanel">
+          <summary>采集控制</summary>
+          <div class="replay-collector-body">
+            <p id="replayCollectorDetail">实时复盘采集默认关闭。启用请用启动脚本的显式选项。</p>
+            <div class="replay-collector-actions">
+              <button type="button" class="secondary" id="btnReplayPause">暂停提交</button>
+              <button type="button" class="secondary" id="btnReplayResume">恢复提交</button>
+              <button type="button" class="secondary" id="btnReplayClear">清空待发</button>
+            </div>
+          </div>
+        </details>
         <button type="button" class="secondary" id="btnLLMCheck" title="检测本机网关，并实际验证一次云端聊天接口；成功后解除本局本地回退">检测/恢复 API</button>
         <button type="button" class="secondary" id="btnLLMConfig" title="更换云端 API 地址、模型或密钥">API 设置</button>
         <span id="llmPrompt" class="llm-prompt">默认不调用云端 API</span>

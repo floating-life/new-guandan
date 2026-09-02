@@ -497,6 +497,12 @@ export function createReplayEventQueue({
       }
       return enabled;
     },
+    clearPending() {
+      if (enabled) return { ok: false, reason: 'must_pause', pendingCount: events.length };
+      events = [];
+      persist();
+      return { ok: true, pendingCount: 0, gap: integrityGap || durabilityGap || droppedCount > 0 };
+    },
     setSubmitter(fn) {
       submitter = typeof fn === 'function' ? fn : null;
       if (submitter && enabled) scheduleFlush();

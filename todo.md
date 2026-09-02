@@ -2,7 +2,7 @@
 
 > 更新：2026-09-02
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1/RT-2 定向代码门已完成；0902 迁移收尾恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（含闭包 21 配套），统一入口已在合并树上通过 42 checks。实时复盘智能体桥仍仅部分满足。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
+> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1～RT-6 定向代码门已完成；本轮合并提交 `e305437` 后统一入口在当前树上通过 46 checks。实时复盘智能体桥的本地代码门已齐：opt-in 回环采集、只读消费者、副末密封批次、HTTP 双消费者续读和训练器拒绝未批准批次。这仍不是浏览器真人长局、密封持久化或训练准入。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
 
 ## 当前停止线
 
@@ -26,7 +26,7 @@
 
 - [x] **EVID-1：修正 ReleaseEvidence 退出语义。** `validate_release_evidence.mjs` 现在只有在 `promotion.promoted=true` 时才允许 `releaseEvidenceReady=true` 和退出 0；已覆盖模型哈希一致但 CI 下界≤0 的拒绝负例、主 A/B 绑定旧文件哈希的合成拒绝负例，以及完整正例。当前真实命令仍因旧主报告哈希不匹配返回 1，符合停止线。
 - [x] **EVID-2：修正遥测覆盖率分母。** `collectDecisionTelemetry` 现在对每个 AI 决策生成记录；缺少 `variant` 或 `localDecision` 时保留 `latencyMs=null` 并计入未测量。搜索/回退采用显式 `searchAttempted / searchTriggered / fallbackKind`；普通 expert 回合也明确记录“未搜索/无回退”，本地超时和决策错误保留真实 fallback 类型。`tools/test_ai_ab_simulation.mjs` 的生产者负例证明漏记仍须入账：搜索子集即使 100% 覆盖，缺一座策略/本地耗时也会拉低测量覆盖率，缺搜索或回退字段则令 `integrityComplete=false`；性能门从原始计数重算覆盖率并拒绝矛盾回执。
-- [x] **EVID-3：绑定完整评测依赖闭包。** `guandan-evaluation-implementation-v2` 已绑定 runner、`game.js` 及其 Worker、评价、存储、LLM 与实时复盘契约路径共 21 个源码文件（含环境遥测模块）；测试独立复算静态/动态/副作用 import 与 Worker URL 闭包，并逐一变异此前遗漏的间接依赖，确认 implementation SHA 改变且旧 checkpoint `--resume` 被拒绝。
+- [x] **EVID-3：绑定完整评测依赖闭包。** `guandan-evaluation-implementation-v2` 已绑定 runner、`game.js` 及其 Worker、评价、存储、LLM、实时复盘契约与密封训练捕获路径共 22 个源码文件（含环境遥测模块）；测试独立复算静态/动态/副作用 import 与 Worker URL 闭包，并逐一变异此前遗漏的间接依赖，确认 implementation SHA 改变且旧 checkpoint `--resume` 被拒绝。EVID-9b 冻结提交仍是当时的 21 文件闭包；当前树因 RT-5 增至 22。
 - [x] **EVID-4：checkpoint 原子与可恢复。** `guandan-ai-ab-checkpoint-v3` 现要求 `checkpointIntegrity.sha256`；按同目录唯一临时文件写入 → `fsync` → 重读全量校验 → 不删除目标的原子替换，并保留 `.last-valid`。resume 严格校验 `complete/nextBlockIndex`、配置签名、精确 seed×level×team 覆盖、pair↔game 及 failure 派生一致；主坏仅可从同配置有效备份恢复，主备均坏拒绝。已回归截断/残留临时文件、可解析篡改、重复或错配对象、数组重排和 Windows `FileShare.None` 写锁；不保证同一路径多 writer 互斥，也不把 SHA-256 视为带密钥认证。
 - [x] **EVID-5：加固性能回执 provenance（本地代码门已关闭）。** `guandan-ai-ab-report-v1` / `guandan-ai-ab-checkpoint-v3` 绑定 `evaluationId`、机器/Node/V8、PID/PPID、fresh/resume 段链和输入 checkpoint 摘要；每局与镜像对象归属运行段，resume 只接受同机同 Node/V8。汇总器按本机字节复算完整依赖闭包、逐文件及聚合 SHA，并固定要求 80 区组、精确 `[2..14]`、`opponentModelMode=off` 与候选/当前 `searchMode` 一致。每个运行段的 `searchTriggered` 必须独立通过固定门，且 decision/measured/unmeasured/fallback-evaluable/timeout 五项与总体严格守恒；跨机器或运行时、旧报告/v2 checkpoint、伪造摘要、缺失/断裂运行段或不守恒均 fail closed。边界：这是本地可审计完整性，不是远程可信硬件证明；不能为历史 statefix 产物生成正式回执，也不改变 expert 默认。
 - [x] **EVID-6：修正盲评灾难门（本地代码门已关闭）。** `summarize_blind_eval.mjs` 升级 `guandan-blind-eval-summary-v3`；严格校验 manifest 的非空唯一 `scenarioIds` 与 `selectedScenarios` 数量，按全部题目分别统计 expert/proposed 灾难数，并以同一 manifest 场景数为分母。灾难门直接比较未舍入原始计数；不完整复核时两率为 `null` 且 fail closed。新增“玩家选择 expert、未选 proposed 却为灾难”反例、翻转选择不改变双臂统计、缺复核、重复 ID 和数量不一致回归。
@@ -38,28 +38,51 @@
 
 ### 0901–0902 本轮 EVID-8 / EVID-9a / EVID-9b / STRAT / RT 证据记录
 
-- 前序 EVID-8/9a/9b 已于冻结提交 `585f099` 完成；该提交在独立脱离工作树通过默认统一验证 **38 checks**、`-FullData` **42 checks**，并通过远端 Windows CI run `33470270032`。本轮只在当前工作树追加 RT-1/RT-2 实现、回归与文档改动，未向 EVID-9b 冻结提交追加改动。
-- 0901 前序工作树的默认统一验证为 **39/39**、`-FullData` 为 **45/45**（后者只读引用既有本地数据工件）；这两个数字以及此前性能 provenance、M2 正负例、环境遥测、Windows 目录别名冲突、checkpoint 原子锁/恢复和 STRAT 夹具回归的通过记录，均仅作 0901 历史记录。RT-2 修复后于 0902 重新执行默认统一验证：RT-2 相关步骤均通过，但在目标外既有改动删除 `tools/test_ai_ab_simulation.mjs` 后，于该步骤以 `MODULE_NOT_FOUND` 退出 1，不能记为全仓通过；`verify.ps1` 同时检查工作区与 staged diff，并显式拒绝 unmerged index。当前定向回归为契约 **41/41**、队列 **39/39**、观察器 **12/12**，完整一副集成回归通过；本轮未重跑 `-FullData`、远端 CI 或发布晋级验证。
+- 前序 EVID-8/9a/9b 已于冻结提交 `585f099` 完成；该提交在独立脱离工作树通过默认统一验证 **38 checks**、`-FullData` **42 checks**，并通过远端 Windows CI run `33470270032`。本轮在合并提交 `e305437` 的当前树上追加 RT-3/RT-4/RT-5 实现、回归与文档改动，未改写 EVID-9b 冻结提交，也未创建新提交。
+- 0901 前序工作树的默认统一验证为 **39/39**、`-FullData` 为 **45/45**（后者只读引用既有本地数据工件）；这些数字均仅作历史记录。合并提交 `e305437` 后，当前树重新执行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\verify.ps1`，本轮新增 RT-6 HTTP 端到端后明确输出 **46 checks**，包括 `lan_server.test.py` **47/47**、`tools/test_replay_consumer.mjs` **20/20**、`js/sealed-training.test.js` **32/32**、`tools/test_sealed_training_converter.mjs` **8/8** 与 `tools/test_replay_e2e.mjs`；同时 `git diff --check`、暂存差异检查和 `git ls-files -u` 均通过。本轮未重跑 `-FullData`、远端 CI 或发布晋级验证。
+- 0902 RT-3 代码门：`lan_server.py` 的采集器默认关闭，`start-lan.ps1 -EnableReplayCollector` 才生成短期 capability token；公开事件 POST 受同源、JSON/大小/速率、严格字段与摘要/链校验，GET 受 token、cursor、分页和最多 5 秒短轮询约束，续读必须绑定 `matchId`。事件只写入安全的 `%LOCALAPPDATA%\GuandanTrainer\replays\`，按日/容量轮转、保留期清理、0600 追加事务失败回滚并 `fsync`；容量清理造成链缺口、磁盘/文件损坏均暴露 `gap` 并 fail closed。牌型元数据按 JS 契约校验数值类型，拒绝嵌套实体身份字段；`/api/replay/status` 与 UI 状态胶囊显示服务端关闭、待发和缺口，页面会按服务端状态启停提交。`python -X utf8 lan_server.test.py` **39/39**，其中验证默认关闭、写入幂等、坏 token、续读绑定、链缺口、容量清理、跨语言数字摘要、短写回滚和摘要篡改。
+- 0902 RT-4 代码门：`tools/replay_consumer.mjs` 只允许回环事件 GET，token 仅来自显式 CLI 参数或 `GUANDAN_REPLAY_CAPABILITY`，不打印、不写源事件；按 `afterSequence`/`matchId` 断点续读，逐事件复核公开 schema、摘要、连续序号和前序摘要，源 gap、坏响应、网络失败和存储损坏均停止且保留已确认游标。游标原子写入 `%LOCALAPPDATA%\GuandanTrainer\replay-consumer\cursor.json`，annotation 追加到独立 `annotations.ndjson`，支持 0600、短写回滚和相同模型/提示版本的幂等重放；输出每手/每圈/每副聚合摘要，annotation 只绑定源事件摘要及模型、提示版本、创建时间，不含牌面副本、暗牌、收益或训练标签。`node tools/test_replay_consumer.mjs` **20/20**，已接入统一入口后 **43 checks**。
+- 0902 独立只读复核：首轮在并发中间态发现并定位 3 个 P1（牌型元数据、容量清理、页面/启动器启用链）及若干 P2；已在当前树修复并由 `lan_server.test.py`、UI 静态回归和统一入口复验。复核线程的修复后再次复核在交付前超时，额外 `codexhost`/可验证 Sol 入口不可用，因此不宣称独立 Sol PASS；expert 默认、发布与晋级状态保持不变。
 - 独立复算：直接读取 43,653,388 字节 legacy v2 checkpoint，确认 2,080 局 / 1,040 镜像组 / 80 区组、无重复/缺失/失败，效用 `+0.028/局`、区组 bootstrap 95% CI `[+0.005,+0.051]`；6,677 个搜索代理回合 P95/P99 `619/1022ms`，1–60 为 `421.8/550ms`，61–80 为 `942/1481ms`。报告/checkpoint SHA-256 分别为 `3b4ebd543d56af0d9c860eef1c07d5fc294b3817a7da006612f3b0e04161762a` / `1a8ed1de8a4a67d6b474bd0bbf1a16f38cebcbff2f1294edd12c91aa26f9a887`。
 - 未通过/未完成：真实 M2 所需 checkpoint、raw telemetry、正式性能回执和盲评工件均不存在；严格旧价值模型发布校验按预期退出 1。STRAT-1～4 尚未冻结、未跑正式镜像赛，expert 默认和现有性能停止线保持不变。
-- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2 和 STRAT-1/2/3/4 的本地回归通过；EVID-9b 冻结提交远端 CI 已完成。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 合并双侧回归后为 **93/93**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
+- 0902 RT-5 代码门：`js/game.js` 在 `applyPlay` / `applyPass` 变异前捕获行动座位手牌、公开 observation、完整规则候选和唯一 chosen，公开观察器只收 `guandan-live-public-event-v1`；副末由 `js/sealed-training.js` 连接真实 `finishOrder` 与相反团队收益，强制 `trainingEligible=false`。`serializeMatchState` 剥离全部密封字段，进行中存档和实时读 API 都不携带密封内容。`tools/sealed_training_converter.mjs` 逐条重放合法性、牌张守恒、座位不连续行动、名次前缀、牌型声明、候选归属和唯一 chosen，去重后按完整 `matchId` 切分 train/validation/held-out，拒绝项目目录、WPSDrive 和公开复盘/消费者目录，失败不写切分产物。未选择候选不含 reward/outcome/`chosen` 反事实标签，外来未选候选 fail closed。评测依赖闭包因 `game.js` 新增该模块从 21 增至 22 个源码文件。`node js/sealed-training.test.js` **32/32**，`node tools/test_sealed_training_converter.mjs` **8/8**，观察器 **14/14**，完整一副集成回归通过，统一入口 **45 checks**。独立只读审查判定本地代码门 PASS（有残余风险）：P0 为 0；首轮 P1 为转换器对未选择外来候选校验过松，当前树已收紧。
+- 0902 RT-6 代码门：真实回环 HTTP 将一副收束对局的公开事件写入采集器；两个 `replay_consumer.mjs` 从中途 cursor 续读不丢不重；公开事件无暗牌字段；密封批次保持 `trainingEligible=false` 且训练器 `validate_dataset_manifest` 拒绝。合成负例覆盖暗牌注入、跨 origin、过期 token、超大请求、重复幂等、磁盘满和保留期删链。`/api/replay/status` 增加 `lastSequence`/`retentionSeconds`/`readerConnected` 且不返回 token。UI 采集控制可暂停、恢复、清空待发。保留期/容量删除已提交事件会锁存 gap。`node tools/test_replay_e2e.mjs` 通过，统一入口 **46 checks**。
+- 0902 RT 审查后修复（P1：token 断链）：独立代码审查发现 capability token 默认 15 分钟过期后无任何续期路径，超过 TTL 的真人长局必断链。已在当前树修复且未创建新提交：`lan_server.py` 的 `authorize()` 对成功授权滑动续期（活跃 follow 消费者每 ≤5 秒轮询一次，不会中途过期；闲置 token 仍在原 TTL 后失效），新增 `capability_failure_code` 区分 `capability_expired` 与 `capability_required`；`start-lan.ps1 -EnableReplayCollector` 在采集器已启用但 token 已过期（或 60 秒内将过期/时间戳无法解析）时安全重启以签发新 token；`replay_consumer.mjs` 对 401 解析错误码，`capability_expired` 不可重试并明确提示重新签发路径。回归：`python -X utf8 lan_server.test.py` **50/50**（新增滑动续期、错误码区分、HTTP 过期码三项），`node tools/test_replay_consumer.mjs` **22/22**（新增过期不可重试提示与无效 token 保持 `http_error`），e2e 通过。边界：滑动续期只覆盖活跃读取者；闲置过期后仍需用户显式重新运行启动脚本，没有也不应有无人值守的续签通道。
 
-## P1-A：实时复盘智能体桥与真人训练候选（RT-1/RT-2 代码门完成；RT-3～6 未满足）
+### RT 审查残余风险清单（0902 独立审查，均为 P2，均未修复，不阻断当前本地代码门）
+
+1. `lan_server.py` `read()` 在链缺口锁存后仍返回记录，未兑现 fail-closed 承诺；仅本仓库消费者恰好检查 `collector.gap`，第三方按 `nextSequence` 翻页的读取方会静默吞掉有洞的事件链。
+2. `lan_server.py` 有限数检查漏过 `Infinity` 字面量（Python `json.loads` 接受之）；一条含 `Infinity` 的行会让 `/api/replay/status` 每次调用抛未捕获异常（连接断开、不锁存 gap）。
+3. `lan_server.py` 任何瞬时存储 OSError 永久锁存 `_gap`；默认 7 天保留期首次清理已提交事件时必然进入该不可恢复状态，无运行时恢复路径。
+4. `lan_server.py` 深层嵌套 JSON（约 1000 层）触发 `RecursionError` 不在捕获列表内，处理线程崩溃、客户端挂起而非干净 400。
+5. `lan_server.py` GET 读取无速率限制；append 每次全量扫描日志至多 3 次，日志接近 64MB 上限时操作退化为平方级，持 token 者 `waitMs=0` 轮询可占满回环 CPU。
+6. `tools/replay_consumer.mjs` 单次模式 drain 循环为死代码，超过一页（默认 100 条）的事件流静默消费不全且退出码为 0。
+7. `js/replay-event-queue.js` `clearPending()` 与进行中的 flush 竞争：慢 POST 期间清空队列，回执到达后误锁存永久完整性缺口（实际投递成功却无 UI 恢复路径）。
+8. `js/replay-event-queue.js` + `js/ui.js` 对局中途清空待发会不可逆破坏当前对局事件链（后续事件被采集端 `event_chain_gap` 拒绝），成功提示无任何警告。
+9. `tools/replay_consumer.mjs` 进程在 `writeSync` 与 `fsync` 之间被杀会留下半行 NDJSON，之后每次启动 `annotation_invalid` 退出 1，无截断/修复路径（游标有原子 rename 保护，annotation 没有）。
+10. `js/sealed-training.js` `createSealedTrainingBatch` 接受调用方任意 `upgradeCode`，不与 `finishOrder` 派生值交叉校验；篡改输入可带错误胜利类型标签静默入库（数值收益仍正确，误标无门能检出）。
+11. `js/sealed-training.js` 牌张守恒仅按座位检查，同一物理牌可出现在两个座位手中而不触发；仅对伪造/损坏的转换器输入 fail-open，真实捕获不会产生。
+12. `js/ai.ab.simulation.js` 无开关地为每次动作支付全量合法候选枚举、每轮末全量重放，且 `state.sealedTrainingHistory` 累计全部批次；正式 A/B 评测因此变慢并随轮数涨内存，PERF-3/4 前需评估其对性能读数的影响。
+- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2、STRAT-1/2/3/4 和 RT-1～RT-6 的当前本地回归通过；EVID-9b 冻结提交远端 CI 已完成。RT-6 仅证明回环 HTTP 与合成收束对局的本地代码门，不证明浏览器真人长局、密封刷新持久化或训练准入。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 合并双侧回归后为 **93/93**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
+
+## P1-A：实时复盘智能体桥与真人训练候选（RT-1～RT-6 本地代码门完成；训练准入未满足）
 
 - [x] **RT-1：冻结三层数据契约。** `js/replay-contracts.js` 定义并校验 `guandan-live-public-event-v1`、`guandan-sealed-training-turn-v1`、`guandan-agent-annotation-v1`；三类对象绑定 match/round/trick/turn、`eventId`、单调 `sequence`、时间、规则版本、实现 SHA 和前序事件摘要。公开事件与密封 turn 使用不同白名单，公开决策元数据只允许受控 token，未知值归一为 `unknown`，annotation 只引用源事件；公开事件实现摘要绑定完整的契约序列化依赖清单；`node js/replay-contracts.test.js` 为 **41/41**。
-- [x] **RT-2：在真实动作提交边界发事件。** `js/game.js` 在 `applyPlay` / `applyPass` 状态写入成功后发出独立公开事件，并在 `trick_end / round_end` 边界补齐链；公开牌按白名单构造，不暴露实体牌 ID 或副本索引，结束事件拒绝动作载荷，完整链首事件强制从 `sequence=0` 开始。`js/ui.js` 只把事件先写入有界本机队列，`js/replay-event-queue.js` 默认关闭网络提交，异步失败重试、重复 `eventId` 幂等、sequence 缺口、HTTP 业务拒绝/错配/无身份回执、持久化失败、无可用持久化存储和刷新后保留的溢出/一般完整性缺口锁存均 fail closed，不阻断牌局。覆盖真人、三个 AI、贡还、接风、双上提前结束和打 A 终局；`node js/replay-event-queue.test.js` **39/39**、`node js/replay-observer.test.js` **12/12**，完整一副集成回归通过。
-- [ ] **RT-3：实现 opt-in 本机采集与游标读取。** `lan_server.py` 增加 `POST /api/replay/events` 与 `GET /api/replay/events?afterSequence=...&limit=...`（可带短长轮询）；默认关闭，只绑定 `127.0.0.1`。浏览器写入受同源、schema、请求体和速率限制；智能体读取要求短期 capability token。事件以原子追加 NDJSON 写入 `LOCALAPPDATA/GuandanTrainer/replays/`，配置保留期/轮转/最大空间，禁止进入仓库或 WPSDrive；磁盘满时降级并在 UI 明示缺口。
-- [ ] **RT-4：提供智能体只读消费与独立注释。** 新增 CLI（后续可包装为 MCP resource）按 cursor 持续读取、恢复和校验事件链，输出每手/每圈/每副复盘；分析结果写入独立 annotation 存储并记录模型、提示版本、时间和源事件摘要。禁止智能体修改源事件、当前牌局状态或直接把建议写成训练标签。
-- [ ] **RT-5：副末生成密封训练候选。** 对每个行动 turn 保存“行动座位手牌 + 当时公开观察 + 全部合法候选 + 实际动作”，副末再连接真实名次/团队收益；不向实时读 API 暴露密封内容。转换器逐条重放规则、牌张守恒、座位轮转、牌型声明、候选归属和唯一 chosen，去重后按完整 match 切分 train/validation/held-out；未人工批准前固定 `trainingEligible=false`，不为未选择动作伪造反事实标签。
-- [ ] **RT-6：端到端安全与完整性验收。** 合成测试覆盖暗牌字段注入、跨 origin、坏/过期 token、超大请求、重复/乱序/漏序、服务中断重试、磁盘满和保留期轮转；真实 HTTP 完成一副时，第二个本机消费者能从中途 cursor 无丢失恢复，公开流逐字段证明无暗牌，密封流副末可复算且训练器拒绝未批准批次。UI 提供启用、暂停、清空、保留期和“当前智能体连接/最后序号/是否缺口”状态。
+- [x] **RT-2：在真实动作提交边界发事件。** `js/game.js` 在 `applyPlay` / `applyPass` 状态写入成功后发出独立公开事件，并在 `trick_end / round_end` 边界补齐链；公开牌按白名单构造，不暴露实体牌 ID 或副本索引，结束事件拒绝动作载荷，完整链首事件强制从 `sequence=0` 开始。`js/ui.js` 只把事件先写入有界本机队列，`js/replay-event-queue.js` 默认关闭网络提交，异步失败重试、重复 `eventId` 幂等、sequence 缺口、HTTP 业务拒绝/错配/无身份回执、持久化失败、无可用持久化存储和刷新后保留的溢出/一般完整性缺口锁存均 fail closed，不阻断牌局。覆盖真人、三个 AI、贡还、接风、双上提前结束和打 A 终局；`node js/replay-event-queue.test.js` **41/41**、`node js/replay-observer.test.js` **14/14**，完整一副集成回归通过。
+- [x] **RT-3：实现 opt-in 本机采集与游标读取。** `lan_server.py` 增加 `POST /api/replay/events` 与 `GET /api/replay/events?afterSequence=...&limit=...`，支持最多 5 秒短轮询；默认关闭且服务仍只绑定 `127.0.0.1`。浏览器写入受同源、公开事件严格白名单/`eventSha256` 复算、请求体和全局速率限制；智能体读取必须携带短期 `X-Guandan-Replay-Capability` token，续读绑定 `matchId`。事件按日/容量轮转，以 `LOCALAPPDATA/GuandanTrainer/replays/` 下 0600 追加事务失败回滚并 `fsync`，执行保留期和总容量清理；清理造成链缺口、项目目录、WPSDrive、坏链、磁盘满均拒绝或 fail closed，并把 `gap/lastError` 暴露给状态接口和 UI。牌型元数据严格复刻 JS 数值契约，拒绝嵌套实体身份字段；`start-lan.ps1 -EnableReplayCollector` 会在已有同版本但关闭采集器时安全重启启用，页面按 `/api/replay/status` 自动启停提交。`python -X utf8 lan_server.test.py` **47/47**。
+- [x] **RT-4：提供智能体只读消费与独立注释。** 新增 `tools/replay_consumer.mjs`（后续可包装为 MCP resource）：严格限制 `http://localhost`/`127.0.0.1` 事件 GET、只从 CLI 或环境变量读取短期 capability token、不发起 POST；按 `afterSequence` + `matchId` 持续读取，逐事件复核公开契约、摘要、连续 sequence 和前序摘要，网络失败或响应/存储损坏时保留游标并 fail closed。游标原子写入 `%LOCALAPPDATA%/GuandanTrainer/replay-consumer/cursor.json`，annotation 独立追加到同目录 `annotations.ndjson`（0600、短写回滚、重复 annotation 幂等），输出每手/每圈/每副摘要；annotation 绑定模型、提示版本、创建时间和源事件摘要，禁止源事件副本、暗牌、收益、`trainingEligible` 或任何自动训练标签。`node tools/test_replay_consumer.mjs` **20/20**，统一入口 **43 checks**。
+- [x] **RT-5：副末生成密封训练候选。** `js/sealed-training.js` 在每个行动 turn 保存行动座位手牌、当时公开 observation、完整规则候选和唯一实际动作；副末连接真实名次/团队收益并强制 `trainingEligible=false`。公开观察器和 `GET /api/replay/events` 仍只看到公开事件；`serializeMatchState` 剥离密封字段。转换器逐条重放规则合法性、牌张守恒、座位不连续行动、名次前缀、牌型声明、候选归属和唯一 chosen，去重后按完整 match 切分 train/validation/held-out，不为未选择动作伪造反事实标签。`node js/sealed-training.test.js` **32/32**，`node tools/test_sealed_training_converter.mjs` **8/8**。边界：密封批次只活在当前对局内存中，刷新/存档不会恢复；不是训练准入。
+- [x] **RT-6：端到端安全与完整性验收（本地代码门）。** 合成 HTTP 负例覆盖暗牌 `hands` 注入、跨 origin POST、过期 token、超大请求 413、重复 eventId 幂等、磁盘满 `storage_full`、保留期删除已提交事件后锁存 gap。`tools/test_replay_e2e.mjs` 把一副收束对局的公开事件经真实回环 HTTP POST 出去，两个 `replay_consumer.mjs` 从中途 cursor 无丢失续读，公开事件逐字段无暗牌，密封批次可转换且 `training/guandan_env_contract.py` 拒绝 `trainingEligible=false`。UI 采集控制提供暂停/恢复/清空待发，状态展示最后序号、保留期和智能体是否连接；启用仍须启动脚本显式 opt-in，用户暂停不会被 5 秒状态刷新覆盖。`python -X utf8 lan_server.test.py` **47/47**，队列 **41/41**，UI 静态 **47/47**，e2e 通过，统一入口 **46 checks**。独立只读审查：本地代码门 PASS（有残余风险），P0/P1 为 0。边界：这是回环 HTTP 与合成收束对局，不是浏览器真人长局；清空只清本机待发队列；密封批次仍无刷新持久化；不是训练准入。
 
 ### 当前能力边界（RT 基线）
 
 - [x] 每手出牌/过牌已经写入内存 `trickLog`，含圈号、座位、公开牌张、余牌数、评价和决策元数据；副末复盘保存后，最近 100 副可从浏览器手工导出。
 - [x] `tools/replay_ai_audit.mjs` 能对手工导出文件做事后、公开信息边界内的逐手反事实审计。
 - [x] RT-2 已把真实动作提交后的公开事件交给独立观察器，并由 `guandan_replay_pending_v1` 有界保存在本机；队列保持默认关闭，只有后续 RT-3 opt-in 采集端点完成后才启用网络提交。
-- [ ] 当前没有复盘 POST/GET、cursor/订阅、智能体 token 或 annotation 存储；副末 localStorage 不是实时接口。
-- [ ] 进行中存档包含四家 `hands` 与 `roundInitialHands`，明确不得作为实时智能体数据源；现有导出也不是训练 schema。
+- [x] 当前已有默认关闭的本机复盘 POST/GET、`afterSequence`/`matchId` cursor 和最多 5 秒短轮询；读取需短期 capability token，写入只接受公开事件并落到本机应用数据目录。`/api/replay/status` 与页面状态胶囊可显示启用、待发和缺口；RT-4 消费者再以独立文件保存只读游标和 annotation，不回写源事件。
+- [x] RT-5 已能在副末从内存密封 turn 生成 `guandan-sealed-training-batch-v1`，并由转换器离线重放、去重和按 match 切分；批次固定 `trainingEligible=false`，不进入实时读 API。
+- [x] RT-6 已有回环 HTTP 双消费者续读、公开流暗牌负例、训练器拒绝未批准批次，以及暂停/清空待发与状态面板。
+- [ ] 进行中存档包含四家 `hands` 与 `roundInitialHands`，明确不得作为实时智能体数据源；现有导出也不是训练 schema。密封批次也尚未做浏览器刷新持久化或 UI 批准流。
 
 ## P1-B：复盘驱动的专家策略修复（新增，可与 R0/R1A 并行）
 
@@ -121,4 +144,4 @@
 - availability-aware UCT 已改为 `log(availability + 1) / visits`；旧错误实现报告全部退出正式证据集。
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
-- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2/RT-3 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。随后 RT-4 将统一入口复验为 **43 checks**；本轮 RT-5 再复验为 **45 checks**，RT-6 再复验为 **46 checks**，评测闭包 21→22。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。

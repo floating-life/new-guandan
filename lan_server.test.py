@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -15,20 +17,53 @@ import lan_server
 
 def request(
     url: str, *, method: str = "GET", origin: str | None = None,
-    content_type: str | None = None, payload: dict | None = None,
+    content_type: str | None = None, payload: dict | None = None, extra_headers: dict | None = None,
 ):
-    headers = {"Host": f"{lan_server.LOOPBACK_HOST}:{lan_server.FIXED_PORT}"}
+    request_headers = {"Host": f"{lan_server.LOOPBACK_HOST}:{lan_server.FIXED_PORT}"}
     if origin is not None:
-        headers["Origin"] = origin
+        request_headers["Origin"] = origin
     if content_type is not None:
-        headers["Content-Type"] = content_type
+        request_headers["Content-Type"] = content_type
+    if extra_headers:
+        request_headers.update(extra_headers)
     data = None if method == "GET" else json.dumps(
         payload if payload is not None else {"context": {}, "candidates": []}
     ).encode("utf-8")
     return urllib.request.urlopen(
-        urllib.request.Request(url, data=data, headers=headers, method=method),
+        urllib.request.Request(url, data=data, headers=request_headers, method=method),
         timeout=3,
     )
+
+
+def replay_event(sequence: int = 0, previous: str | None = None, event_id: str | None = None) -> dict:
+    event = {
+        "schema": lan_server.REPLAY_PUBLIC_SCHEMA,
+        "matchId": "rt3-test-match",
+        "round": 1,
+        "trick": 1,
+        "turn": sequence + 1,
+        "eventId": event_id or f"rt3-event-{sequence}",
+        "sequence": sequence,
+        "occurredAt": "2026-09-02T00:00:00.000Z",
+        "ruleVersion": "guandan-rules-v1",
+        "implementationSha256": "a" * 64,
+        "eventSha256": None,
+        "previousEventSha256": previous,
+        "eventType": "play",
+        "seat": 0,
+        "action": "play",
+        "cards": [{"rank": 2, "suit": "S"}],
+        "hand": {"type": "single", "mainRank": 2, "size": 1, "power": 2},
+        "countsBefore": [2, 5, 5, 5],
+        "countsAfter": [1, 5, 5, 5],
+        "tribute": [],
+        "engine": {"name": "test", "version": "1"},
+        "decisionMeta": {"source": "human", "fallbackKind": "none"},
+    }
+    payload = dict(event)
+    payload.pop("eventSha256")
+    event["eventSha256"] = lan_server._replay_sha256(lan_server._replay_stable_json(payload))
+    return event
 
 
 def main() -> int:
@@ -38,6 +73,7 @@ def main() -> int:
     thread.start()
     base = f"http://{lan_server.LOOPBACK_HOST}:{server.server_port}"
     passed = 0
+    original_replay_store = lan_server._REPLAY_STORE
     try:
         with request(f"{base}/healthz") as response:
             assert response.status == 200
@@ -53,6 +89,335 @@ def main() -> int:
             assert response.status == 200 and "apiKey" not in config_payload
             passed += 1
             print("  [OK] API 配置查询不返回密钥内容")
+
+        with request(f"{base}/api/replay/status") as response:
+            replay_status = json.loads(response.read().decode("utf-8"))
+            assert replay_status["ok"] is True and replay_status["collector"]["enabled"] is False
+            passed += 1
+            print("  [OK] 复盘采集器默认关闭")
+
+        try:
+            request(
+                f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                content_type="application/json", payload=replay_event(),
+            )
+            raise AssertionError("关闭的复盘采集器仍接受写入")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 503
+            passed += 1
+            print("  [OK] 未显式启用时复盘写入被拒绝")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = lan_server.configure_replay_collector(
+                enabled=True, token="t" * 40, root=Path(temporary),
+            )
+            first = replay_event()
+            with request(
+                f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                content_type="application/json", payload=first,
+            ) as response:
+                ack = json.loads(response.read().decode("utf-8"))
+                assert response.status == 200 and ack["eventId"] == first["eventId"]
+                passed += 1
+                print("  [OK] 已启用采集器按公开契约接收第一条事件")
+
+            try:
+                request(f"{base}/api/replay/events?afterSequence=-1", extra_headers={"X-Guandan-Replay-Capability": "bad"})
+                raise AssertionError("坏 capability token 未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+                passed += 1
+                print("  [OK] 游标读取要求短期 capability token")
+
+            with request(
+                f"{base}/api/replay/events?afterSequence=-1&limit=10",
+                extra_headers={"X-Guandan-Replay-Capability": store.capability_token},
+            ) as response:
+                page = json.loads(response.read().decode("utf-8"))
+                assert page["ok"] is True and len(page["events"]) == 1 and page["nextSequence"] == 0
+                passed += 1
+                print("  [OK] 游标读取返回按序公开事件和 nextSequence")
+
+            second = replay_event(1, first["eventSha256"])
+            with request(
+                f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                content_type="application/json", payload=second,
+            ) as response:
+                assert json.loads(response.read().decode("utf-8"))["ok"] is True
+                passed += 1
+            with request(
+                f"{base}/api/replay/events?afterSequence=0&limit=1&matchId={first['matchId']}",
+                extra_headers={"X-Guandan-Replay-Capability": store.capability_token},
+            ) as response:
+                page = json.loads(response.read().decode("utf-8"))
+                assert [item["sequence"] for item in page["events"]] == [1] and page["hasMore"] is False
+                passed += 1
+                print("  [OK] 事件链可从中途 cursor 无丢失续读")
+
+            try:
+                request(
+                    f"{base}/api/replay/events?afterSequence=0",
+                    extra_headers={"X-Guandan-Replay-Capability": store.capability_token},
+                )
+                raise AssertionError("无 matchId 的续读 cursor 未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                passed += 1
+                print("  [OK] 续读 cursor 必须绑定 matchId")
+
+            gap = replay_event(3, second["eventSha256"])
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=gap,
+                )
+                raise AssertionError("sequence 缺口未被采集器拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 409
+                passed += 1
+                print("  [OK] 采集器拒绝 sequence 缺口并保持链完整性")
+
+            tampered = dict(second)
+            tampered["eventId"] = "tampered"
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=tampered,
+                )
+                raise AssertionError("摘要篡改未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                passed += 1
+                print("  [OK] 采集器复算 eventSha256 并拒绝篡改事件")
+
+            nested_private = replay_event(2, second["eventSha256"], "nested-private")
+            nested_private["hand"] = {
+                "type": "single", "mainRank": 2, "size": 1, "power": 2,
+                "meta": {"sequence": {"deckIndex": 0}},
+            }
+            nested_payload = dict(nested_private)
+            nested_payload.pop("eventSha256")
+            nested_private["eventSha256"] = lan_server._replay_sha256(
+                lan_server._replay_stable_json(nested_payload)
+            )
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=nested_private,
+                )
+                raise AssertionError("hand.meta.sequence 中的嵌套实体字段未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                passed += 1
+                print("  [OK] 公开牌型元数据拒绝嵌套实体身份字段")
+
+            capacity_root = Path(temporary) / "capacity"
+            capacity_store = lan_server.ReplayEventStore(
+                capacity_root, enabled=True, capability_token="c" * 40,
+                max_bytes=64 * 1024, rotate_bytes=64 * 1024,
+            )
+            previous = None
+            capacity_failed = False
+            for index in range(140):
+                item = replay_event(index, previous, f"capacity-event-{index}")
+                try:
+                    capacity_store.append(item)
+                except lan_server.ReplayStoreError as exc:
+                    assert exc.code == "storage_corrupt"
+                    capacity_failed = True
+                    break
+                previous = item["eventSha256"]
+            assert capacity_failed and capacity_store.status()["gap"] is True
+            passed += 1
+            print("  [OK] 容量清理造成链缺口时锁存 gap 并停止安全采集")
+
+            assert lan_server._replay_number(1e-7) == "1e-7"
+            assert lan_server._replay_number(1e-6) == "0.000001"
+            assert lan_server._replay_number(1e20) == "100000000000000000000"
+            passed += 1
+            print("  [OK] 公开摘要数字格式与 JSON.stringify 规范一致")
+
+            short_root = Path(temporary) / "short-write"
+            short_store = lan_server.ReplayEventStore(
+                short_root, enabled=True, capability_token="s" * 40,
+            )
+            short_first = replay_event(0, None, "short-write-0")
+            short_second = replay_event(1, short_first["eventSha256"], "short-write-1")
+            short_store.append(short_first)
+            original_write = lan_server.os.write
+            try:
+                lan_server.os.write = lambda descriptor, payload: max(1, len(payload) - 1)
+                try:
+                    short_store.append(short_second)
+                    raise AssertionError("短写未被拒绝")
+                except lan_server.ReplayStoreError as exc:
+                    assert exc.code == "storage_unavailable"
+            finally:
+                lan_server.os.write = original_write
+            assert short_store.status()["gap"] is True
+            assert short_store.root.joinpath(next(short_store.root.glob("events-*.ndjson")).name).read_text(encoding="utf-8").count("short-write-0") == 1
+            passed += 1
+            print("  [OK] NDJSON 短写回滚半行并锁存存储缺口")
+
+            rotated_root = Path(temporary) / "rotated"
+            rotated_store = lan_server.ReplayEventStore(
+                rotated_root, enabled=True, capability_token="r" * 40,
+                max_bytes=128 * 1024, rotate_bytes=64 * 1024,
+            )
+            previous = None
+            for index in range(120):
+                item = replay_event(index, previous, f"rotated-event-{index}")
+                rotated_store.append(item)
+                previous = item["eventSha256"]
+            rotated_files = list(rotated_root.glob("events-*.ndjson"))
+            assert len(rotated_files) >= 2
+            assert rotated_store.read(after_sequence=118, match_id="rt3-test-match")["events"][0]["sequence"] == 119
+            passed += 1
+            print("  [OK] 事件分片轮转后仍按时间顺序维护并续读链")
+
+            leak = json.dumps(store.status())
+            assert store.capability_token not in leak
+            assert store.status()["lastSequence"] == 1
+            assert store.status()["retentionSeconds"] >= 3600
+            passed += 1
+            print("  [OK] 状态接口暴露最后序号和保留期，不返回 capability token")
+
+            duplicate = json.loads(request(
+                f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                content_type="application/json", payload=first,
+            ).read().decode("utf-8"))
+            assert duplicate["ok"] is True and duplicate.get("duplicate") is True
+            passed += 1
+            print("  [OK] 重复 eventId+摘要写入保持幂等")
+
+            hidden = replay_event(2, second["eventSha256"], "hidden-hands")
+            hidden["hands"] = [[], [], [], []]
+            hidden_payload = dict(hidden)
+            hidden_payload.pop("eventSha256")
+            hidden["eventSha256"] = lan_server._replay_sha256(lan_server._replay_stable_json(hidden_payload))
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=hidden,
+                )
+                raise AssertionError("暗牌字段 hands 未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            passed += 1
+            print("  [OK] 公开写入拒绝暗牌字段注入")
+
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin="https://evil.example",
+                    content_type="application/json", payload=replay_event(2, second["eventSha256"], "cross-origin"),
+                )
+                raise AssertionError("复盘写入跨 origin 未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 403
+            passed += 1
+            print("  [OK] 复盘写入跨 origin 被 403 拒绝")
+
+            oversized = urllib.request.Request(
+                f"{base}/api/replay/events",
+                data=b"{" + (b"x" * (lan_server.REPLAY_MAX_EVENT_BYTES + 8)),
+                headers={
+                    "Host": f"{lan_server.LOOPBACK_HOST}:{lan_server.FIXED_PORT}",
+                    "Origin": lan_server.LOCAL_ORIGIN,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(lan_server.REPLAY_MAX_EVENT_BYTES + 9),
+                },
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(oversized, timeout=3)
+                raise AssertionError("超大复盘请求未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 413
+            passed += 1
+            print("  [OK] 超大复盘请求体返回 413")
+
+            expired_store = lan_server.ReplayEventStore(
+                Path(temporary) / "expired", enabled=True, capability_token="e" * 40,
+            )
+            expired_store._capability_expires_at = 1
+            assert expired_store.authorize("e" * 40) is False
+            passed += 1
+            print("  [OK] 过期 capability token 不能继续读取")
+
+            sliding_store = lan_server.ReplayEventStore(
+                Path(temporary) / "sliding", enabled=True, capability_token="g" * 40,
+                token_ttl_seconds=60,
+            )
+            sliding_store._capability_expires_at = time.time() + 1
+            assert sliding_store.authorize("g" * 40) is True
+            assert sliding_store._capability_expires_at >= time.time() + 59
+            assert sliding_store.authorize("g" * 40) is True
+            assert sliding_store.authorize("bad") is False
+            passed += 1
+            print("  [OK] 活跃读取在过期前成功授权会滑动续期，错误 token 仍被拒绝")
+
+            sliding_store._capability_expires_at = 1
+            assert sliding_store.authorize("g" * 40) is False
+            assert sliding_store.capability_failure_code("g" * 40) == "capability_expired"
+            assert sliding_store.capability_failure_code("bad") == "capability_required"
+            assert sliding_store.capability_failure_code(None) == "capability_required"
+            passed += 1
+            print("  [OK] 闲置过期与无效 token 的 401 错误码可区分")
+
+            lan_server.configure_replay_collector(
+                enabled=True, token="h" * 40, root=Path(temporary) / "expired-http",
+            )
+            lan_server._REPLAY_STORE._capability_expires_at = 1
+            try:
+                request(
+                    f"{base}/api/replay/events?afterSequence=-1",
+                    extra_headers={"X-Guandan-Replay-Capability": "h" * 40},
+                )
+                raise AssertionError("过期 token 的 HTTP 读取未被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+                expired_body = json.loads(exc.read().decode("utf-8"))
+                assert expired_body["code"] == "capability_expired"
+                assert "start-lan.ps1 -EnableReplayCollector" in expired_body["message"]
+            passed += 1
+            print("  [OK] 过期 token 的 HTTP 读取返回 capability_expired 与续期指引")
+
+            retention_root = Path(temporary) / "retention"
+            retention_store = lan_server.ReplayEventStore(
+                retention_root, enabled=True, capability_token="n" * 40,
+                retention_seconds=3600,
+            )
+            retention_store.append(replay_event(0, None, "retention-0"))
+            old_file = next(retention_root.glob("events-*.ndjson"))
+            os.utime(old_file, (1, 1))
+            try:
+                with retention_store._lock:
+                    retention_store._prune_locked(16)
+                raise AssertionError("保留期清理未 fail closed")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            assert retention_store.status()["gap"] is True
+            passed += 1
+            print("  [OK] 保留期清理造成链缺口时 fail closed")
+
+            full_store = lan_server.ReplayEventStore(
+                Path(temporary) / "full", enabled=True, capability_token="f" * 40,
+            )
+            full_store.max_bytes = 32
+            try:
+                full_store.append(replay_event(0, None, "disk-full-0"))
+                raise AssertionError("磁盘满路径未被拒绝")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_full"
+            passed += 1
+            print("  [OK] 磁盘满时拒绝写入并标为 storage_full")
+
+        try:
+            lan_server.ReplayEventStore(lan_server.WEB_ROOT)
+            raise AssertionError("项目目录被允许作为复盘采集目录")
+        except ValueError:
+            passed += 1
+            print("  [OK] 复盘采集目录拒绝项目树，避免写回仓库")
 
         try:
             request(f"{base}/api/llm/health", origin="https://evil.example")
@@ -383,6 +748,7 @@ def main() -> int:
             lan_server._ENV_LLM_API_KEY = original_env_api_key
             lan_server._ENV_LLM_MODEL = original_env_model
     finally:
+        lan_server._REPLAY_STORE = original_replay_store
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)

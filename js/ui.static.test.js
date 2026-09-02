@@ -31,6 +31,17 @@ assert(ui.includes("applySettings(state, { localAiEngine: engine })")
   && ui.includes('公平信息集模拟') && ui.includes('成对根 PIMC 已启用'), '本地引擎开关接入设置并说明公平采样、成对覆盖与安全回退');
 assert(ui.includes('localEngine.disabled') && ui.includes("实验搜索仅在大师难度运行"),
   '非大师难度禁用实验搜索选择器，并说明当前不会启用');
+assert(html.includes('id="replayStatus"') && ui.includes('refreshReplayCollectorStatus'),
+  '复盘状态胶囊展示本机采集器状态');
+assert(ui.includes("'/api/replay/status'") && ui.includes('replayEventQueue.setEnabled')
+  && ui.includes('setInterval'), '页面按服务端启用与缺口状态自动启停复盘提交');
+assert(html.includes('id="replayCollectorPanel"') && html.includes('id="btnReplayPause"')
+  && html.includes('id="btnReplayResume"') && html.includes('id="btnReplayClear"'),
+  '采集控制提供暂停、恢复和清空待发');
+assert(ui.includes('replaySubmitPaused') && ui.includes('clearPending')
+  && ui.includes('readerConnected') && ui.includes('lastSequence')
+  && ui.includes('retentionSeconds'),
+  '采集面板展示最后序号、保留期和智能体连接，暂停不会被状态刷新覆盖');
 assert(ui.includes('混合搜索') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
   '逐手复盘展示混合层是否改选、采样数和模拟节点数');
 assert(ui.includes('成对根 PIMC') && ui.includes('次成对 rollout'),

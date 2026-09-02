@@ -2,9 +2,15 @@
 import {
   createMatch, startMatch, humanPlay, humanPass, humanSelectSet,
   humanPickReturnCard, humanConfirmReturn, getLegalHints, getReturnCandidates,
-  setUpdateCallback, setReplayEventObserver, PHASE,
+  setUpdateCallback, setReplayEventObserver, serializeMatchState, PHASE,
 } from './game.js';
 import { validateLiveEventChain } from './replay-contracts.js';
+import {
+  convertSealedTrainingBatches,
+  getSealedTrainingBatch,
+  replaySealedTrainingBatch,
+  SEALED_STATE_KEYS,
+} from './sealed-training.js';
 
 const state = createMatch({ difficulty: 'easy', aiSpeed: 'fast', coachMode: false });
 let pumping = false;
@@ -90,9 +96,23 @@ function finish() {
     '真实事件流覆盖 trick_end 与 round_end，且副末只发一次 round_end');
     assert(replayEvents.every((event) => !('hands' in event)
       && !('initialHands' in event) && !('remainingHands' in event)
+      && !('legalCandidates' in event) && event.trainingEligible == null
       && event.cards.every((card) => !('id' in card) && !('deckIndex' in card))
       && event.tribute.every((item) => !('id' in item.card) && !('deckIndex' in item.card))),
-    '真实公开事件不包含四家暗牌、终局手牌或实体牌 ID/副本索引');
+    '真实公开事件不包含四家暗牌、终局手牌、实体牌 ID/副本索引或密封训练字段');
+    const sealedBatch = getSealedTrainingBatch(state);
+    const actionCount = replay.trickLog.filter((line) => line.action === 'play' || line.action === 'pass').length;
+    assert(sealedBatch && sealedBatch.trainingEligible === false && sealedBatch.turns.length === actionCount,
+      '副末密封批次覆盖全部行动 turn 且不可训练');
+    assert(sealedBatch.finishOrder.length === 4 && sealedBatch.teamUtilities[0] === -sealedBatch.teamUtilities[1],
+      '密封批次连接真实名次和相反的团队收益');
+    assert(replaySealedTrainingBatch(sealedBatch).ok, '完整一副密封批次可规则重放');
+    const converted = convertSealedTrainingBatches([sealedBatch]);
+    assert(converted.ok && converted.manifest.trainingEligible === false && converted.manifest.acceptedMatchRounds === 1,
+      '转换器按完整 match 切分且保持 trainingEligible=false');
+    const snapshot = serializeMatchState(state);
+    assert(SEALED_STATE_KEYS.every((key) => !(key in snapshot)),
+      '进行中存档不保存密封训练内容');
     console.log(`\n结果: 完整一副 ${replay.trickLog.length} 手，回归通过`);
     setReplayEventObserver(null);
     process.exit(0);
