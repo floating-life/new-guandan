@@ -305,14 +305,18 @@ function splitAnnotationLines(buffer) {
       lines.push({
         start,
         content: buffer.subarray(start, index).toString('utf8').replace(/\r$/, ''),
+        terminated: true,
       });
       start = index + 1;
     }
   }
   if (start < buffer.length) {
+    // A trailing segment without its newline is the only position a torn
+    // write can occupy; mark it so recovery can tell it from tampered lines.
     lines.push({
       start,
       content: buffer.subarray(start).toString('utf8'),
+      terminated: false,
     });
   }
   return lines;
@@ -342,7 +346,22 @@ export function readAnnotationStore(annotationPath) {
       }
       break;
     }
-    validateStoredAnnotation(value);
+    try {
+      validateStoredAnnotation(value);
+    } catch (error) {
+      // A torn final write can also land as complete JSON whose validation
+      // fails (truncated string fields, bad sha). Only an unterminated last
+      // line — the one position a torn write can occupy — is recoverable by
+      // truncation; terminated lines and earlier lines stay fail closed.
+      const tornFinalLine = index === lines.length - 1 && line.terminated === false;
+      if (!tornFinalLine || error?.code !== 'annotation_invalid') throw error;
+      try {
+        truncateAnnotationFile(annotationPath, line.start);
+      } catch {
+        throw new ReplayConsumerError('storage_unavailable', 'annotation 末行无法安全截断');
+      }
+      break;
+    }
     if (records.has(value.annotationId)) {
       throw new ReplayConsumerError('annotation_invalid', 'annotation 存储含重复 annotationId');
     }

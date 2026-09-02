@@ -229,6 +229,32 @@ async function main() {
     assert.equal(readAnnotationStore(halfPath).size, 1);
     console.log('  [OK] annotation 末行半行截断后可恢复消费且不发明记录');
 
+    const tornValidJson = path.join(temporary, 'torn-valid-json.ndjson');
+    const tornRecord = { ...validStored, eventSha256: 'z'.repeat(64) };
+    fs.writeFileSync(tornValidJson, `${JSON.stringify(validStored)}\n${JSON.stringify(tornRecord)}`, { mode: 0o600 });
+    const recoveredTorn = readAnnotationStore(tornValidJson);
+    assert.equal(recoveredTorn.size, 1);
+    assert.equal(recoveredTorn.get(validStored.annotationId).annotationId, validStored.annotationId);
+    assert.equal(fs.readFileSync(tornValidJson, 'utf8'), `${JSON.stringify(validStored)}\n`);
+    const tornConsume = await consumeOnce({
+      endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: tornValidJson,
+      fetchImpl: fakeFetch([response([], first.matchId, 2, false)], []),
+    });
+    assert.equal(tornConsume.summary.events, 0);
+    console.log('  [OK] annotation 末行撕裂写（JSON 完整但校验失败）截断后可恢复消费');
+
+    const tamperedTerminated = path.join(temporary, 'tampered-terminated.ndjson');
+    fs.writeFileSync(
+      tamperedTerminated,
+      `${JSON.stringify(validStored)}\n${JSON.stringify(tornRecord)}\n`,
+      { mode: 0o600 },
+    );
+    await expectConsumerError(consumeOnce({
+      endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: tamperedTerminated,
+      fetchImpl: fakeFetch([], []),
+    }), 'annotation_invalid');
+    console.log('  [OK] annotation 已终止末行校验失败仍 fail closed（完整写入视为篡改）');
+
     const corrupted = path.join(temporary, 'corrupt.ndjson');
     fs.writeFileSync(
       corrupted,
@@ -355,7 +381,7 @@ async function main() {
     }
     console.log('  [OK] --follow 在 hasMore=false 后继续轮询，非可重试错误时停止');
 
-    console.log('replay consumer: 25/25');
+    console.log('replay consumer: 27/27');
     return 0;
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
