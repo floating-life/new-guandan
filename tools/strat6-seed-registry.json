@@ -1,0 +1,66 @@
+{
+  "schema": "guandan-strat6-seed-registry-v1",
+  "ruleVersion": "guandan-rules-v1",
+  "purpose": "STRAT-6 per-rule expert-feature mirror ablation. Formal range is unseen versus documented historical evals; smoke range is consumed and must never be reused as formal.",
+  "comparison": "expert",
+  "opponentModelMode": "off",
+  "levels": "all",
+  "levelBlocks": true,
+  "arms": [
+    {
+      "id": "strat2",
+      "rule": "STRAT-2",
+      "candidate": "with-reserved-high-control-lead",
+      "feature": "reserveHighControlLead"
+    },
+    {
+      "id": "strat3",
+      "rule": "STRAT-3",
+      "candidate": "with-enemy-report-lead-safety",
+      "feature": "enemyReportLeadSafety"
+    },
+    {
+      "id": "strat4",
+      "rule": "STRAT-4",
+      "candidate": "with-partner-trick-control",
+      "feature": "partnerTrickControl"
+    }
+  ],
+  "formal": {
+    "role": "formal-strat6",
+    "baseSeed": 20268111,
+    "groupCount": 40,
+    "seedEnd": 20268150
+  },
+  "smoke": {
+    "role": "smoke-consumed",
+    "baseSeed": 20268101,
+    "groupCount": 2,
+    "seedEnd": 20268102
+  },
+  "reservedUnused": [
+    { "start": 20268103, "end": 20268110, "reason": "buffer between smoke and formal; do not run" },
+    { "start": 20268151, "end": 20268190, "reason": "formal buffer; do not power-up or seed-shop" }
+  ],
+  "forbiddenRanges": [
+    { "start": 20260801, "end": 20260830, "reason": "runner default example" },
+    { "start": 20260811, "end": 20261210, "reason": "P0/P1 ablation dumps and 202610xx search A/B" },
+    { "start": 20260827, "end": 20260866, "reason": "historical selfplay" },
+    { "start": 20260901, "end": 20260940, "reason": "selfplay 20260901" },
+    { "start": 20260941, "end": 20260980, "reason": "PERF-2b" },
+    { "start": 20261001, "end": 20261080, "reason": "root-pimc/ismcts-v2 A/B" },
+    { "start": 20261210, "end": 20261249, "reason": "P2-P5 holdout" },
+    { "start": 20262101, "end": 20262310, "reason": "reserved diagnostic tens" },
+    { "start": 20263001, "end": 20263080, "reason": "v3 1800-node 80-block" },
+    { "start": 20264101, "end": 20264180, "reason": "v3 fxe failed" },
+    { "start": 20264202, "end": 20264202, "reason": "fxe control probe" },
+    { "start": 20265001, "end": 20265010, "reason": "diagnostic" },
+    { "start": 20265101, "end": 20265180, "reason": "fxe control" },
+    { "start": 20265201, "end": 20265201, "reason": "isolation smoke" },
+    { "start": 20265301, "end": 20265310, "reason": "statefix probe" },
+    { "start": 20265401, "end": 20265480, "reason": "stopped v3-fxe" },
+    { "start": 20267001, "end": 20267080, "reason": "M2 synthetic fixture" },
+    { "start": 920000, "end": 920039, "reason": "value-model primary A/B" },
+    { "start": 931000, "end": 931003, "reason": "continuous-match" }
+  ]
+}

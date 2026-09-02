@@ -465,6 +465,146 @@ def main() -> int:
             passed += 1
             print("  [OK] 磁盘满时拒绝写入并标为 storage_full")
 
+            inf_payload = replay_event(0, None, "post-inf")
+            inf_payload["decisionMeta"] = {
+                "source": "human", "fallbackKind": "none", "latencyMs": float("inf"),
+            }
+            inf_root = Path(temporary) / "post-inf"
+            inf_http = lan_server.configure_replay_collector(
+                enabled=True, token="p" * 40, root=inf_root,
+            )
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=inf_payload,
+                )
+                raise AssertionError("Infinity 写入未被拒绝")
+            except urllib.error.HTTPError as exc:
+                inf_body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 400 and inf_body["code"] == "invalid_event"
+                assert inf_body.get("gap") is not True
+            assert inf_http.status()["gap"] is False
+            passed += 1
+            print("  [OK] POST 非有限数返回 400 且不锁存结构性缺口")
+
+            nested = {"latencyMs": 1}
+            for _ in range(20):
+                nested = {"x": nested}
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=nested,
+                )
+                raise AssertionError("过深嵌套 JSON 未被拒绝")
+            except urllib.error.HTTPError as exc:
+                nested_body = json.loads(exc.read().decode("utf-8"))
+                assert exc.code == 400 and nested_body["code"] == "invalid_event"
+                assert nested_body.get("gap") is not True
+            assert inf_http.status()["gap"] is False
+            passed += 1
+            print("  [OK] POST 过深嵌套 JSON 返回 400 且不锁存缺口")
+
+            original_loads = json.loads
+            def boom_loads(*args, **kwargs):
+                raise RecursionError("too deep")
+            json.loads = boom_loads
+            recursion_raw = None
+            try:
+                request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json", payload=replay_event(0, None, "recursion-post"),
+                )
+                raise AssertionError("RecursionError 未被转成 400")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                recursion_raw = exc.read().decode("utf-8")
+            finally:
+                json.loads = original_loads
+            recursion_body = json.loads(recursion_raw)
+            assert recursion_body["code"] == "invalid_event"
+            assert inf_http.status()["gap"] is False
+            passed += 1
+            print("  [OK] POST RecursionError 返回 400 且不中断连接")
+
+            stored_inf_root = Path(temporary) / "stored-inf"
+            stored_inf = lan_server.ReplayEventStore(
+                stored_inf_root, enabled=True, capability_token="q" * 40,
+            )
+            stored_first = replay_event(0, None, "stored-inf-0")
+            stored_inf.append(stored_first)
+            stored_file = next(stored_inf_root.glob("events-*.ndjson"))
+            stored_bad = replay_event(1, stored_first["eventSha256"], "stored-inf-1")
+            stored_bad["decisionMeta"] = {
+                "source": "human", "fallbackKind": "none", "latencyMs": float("inf"),
+            }
+            with stored_file.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(stored_bad, allow_nan=True) + "\n")
+            stored_status = stored_inf.status()
+            assert stored_status["gap"] is True
+            try:
+                stored_inf.read(-1, 10)
+                raise AssertionError("存储 Infinity 读取未 fail closed")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            lan_server.configure_replay_collector(
+                enabled=True, token="q" * 40, root=stored_inf_root,
+            )
+            with request(f"{base}/api/replay/status") as response:
+                http_status = json.loads(response.read().decode("utf-8"))
+                assert response.status == 200 and http_status["collector"]["gap"] is True
+            try:
+                request(
+                    f"{base}/api/replay/events?afterSequence=-1",
+                    extra_headers={"X-Guandan-Replay-Capability": "q" * 40},
+                )
+                raise AssertionError("存储 Infinity 的 HTTP 读取未返回 503")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 503
+                stored_body = json.loads(exc.read().decode("utf-8"))
+                assert stored_body["code"] == "storage_corrupt"
+            passed += 1
+            print("  [OK] 已落盘非有限数锁存缺口，status/read 不中断连接")
+
+            rate_root = Path(temporary) / "get-rate"
+            rate_store = lan_server.configure_replay_collector(
+                enabled=True, token="g" * 40, root=rate_root,
+            )
+            rate_first = replay_event(0, None, "rate-0")
+            rate_store.append(rate_first)
+            original_limit = lan_server.REPLAY_RATE_LIMIT
+            lan_server._REPLAY_GET_CALLS.clear()
+            lan_server._REPLAY_CALLS.clear()
+            lan_server.REPLAY_RATE_LIMIT = 2
+            try:
+                for _ in range(2):
+                    with request(
+                        f"{base}/api/replay/events?afterSequence=-1",
+                        extra_headers={"X-Guandan-Replay-Capability": "g" * 40},
+                    ) as response:
+                        assert response.status == 200
+                try:
+                    request(
+                        f"{base}/api/replay/events?afterSequence=-1",
+                        extra_headers={"X-Guandan-Replay-Capability": "g" * 40},
+                    )
+                    raise AssertionError("GET 限流未被触发")
+                except urllib.error.HTTPError as exc:
+                    rate_body = json.loads(exc.read().decode("utf-8"))
+                    assert exc.code == 429 and rate_body["code"] == "rate_limited"
+                    assert rate_body.get("retryable") is True
+                with request(
+                    f"{base}/api/replay/events", method="POST", origin=lan_server.LOCAL_ORIGIN,
+                    content_type="application/json",
+                    payload=replay_event(1, rate_first["eventSha256"], "rate-1"),
+                ) as response:
+                    assert response.status == 200
+            finally:
+                lan_server.REPLAY_RATE_LIMIT = original_limit
+                lan_server._REPLAY_GET_CALLS.clear()
+                lan_server._REPLAY_CALLS.clear()
+            passed += 1
+            print("  [OK] GET /api/replay/events 限流返回 429 且不占用 POST 配额")
+
         try:
             lan_server.ReplayEventStore(lan_server.WEB_ROOT)
             raise AssertionError("项目目录被允许作为复盘采集目录")

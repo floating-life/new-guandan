@@ -1,5 +1,5 @@
 /** 混合决策、公平观察、信息集采样与价值模型契约测试。 */
-import { createDeck } from './cards.js';
+import { createCard, createDeck } from './cards.js';
 import {
   HandType, generateLegalPlays, handSignature, parseHand, parseHandVariants,
 } from './rules.js';
@@ -18,6 +18,7 @@ import {
   samplePublicInformationSets, validateHybridValueModel,
 } from './ai-hybrid.js';
 import { makePromotedValueModel } from './value-model.test-fixture.js';
+import { filterEligibleStrategyActions } from './strategy-core.js';
 
 let passed = 0;
 let failed = 0;
@@ -1101,6 +1102,157 @@ console.log('专家安全筛选不可被短视模拟绕过');
     && result.telemetry?.rejectedCandidates?.some((item) => (
       item.id === premium.id && item.reason === 'premium_control_escalation'
     )), '专家已排除的领炸候选即使原始分更高也不能被增强层恢复');
+}
+
+console.log('STRAT-5：搜索入口共用 eligible-action 层');
+{
+  const level = 2;
+  const card = (rank, suit, deckIndex = 0) => createCard(rank, suit, deckIndex);
+  const hand = [
+    card(3, 'S'), card(3, 'H'), card(5, 'S'), card(5, 'H'),
+    card(7, 'S'), card(9, 'S'), card(10, 'S'), card(11, 'S'),
+  ];
+  const compact = (id, cards, localScore) => {
+    const parsed = parseHand(cards, level);
+    return {
+      id, action: 'play', cards, hand: parsed, signature: handSignature(parsed), localScore,
+    };
+  };
+  const unsafe = compact('unsafe_low_single', [hand[4]], 100);
+  const safeA = compact('safe_pair_3', hand.slice(0, 2), 85);
+  const safeB = compact('safe_pair_5', hand.slice(2, 4), 80);
+  const leadCtx = {
+    seat: 0,
+    hand,
+    level,
+    lastHand: null,
+    lastSeat: null,
+    handCounts: [hand.length, 1, 12, 1],
+    teams: [0, 1, 0, 1],
+    finishOrder: [],
+    playedCards: [],
+    publicHistory: [],
+    difficulty: 'master',
+    deterministic: true,
+    policyFeatures: { enemyReportLeadSafety: true },
+  };
+  const searchOptions = {
+    behaviorAttempts: 1,
+    iterationBudget: 2,
+    minimumEffectiveVisits: 2,
+    maxPlies: 16,
+    nodeBudget: 800,
+    seed: 20260905,
+  };
+  for (const searchMode of ['pimc-v1', 'paired-root-pimc-v1', 'ismcts-v2', 'ismcts-v3']) {
+    const result = chooseHybridFromConsultation({
+      ...leadCtx,
+      decisionEngine: searchMode,
+    }, {
+      action: 'play',
+      cards: unsafe.cards,
+      hand: unsafe.hand,
+      signature: unsafe.signature,
+      candidates: [unsafe, safeA, safeB],
+      localCandidateId: unsafe.id,
+      cloudConstraint: 'soft_rerank',
+    }, { ...searchOptions, searchMode });
+    assert(result.decision?.hybrid?.localCandidateId !== unsafe.id
+        && result.decision?.hybrid?.finalCandidateId !== unsafe.id
+        && !result.decision?.cards?.some((item) => item.rank === 7),
+    `${searchMode} 根搜索不得执行被 STRAT-3 排除的低单`);
+  }
+
+  const followCtx = { ...leadCtx, lastHand: parseHand([card(6, 'C')], level), lastSeat: 1 };
+  const followEntries = [unsafe, safeA];
+  const followFilter = filterEligibleStrategyActions(followEntries, {
+    ...followCtx,
+    mode: 'beat',
+  });
+  assert(followFilter.entries === followEntries,
+    'STRAT-3 跟牌分支即使开关打开也是 no-op');
+
+  const partnerPlay = [card(5, 'C')];
+  const yieldHand = [card(7, 'S'), card(8, 'S'), card(9, 'S'), card(10, 'S')];
+  const stealParsed = parseHand([yieldHand[0]], level);
+  const steal = {
+    id: 'steal_single', action: 'play', cards: [yieldHand[0]],
+    hand: stealParsed, signature: handSignature(stealParsed),
+  };
+  const passCandidate = { id: 'pass', action: 'pass', cards: [], hand: null, signature: null };
+  const yieldCtx = {
+    seat: 0,
+    hand: yieldHand,
+    level,
+    lastHand: parseHand(partnerPlay, level),
+    lastSeat: 2,
+    handCounts: [4, 0, 4, 7],
+    teams: [0, 1, 0, 1],
+    finishOrder: [1],
+    playedCards: [],
+    publicHistory: [
+      {
+        turn: 37, trickNumber: 10, seat: 2, action: 'play', cards: partnerPlay,
+        hand: parseHand(partnerPlay, level),
+        countsBefore: [4, 0, 4, 8], countsAfter: [4, 0, 4, 7],
+      },
+      {
+        turn: 38, trickNumber: 10, seat: 3, action: 'pass', cards: [],
+        countsBefore: [4, 0, 4, 7], countsAfter: [4, 0, 4, 7],
+      },
+    ],
+    difficulty: 'master',
+    deterministic: true,
+    policyFeatures: { partnerTrickControl: true },
+  };
+  for (const searchMode of ['pimc-v1', 'paired-root-pimc-v1', 'ismcts-v2', 'ismcts-v3']) {
+    const searched = evaluateInformationSetCandidates(yieldCtx, [steal, passCandidate, safeA], {
+      ...searchOptions, searchMode,
+    });
+    assert(!searched.candidateResults?.some((item) => item.id === steal.id)
+        && searched.reason !== undefined,
+    `${searchMode} 根候选不得搜索 STRAT-4 抢队友牌`);
+  }
+
+  const innerState = {
+    hands: [
+      yieldHand.map((item) => ({ ...item })),
+      [],
+      [card(4, 'H'), card(6, 'H'), card(6, 'S'), card(12, 'H')],
+      [card(2, 'C'), card(2, 'D'), card(4, 'C'), card(4, 'D'), card(8, 'H'), card(9, 'H'), card(11, 'H')],
+    ],
+    teams: [0, 1, 0, 1],
+    level,
+    lastHand: parseHand(partnerPlay, level),
+    lastSeat: 2,
+    passed: new Set([3]),
+    finishOrder: [1],
+  };
+  const innerObservation = {
+    seat: 0,
+    hand: yieldHand,
+    level,
+    lastHand: innerState.lastHand,
+    lastSeat: 2,
+    teams: innerState.teams,
+    finishOrder: [1],
+    handCounts: innerState.hands.map((item) => item.length),
+    publicHistory: yieldCtx.publicHistory,
+    policyFeatures: yieldCtx.policyFeatures,
+  };
+  const deciding = inspectOpenLoopBombCoverage(innerState, 0, 5, { observation: innerObservation });
+  assert(deciding.baseline.actionKeys.includes('pass')
+      && !deciding.baseline.actionKeys.some((key) => key.startsWith('play:7:S:0|')),
+  '本家内节点 STRAT-4 只保留过牌或整手收官，不扩展抢队友单张');
+  const opponent = inspectOpenLoopBombCoverage(innerState, 3, 5, { observation: innerObservation });
+  assert(opponent.baseline.actionKeys.some((key) => key !== 'pass'),
+    '对手内节点不套用本家 STRAT-4，仍可扩展合法接牌');
+
+  const offObservation = { ...innerObservation, policyFeatures: { enemyReportLeadSafety: false, partnerTrickControl: false } };
+  const offInner = inspectOpenLoopBombCoverage(innerState, 0, 5, { observation: offObservation });
+  const controlInner = inspectOpenLoopBombCoverage(innerState, 0, 5);
+  assert(JSON.stringify(offInner.baseline.actionKeys) === JSON.stringify(controlInner.baseline.actionKeys),
+    'feature 关闭时内节点 4 参数路径与 3 参数对照相同');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

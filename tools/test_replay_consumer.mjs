@@ -13,6 +13,7 @@ import {
   assertSafeStoragePath,
   consumeOnce,
   createReplayAnnotation,
+  main as runConsumer,
   parseReplayEndpoint,
   readAnnotationStore,
 } from './replay_consumer.mjs';
@@ -213,13 +214,32 @@ async function main() {
     assert.deepEqual(JSON.parse(fs.readFileSync(cursorPath, 'utf8')), beforeBad);
     console.log('  [OK] 网络失败不丢失已有 cursor，下一次运行可恢复');
 
+    const validStored = annotations.values().next().value;
+    const halfPath = path.join(temporary, 'half-line.ndjson');
+    fs.writeFileSync(halfPath, `${JSON.stringify(validStored)}\n{"partial`, { mode: 0o600 });
+    const recoveredHalf = readAnnotationStore(halfPath);
+    assert.equal(recoveredHalf.size, 1);
+    assert.equal(recoveredHalf.get(validStored.annotationId).annotationId, validStored.annotationId);
+    assert.equal(fs.readFileSync(halfPath, 'utf8'), `${JSON.stringify(validStored)}\n`);
+    const halfConsume = await consumeOnce({
+      endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: halfPath,
+      fetchImpl: fakeFetch([response([], first.matchId, 2, false)], []),
+    });
+    assert.equal(halfConsume.summary.events, 0);
+    assert.equal(readAnnotationStore(halfPath).size, 1);
+    console.log('  [OK] annotation 末行半行截断后可恢复消费且不发明记录');
+
     const corrupted = path.join(temporary, 'corrupt.ndjson');
-    fs.writeFileSync(corrupted, '{broken\n', { mode: 0o600 });
+    fs.writeFileSync(
+      corrupted,
+      `${JSON.stringify(validStored)}\n{broken\n${JSON.stringify(validStored)}\n`,
+      { mode: 0o600 },
+    );
     await expectConsumerError(consumeOnce({
       endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: corrupted,
       fetchImpl: fakeFetch([], []),
     }), 'annotation_invalid');
-    console.log('  [OK] annotation 损坏时拒绝继续消费');
+    console.log('  [OK] annotation 中间行损坏时拒绝继续消费');
 
     const malformed = { ...annotations.values().next().value, matchId: 42,
       eventSha256: 'z'.repeat(64), content: { summary: 1, tags: {}, recommendations: [], confidence: 3 } };
@@ -288,7 +308,54 @@ async function main() {
       return true;
     });
     console.log('  [OK] 无效 token 保持 http_error 且不可重试');
-    console.log('replay consumer: 22/22');
+
+    const onceCursor = path.join(temporary, 'once-cursor.json');
+    const onceAnnotations = path.join(temporary, 'once-annotations.ndjson');
+    const onceCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetch([
+      response([first, second], first.matchId, 1, true),
+      response([third], first.matchId, 2, false),
+    ], onceCalls);
+    try {
+      const code = await runConsumer([
+        '--endpoint', ENDPOINT, '--token', TOKEN,
+        '--cursor', onceCursor, '--annotations', onceAnnotations,
+        '--once', '--limit', '2', '--json',
+      ]);
+      assert.equal(code, 0);
+      assert.equal(onceCalls.length, 2);
+      assert.equal(readAnnotationStore(onceAnnotations).size, 3);
+      assert.equal(JSON.parse(fs.readFileSync(onceCursor, 'utf8')).sequence, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    console.log('  [OK] --once 会排空多页流并在 hasMore=false 后以 0 退出');
+
+    const followCursor = path.join(temporary, 'follow-cursor.json');
+    const followAnnotations = path.join(temporary, 'follow-annotations.ndjson');
+    let followCalls = 0;
+    globalThis.fetch = async () => {
+      followCalls += 1;
+      if (followCalls === 1) {
+        return { ok: true, status: 200, json: async () => response([], null, -1, false) };
+      }
+      return { ok: false, status: 400, json: async () => ({ ok: false }) };
+    };
+    try {
+      const code = await runConsumer([
+        '--endpoint', ENDPOINT, '--token', TOKEN,
+        '--cursor', followCursor, '--annotations', followAnnotations,
+        '--follow',
+      ]);
+      assert.equal(code, 1);
+      assert.equal(followCalls, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    console.log('  [OK] --follow 在 hasMore=false 后继续轮询，非可重试错误时停止');
+
+    console.log('replay consumer: 25/25');
     return 0;
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });

@@ -37,6 +37,12 @@ const state = restoredState || createMatch();
 // 再调用 queue.setEnabled(true) 让同一队列异步提交到本机采集端点。
 const replayEventQueue = createReplayEventQueue({ enabled: false });
 let replaySubmitPaused = false;
+let replayCollectionInterruptedMatchId = (
+  restoredState
+  && Number(restoredState.replaySequence) > 0
+  && restoredState.matchId
+  && !replayEventQueue.hasMatchTrace(restoredState.matchId)
+) ? restoredState.matchId : null;
 const $ = (sel) => document.querySelector(sel);
 let llmHealth = getLLMHealth();
 let llmHealthEpoch = 0;
@@ -72,8 +78,32 @@ function rankHeadLabel(key, level) {
 function localEngineLabel(engine) {
   if (engine === 'root-pimc-v1' || engine === 'ismcts') return '成对根 PIMC（实验）';
   if (engine === 'ismcts-v2') return 'ISMCTS v2（实验）';
+  if (engine === 'ismcts-v3') return 'ISMCTS v3（离线评测）';
   if (engine === 'pimc-v1' || engine === 'hybrid') return 'PIMC（实验）';
   return '专家策略';
+}
+
+function replaySearchLabel(search) {
+  const mode = search?.searchMode;
+  if (mode === 'ismcts-v3') return 'ISMCTS v3/成对 sweep';
+  if (mode === 'ismcts-v2') return 'ISMCTS v2';
+  if (['paired-root-pimc-v1', 'ismcts-root-v1'].includes(mode)) return '成对根 PIMC';
+  if (mode === 'pimc-v1') return 'PIMC';
+  return '混合搜索';
+}
+
+function replaySearchDetail(search) {
+  const mode = search?.searchMode;
+  if (mode === 'ismcts-v3') {
+    return ` · ${Number(search?.pairedSweeps) || 0} 次成对 sweep / ${Number(search?.iterations) || 0} 次 rollout`;
+  }
+  if (mode === 'ismcts-v2') {
+    return ` · ${Number(search?.iterations) || 0} 次迭代 / ${Number(search?.sampledWorlds) || 0} 个重采样世界 / ${Number(search?.treeNodes) || 0} 个树节点`;
+  }
+  if (['paired-root-pimc-v1', 'ismcts-root-v1'].includes(mode)) {
+    return ` · ${Number(search?.iterations) || 0} 次成对 rollout`;
+  }
+  return '';
 }
 
 function valueModelFailureReason(result) {
@@ -329,11 +359,18 @@ function llmStatusView() {
 
 function replayStatusView() {
   const snapshot = replayEventQueue.snapshot();
+  if (replayCollectionInterruptedMatchId && state.matchId === replayCollectionInterruptedMatchId) {
+    return {
+      text: '复盘采集已中断',
+      className: 'error',
+      title: '当前对局采集链已中断、请新开一局以恢复采集。新开一局自动恢复。',
+    };
+  }
   if (replayCollectorStatus?.gap) {
     return {
       text: '复盘采集有缺口',
       className: 'error',
-      title: replayCollectorStatus.lastError || '本机采集器检测到公开事件链缺口，已停止安全消费',
+      title: `${replayCollectorStatus.lastError || '本机采集器检测到公开事件链缺口，已停止安全消费'}。新开一局自动恢复。`,
     };
   }
   if (snapshot.gap) {
@@ -344,7 +381,7 @@ function replayStatusView() {
     return {
       text: '复盘采集有缺口',
       className: 'error',
-      title: detail || '公开复盘事件存在持久化、顺序或采集失败，已停止提交',
+      title: `${detail || '公开复盘事件存在持久化、顺序或采集失败，已停止提交'}。新开一局自动恢复。`,
     };
   }
   if (snapshot.enabled) {
@@ -380,7 +417,7 @@ function replayCollectorDetailText() {
   const reader = collector.readerConnected
     ? `已连接（读到 ${collector.readerLastSequence}）`
     : '未连接';
-  return [
+  const parts = [
     `服务端：${collector.enabled ? '已启用' : '未启用'}`,
     `缺口：${collector.gap ? '有' : '无'}`,
     `最后序号：${lastSequence}`,
@@ -390,7 +427,11 @@ function replayCollectorDetailText() {
     `提交：${snapshot.enabled ? '进行中' : (replaySubmitPaused ? '已暂停' : '未启用')}`,
     `事件构造失败：${state.replayEventFailures || 0}${state.replayLastEventError ? `（${state.replayLastEventError}）` : ''}`,
     `观察器错误：${state.replayObserverErrors || 0}`,
-  ].join('；') + '。启用采集请用启动脚本的显式选项。';
+  ];
+  if (replayCollectionInterruptedMatchId && state.matchId === replayCollectionInterruptedMatchId) {
+    parts.push('当前对局采集链已中断、请新开一局以恢复采集');
+  }
+  return parts.join('；') + '。启用采集请用启动脚本的显式选项。新开一局自动恢复。';
 }
 
 async function refreshReplayCollectorStatus() {
@@ -937,6 +978,7 @@ function renderActions() {
     b.dataset.focusKey = 'action:start';
     b.onclick = () => {
       startMatch(state);
+      replayCollectionInterruptedMatchId = null;
       render();
     };
     bar.appendChild(b);
@@ -1363,12 +1405,8 @@ function openReplay(preferId) {
     if (current) {
       const ev = current.evaluation;
       const search = current.decisionMeta?.hybrid || null;
-      const isPairedRoot = ['paired-root-pimc-v1', 'ismcts-root-v1'].includes(search?.searchMode);
-      const isIsmcts = search?.searchMode === 'ismcts-v2';
-      const searchLabel = isIsmcts ? 'ISMCTS v2' : (isPairedRoot ? '成对根 PIMC' : '混合搜索');
-      const searchDetail = isIsmcts
-        ? ` · ${Number(search?.iterations) || 0} 次迭代 / ${Number(search?.sampledWorlds) || 0} 个重采样世界 / ${Number(search?.treeNodes) || 0} 个树节点`
-        : (isPairedRoot ? ` · ${Number(search?.iterations) || 0} 次成对 rollout` : '');
+      const searchLabel = replaySearchLabel(search);
+      const searchDetail = replaySearchDetail(search);
       html += `<div class="replay-current">
         <strong>第 ${current.trickNumber || '-'} 圈 · ${escapeHtml(current.text)}</strong>
         ${current.countsAfter ? `<p>剩余张数：你 ${current.countsAfter[0]} / 下家 ${current.countsAfter[1]} / 对家 ${current.countsAfter[2]} / 上家 ${current.countsAfter[3]}</p>` : ''}
@@ -1618,6 +1656,7 @@ function setupChrome() {
   $('#btnNew').onclick = () => {
     if (confirm('确定重新开始整场比赛？')) {
       startMatch(state);
+      replayCollectionInterruptedMatchId = null;
       render();
     }
   };
@@ -1753,7 +1792,17 @@ function setupChrome() {
 }
 
 setReplayEventObserver((event) => {
-  replayEventQueue.enqueue(event);
+  if (replayCollectionInterruptedMatchId && event.matchId === replayCollectionInterruptedMatchId) {
+    return;
+  }
+  if (replayCollectionInterruptedMatchId && event.matchId !== replayCollectionInterruptedMatchId) {
+    replayCollectionInterruptedMatchId = null;
+  }
+  const result = replayEventQueue.enqueue(event);
+  if (result?.reason === 'unreproducible_match') {
+    replayCollectionInterruptedMatchId = event.matchId;
+    return;
+  }
   render();
 });
 
@@ -1771,6 +1820,8 @@ if ((state.settings?.llmPolicyMode || LLM_POLICY_MODE.LOCAL) !== LLM_POLICY_MODE
   void refreshLLMHealth({ silent: true, recover: recoverFallback, deep: recoverFallback });
 }
 if (restoredState && restoredState.phase !== PHASE.IDLE) {
-  flash('已恢复上次未完成的牌局');
+  flash(replayCollectionInterruptedMatchId
+    ? '已恢复上次未完成的牌局；当前对局采集链已中断、请新开一局以恢复采集'
+    : '已恢复上次未完成的牌局');
   resumeMatch(state);
 }

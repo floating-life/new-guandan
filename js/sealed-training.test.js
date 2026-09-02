@@ -9,6 +9,7 @@ import {
   PASS_CANDIDATE_ID,
   SEALED_STATE_KEYS,
   SEALED_TRAINING_BATCH_SCHEMA,
+  appendSealedTrainingTurn,
   assignMatchSplit,
   convertSealedTrainingBatches,
   createSealedTrainingBatch,
@@ -357,6 +358,76 @@ console.log('RT-5 转换器切分、去重与反事实拒绝');
     '快照保留完整候选并给 chosen 确定性 ID');
   assert(event.eventType === 'play' && !('legalCandidates' in event),
     '用于绑定的公开事件仍不含密封字段');
+}
+
+{
+  const state = playingState({ finish: true });
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try {
+    humanSelectSet(state, [state.hands[0][0].id]);
+    humanPlay(state);
+    const original = getSealedTrainingBatch(state);
+    let rejected = false;
+    try {
+      createSealedTrainingBatch({ ...original, upgradeCode: 'head_last' });
+    } catch { rejected = true; }
+    assert(rejected, '错误 upgradeCode 与名次不一致时 fail closed');
+    assert(!validateSealedTrainingBatch({ ...original, upgradeCode: 'head_last' }).ok,
+      'validate 拒绝 upgradeCode 与 finishOrder 不一致');
+    assert(original.upgradeCode === teamUtilitiesFromFinishOrder(original.finishOrder).upgradeCode,
+      '批次持久化由名次重算的 upgradeCode');
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+}
+
+{
+  const shared = C(4);
+  const other = C(8);
+  const snap0 = snapshotSealedAction({
+    seat: 0,
+    action: 'play',
+    cards: [shared],
+    playedHand: parseHand([shared], 2),
+    actingHand: [shared],
+    level: 2,
+    lastHand: null,
+    handCounts: [1, 2, 1, 1],
+  });
+  const snap1 = snapshotSealedAction({
+    seat: 1,
+    action: 'play',
+    cards: [other],
+    playedHand: parseHand([other], 2),
+    actingHand: [{ ...shared }, other],
+    level: 2,
+    lastHand: parseHand([shared], 2),
+    handCounts: [0, 2, 1, 1],
+  });
+  const sealedState = {
+    matchId: 'sealed-test-match',
+    sealedSequence: 0,
+    sealedTrainingTurns: [],
+    sealedPreviousTurnSha256: null,
+    sealedTrainingFailures: 0,
+  };
+  appendSealedTrainingTurn(sealedState, publicEvent({ sequence: 0, seat: 0, cards: [shared] }), snap0);
+  appendSealedTrainingTurn(sealedState, publicEvent({ sequence: 1, seat: 1, cards: [other] }), snap1);
+  const forged = createSealedTrainingBatch({
+    matchId: 'sealed-test-match',
+    round: 1,
+    createdAt: '2026-09-02T00:00:00.000Z',
+    implementationSha256: sha(),
+    publicImplementationSha256: sha(),
+    finishOrder: [0, 2, 1, 3],
+    turns: sealedState.sealedTrainingTurns,
+    trainingEligible: false,
+    split: null,
+  });
+  const replay = replaySealedTrainingBatch(forged);
+  assert(!replay.ok && replay.errors.some((error) => error.includes('物理牌身份')),
+    '同一物理牌身份出现在两个座位时 fail closed');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

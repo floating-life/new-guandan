@@ -46,6 +46,7 @@ REPLAY_DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
 REPLAY_MAX_WAIT_MS = 5000
 REPLAY_RATE_LIMIT = 240
 REPLAY_RATE_WINDOW_SECONDS = 60
+REPLAY_JSON_MAX_DEPTH = 12
 REPLAY_COLLECTOR_STATE_SCHEMA = "guandan-replay-collector-state-v1"
 REPLAY_COLLECTOR_STATE_FILE = "collector-state.json"
 REPLAY_MAX_CHAIN_FLOORS = 256
@@ -917,6 +918,46 @@ class ReplayStoreError(RuntimeError):
         self.code = code
 
 
+def _replay_reject_constant(token: str):
+    raise ValueError(f"复盘 JSON 不得包含 {token}")
+
+
+def _replay_assert_json_value(value, depth: int = 1) -> None:
+    if depth > REPLAY_JSON_MAX_DEPTH:
+        raise ValueError("复盘 JSON 嵌套过深")
+    if value is None or isinstance(value, (bool, str)):
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("复盘 JSON 不得包含非有限数")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _replay_assert_json_value(item, depth + 1)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _replay_assert_json_value(item, depth + 1)
+        return
+    raise ValueError("复盘 JSON 含不支持的类型")
+
+
+def _replay_loads(text: str, *, corrupt: bool = False):
+    """Parse public replay JSON and reject NaN/Infinity and excessive nesting."""
+    code = "storage_corrupt" if corrupt else "invalid_event"
+    message = "复盘事件文件无法解析" if corrupt else "复盘事件 JSON 无效"
+    try:
+        value = json.loads(text, parse_constant=_replay_reject_constant)
+        _replay_assert_json_value(value)
+        return value
+    except RecursionError as exc:
+        raise ReplayStoreError(code, "复盘 JSON 嵌套过深") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ReplayStoreError(code, f"{message}：{str(exc)[:160]}") from exc
+
+
 def _replay_number(value) -> str:
     """Serialize JSON numbers with the same notation choices as JSON.stringify."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1019,7 +1060,7 @@ def _replay_hand(value, path: str) -> None:
         _replay_integer(value["mainRank"], f"{path}.mainRank", 2, 17)
     _replay_integer(value.get("size"), f"{path}.size", 0, 27)
     power = value.get("power")
-    if isinstance(power, bool) or not isinstance(power, (int, float)) or not float(power) == power:
+    if isinstance(power, bool) or not isinstance(power, (int, float)) or not math.isfinite(float(power)):
         raise ReplayStoreError("invalid_event", f"{path}.power 必须是有限数")
     if value.get("meta") is not None:
         if not isinstance(value["meta"], dict) or set(value["meta"]) - {"sequence", "pairRank", "suit", "wildAs"}:
@@ -1117,7 +1158,12 @@ def _validate_replay_event(event: dict) -> None:
         for name in ("budgetMs", "latencyMs"):
             if name in decision:
                 value = decision[name]
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or not float(value) == value:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or value < 0
+                ):
                     raise ReplayStoreError("invalid_event", f"decisionMeta.{name} 必须是非负有限数")
     if event_type == "play" and (seat is None or not event["cards"] or event["hand"] is None):
         raise ReplayStoreError("invalid_event", "play 事件必须有座位、牌和牌型")
@@ -1130,7 +1176,13 @@ def _validate_replay_event(event: dict) -> None:
         raise ReplayStoreError("invalid_event", f"{event_type} 事件只能携带边界身份、余牌数和空动作载荷")
     payload = dict(event)
     supplied = payload.pop("eventSha256")
-    if _replay_sha256(_replay_stable_json(payload)) != supplied:
+    try:
+        digest = _replay_sha256(_replay_stable_json(payload))
+    except RecursionError as exc:
+        raise ReplayStoreError("invalid_event", "复盘 JSON 嵌套过深") from exc
+    except (TypeError, ValueError) as exc:
+        raise ReplayStoreError("invalid_event", str(exc)[:200] or "复盘事件无法规范化") from exc
+    if digest != supplied:
         raise ReplayStoreError("invalid_event", "eventSha256 与事件内容不匹配")
 
 
@@ -1265,6 +1317,12 @@ class ReplayEventStore:
                 # 瞬时 I/O 故障不锁存；结构性损坏才锁存缺口。
                 if exc.code != "storage_unavailable":
                     self._gap = True
+            except RecursionError:
+                self._last_error = "复盘 JSON 嵌套过深"
+                self._gap = True
+            except (TypeError, ValueError) as exc:
+                self._last_error = str(exc)[:200]
+                self._gap = True
             reader_age = None if self._reader_last_at is None else time.time() - self._reader_last_at
             return {
                 "enabled": self._enabled,
@@ -1327,10 +1385,26 @@ class ReplayEventStore:
                         if not line.strip():
                             continue
                         try:
-                            event = json.loads(line)
-                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                            raise ReplayStoreError("storage_corrupt", f"复盘事件文件无法解析：{file.name}:{line_number}") from exc
-                        _validate_replay_event(event)
+                            event = _replay_loads(line, corrupt=True)
+                        except ReplayStoreError as exc:
+                            raise ReplayStoreError(
+                                "storage_corrupt",
+                                f"复盘事件文件无法解析：{file.name}:{line_number}",
+                            ) from exc
+                        try:
+                            _validate_replay_event(event)
+                        except RecursionError as exc:
+                            raise ReplayStoreError(
+                                "storage_corrupt",
+                                f"复盘事件文件无法解析：{file.name}:{line_number}",
+                            ) from exc
+                        except ReplayStoreError as exc:
+                            if exc.code == "invalid_event":
+                                raise ReplayStoreError(
+                                    "storage_corrupt",
+                                    f"复盘事件文件无法解析：{file.name}:{line_number}",
+                                ) from exc
+                            raise
                         records.append(event)
         except ReplayStoreError:
             raise
@@ -1545,6 +1619,7 @@ class ReplayEventStore:
 
 _REPLAY_STORE = ReplayEventStore()
 _REPLAY_CALLS = deque()
+_REPLAY_GET_CALLS = deque()
 _REPLAY_CALLS_LOCK = threading.Lock()
 
 
@@ -1559,14 +1634,15 @@ def configure_replay_collector(*, enabled: bool = False, token: str | None = Non
     return _REPLAY_STORE
 
 
-def _within_replay_rate_limit() -> bool:
+def _within_replay_rate_limit(bucket: deque | None = None) -> bool:
     now = time.monotonic()
+    calls = _REPLAY_CALLS if bucket is None else bucket
     with _REPLAY_CALLS_LOCK:
-        while _REPLAY_CALLS and now - _REPLAY_CALLS[0] >= REPLAY_RATE_WINDOW_SECONDS:
-            _REPLAY_CALLS.popleft()
-        if len(_REPLAY_CALLS) >= REPLAY_RATE_LIMIT:
+        while calls and now - calls[0] >= REPLAY_RATE_WINDOW_SECONDS:
+            calls.popleft()
+        if len(calls) >= REPLAY_RATE_LIMIT:
             return False
-        _REPLAY_CALLS.append(now)
+        calls.append(now)
         return True
 
 
@@ -1647,7 +1723,14 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
         self._send_json(_llm_config_payload(), head_only=head_only)
 
     def _replay_status(self, head_only: bool = False) -> None:
-        self._send_json({"ok": True, "schema": REPLAY_PUBLIC_SCHEMA, "collector": _REPLAY_STORE.status()}, head_only=head_only)
+        try:
+            collector = _REPLAY_STORE.status()
+        except RecursionError:
+            self._send_json({
+                "ok": False, "code": "storage_corrupt", "message": "复盘 JSON 嵌套过深", "gap": True,
+            }, status=503, head_only=head_only)
+            return
+        self._send_json({"ok": True, "schema": REPLAY_PUBLIC_SCHEMA, "collector": collector}, head_only=head_only)
 
     def _replay_capability(self) -> str | None:
         return self.headers.get(REPLAY_CAPABILITY_HEADER)
@@ -1663,6 +1746,11 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
             )
             self._send_json({"ok": False, "code": failure, "message": message}, status=401)
             return
+        if not _within_replay_rate_limit(_REPLAY_GET_CALLS):
+            self._send_json({
+                "ok": False, "code": "rate_limited", "message": "复盘读取请求过于频繁，请稍后重试", "retryable": True,
+            }, status=429)
+            return
         query = parse_qs(urlsplit(self.path).query)
         try:
             after = int(query.get("afterSequence", ["-1"])[0])
@@ -1673,6 +1761,10 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
                 _replay_string(match_id, "matchId", 120)
             result = _REPLAY_STORE.read(after, limit, match_id, wait_ms)
             self._send_json(result)
+        except RecursionError:
+            self._send_json({
+                "ok": False, "code": "storage_corrupt", "message": "复盘 JSON 嵌套过深", "gap": True,
+            }, status=503)
         except (ValueError, ReplayStoreError) as exc:
             code = exc.code if isinstance(exc, ReplayStoreError) else "bad_request"
             status = 400 if code in {"bad_request", "invalid_event", "match_id_required"} else 503
@@ -1699,9 +1791,11 @@ class LocalOnlyHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": False, "code": "rate_limited", "message": "复盘采集请求过于频繁，请稍后重试", "retryable": True}, status=429)
             return
         try:
-            event = json.loads(self.rfile.read(length).decode("utf-8"))
+            event = _replay_loads(self.rfile.read(length).decode("utf-8"))
             result = _REPLAY_STORE.append(event)
             self._send_json(result)
+        except RecursionError:
+            self._send_json({"ok": False, "code": "invalid_event", "message": "复盘 JSON 嵌套过深"}, status=400)
         except ReplayStoreError as exc:
             status = {
                 "collector_disabled": 503, "event_conflict": 409, "event_chain_gap": 409,

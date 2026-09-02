@@ -149,6 +149,19 @@ function sameHandMultiset(left, right) {
   return [...counts.values()].every((count) => count === 0);
 }
 
+function uniquePhysicalCards(hands) {
+  const seen = new Set();
+  for (const cards of hands) {
+    if (!Array.isArray(cards)) continue;
+    for (const card of cards) {
+      const key = cardIdentity(card);
+      if (seen.has(key)) return false;
+      seen.add(key);
+    }
+  }
+  return true;
+}
+
 export function listLegalTrainingCandidates({
   actingHand, level, lastHand, action, cards, playedHand,
 } = {}) {
@@ -318,6 +331,10 @@ export function createSealedTrainingBatch(input) {
   if (input.upgrade != null && Number(input.upgrade) !== expected.upgrade) {
     throw new TypeError('upgrade 与名次不一致');
   }
+  if (input.upgradeCode != null
+    && stringValue(input.upgradeCode, 'upgradeCode', { max: 40 }) !== expected.upgradeCode) {
+    throw new TypeError('upgradeCode 与名次不一致');
+  }
   const teamUtilities = Array.isArray(input.teamUtilities)
     ? input.teamUtilities.map((value, index) => {
       if (!Number.isSafeInteger(value)) throw new TypeError(`teamUtilities[${index}] 必须是整数`);
@@ -355,7 +372,7 @@ export function createSealedTrainingBatch(input) {
     finishOrder,
     winTeam: expected.winTeam,
     upgrade: expected.upgrade,
-    upgradeCode: stringValue(input.upgradeCode || expected.upgradeCode, 'upgradeCode', { max: 40 }),
+    upgradeCode: expected.upgradeCode,
     teamUtilities,
     turns,
     trainingEligible: false,
@@ -394,6 +411,15 @@ export function replaySealedTrainingBatch(batch) {
   const validated = validateSealedTrainingBatch(batch);
   if (!validated.ok) return { ok: false, errors: validated.errors };
   const remainingBySeat = new Map();
+  const openingHands = new Map();
+  for (const turn of batch.turns) {
+    if (!openingHands.has(turn.seat) && Array.isArray(turn.hand)) {
+      openingHands.set(turn.seat, turn.hand);
+    }
+  }
+  if (!uniquePhysicalCards(openingHands.values())) {
+    errors.push('批次开始时物理牌身份跨座位重复');
+  }
   for (const [index, turn] of batch.turns.entries()) {
     const turnCheck = validateSealedTrainingTurn(turn);
     if (!turnCheck.ok) {
@@ -425,6 +451,10 @@ export function replaySealedTrainingBatch(batch) {
     const previous = remainingBySeat.get(turn.seat);
     if (previous && !sameHandMultiset(previous, turn.hand)) {
       errors.push(`turns[${index}] 牌张守恒失败`);
+    }
+    remainingBySeat.set(turn.seat, Array.isArray(turn.hand) ? turn.hand.slice() : []);
+    if (!uniquePhysicalCards(remainingBySeat.values())) {
+      errors.push(`turns[${index}] 物理牌身份跨座位重复`);
     }
     const lastHand = observation.lastHand || null;
     const chosen = turn.legalCandidates.find((item) => item.candidateId === turn.chosenCandidateId);
@@ -480,10 +510,14 @@ export function replaySealedTrainingBatch(batch) {
       ? turn.hand.slice()
       : turn.hand.filter((card) => !physicalCards.some((played) => cardIdentity(played) === cardIdentity(card)));
     remainingBySeat.set(turn.seat, nextHand);
+    if (!uniquePhysicalCards(remainingBySeat.values())) {
+      errors.push(`turns[${index}] 出牌后物理牌身份跨座位重复`);
+    }
   }
   try {
     const expected = teamUtilitiesFromFinishOrder(batch.finishOrder);
     if (expected.upgrade !== batch.upgrade || expected.winTeam !== batch.winTeam
+      || expected.upgradeCode !== batch.upgradeCode
       || expected.teamUtilities[0] !== batch.teamUtilities[0]
       || expected.teamUtilities[1] !== batch.teamUtilities[1]) {
       errors.push('名次与团队收益无法从 finishOrder 重算');

@@ -2,7 +2,7 @@
 
 > 更新：2026-09-02
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1～RT-6 定向代码门已完成；本轮合并提交 `e305437` 后统一入口在当前树上通过 46 checks。实时复盘智能体桥的本地代码门已齐：opt-in 回环采集、只读消费者、副末密封批次、HTTP 双消费者续读和训练器拒绝未批准批次。这仍不是浏览器真人长局、密封持久化或训练准入。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
+> 当前结论：**expert 保持默认；没有 `promoted` 模型；`EXPERT_POLICY_FEATURES` 的 STRAT-2/3/4 开关全部为 `false`。** 最新 v3 正常臂收益 CI 为正但性能门失败。EVID-9b 冻结提交 `585f099` 远端 CI 已通过。HEAD `6337e8b` 之上的未提交工作树（含 STRAT-5/RT 残余与本轮 STRAT-6/REL）统一入口为 **48 checks**。STRAT-6 正式三臂已在实现 SHA `94cccaddac6e29c08b3d69ff8f35aac716bb881909cb173c8400e1010dd5d8ed`、种子 `20268111–20268150` 上收割：STRAT-2 数字门通过但因证据绑定工作树 SHA 而非 git 提交，不得进入 expert 默认；STRAT-3 CI/灾难未过门；STRAT-4 与 expert 完全等价（CI `[0,0]`）。REL-1 是脚本化三副而非真人手打；笔记本/手机卡顿未测。ALGO-2 仅为代码门，不构成性能/强度/发布证据。
 
 ## 当前停止线
 
@@ -11,7 +11,8 @@
 - [x] expert 继续作为网页默认；`ismcts-v3` 仅保留为离线候选。
 - [x] 暂不启动正式 DMC/DanZero 训练，不把 `trainingEligible=false` 的外部轨迹并入训练。
 - [ ] R1A 完成前，不把 active-match 完整快照暴露给智能体，不把真人复盘或智能体意见直接并入训练；所有新增真人轨迹默认 `trainingEligible=false`。
-- [ ] STRAT-1～6 完成前，0831 复盘派生规则和当前“满手保留 A/级牌三带二”工作区修复只算候选；不得无开关进入 expert 默认，也不得用单测全绿替代镜像收益与灾难回归。
+- [x] STRAT-6 已用预登记未见种子 `20268111–20268150` 完成三条独立正式镜像臂（各 40 区组 × 13 级 = 520 对）；未达门或未 git 提交冻结的规则保持关闭。
+- [ ] 在同一 git 提交上冻结当前实现 SHA 并经晋级审查前，不得把 STRAT-2 的 summarizer `promote=true` 写成 expert 默认，也不得打开 STRAT-3/4。
 - [x] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子；EVID-9b 已在冻结提交上经远端 CI 闭环。
 - [x] SEC-1～3 已完成：不在聊天、日志或文档中展示抽取到的令牌值；EVID-9b 仅提交已验证候选快照。
 
@@ -50,23 +51,25 @@
 - 0902 RT-6 真人长局验收（真实浏览器对局 `match_3a514638`）：按"清队列键 + 清对局存档键 → 硬刷 → 立即新开一局"流程后，公开事件实时落盘，磁盘链校验通过（seq 0..224 连续、sha 链完整、公开契约全过、无暗牌字段），跨第 1～3 副；采集器全程 `gap=false`。token 滑动续期在活跃消费者下实测生效（`capabilityExpiresAt` 12:20:24Z→12:32:26Z）；消费者 follow 模式 `readerConnected=true`，第二消费者全新 cursor 跨进程续读 200 条 annotation 零重复；对局中途重启服务器（签发新 token）时浏览器队列重试吸收中断，链不受影响。密封批次侧由 RT-6 e2e 覆盖（`trainingEligible=false`、训练器拒收），页内密封状态按设计不外部可见。首次验收失败的根因（只清队列键、存档自动续局从 seq≥1 落入空队列触发 fail-closed）记入残余风险清单 #13。
 - 0902 RT 审查后修复（P1：token 断链）：独立代码审查发现 capability token 默认 15 分钟过期后无任何续期路径，超过 TTL 的真人长局必断链。已修复并随提交 `1331550` 入库：`lan_server.py` 的 `authorize()` 对成功授权滑动续期（活跃 follow 消费者每 ≤5 秒轮询一次，不会中途过期；闲置 token 仍在原 TTL 后失效），新增 `capability_failure_code` 区分 `capability_expired` 与 `capability_required`；`start-lan.ps1 -EnableReplayCollector` 在采集器已启用但 token 已过期（或 60 秒内将过期/时间戳无法解析）时安全重启以签发新 token；`replay_consumer.mjs` 对 401 解析错误码，`capability_expired` 不可重试并明确提示重新签发路径。回归：`python -X utf8 lan_server.test.py` **50/50**（新增滑动续期、错误码区分、HTTP 过期码三项），`node tools/test_replay_consumer.mjs` **22/22**（新增过期不可重试提示与无效 token 保持 `http_error`），e2e 通过。边界：滑动续期只覆盖活跃读取者；闲置过期后仍需用户显式重新运行启动脚本，没有也不应有无人值守的续签通道。
 - 0902 RT 审查后修复（P2 五项）：#7/#8 清空待发——flush 进行中清空推迟到回执落地后，`clearPending()` 返回 `brokenMatchIds` 并由 UI 明确警告当前对局不可继续采集；#1 `read()` 在缺口锁存后抛 `storage_corrupt`，兑现 fail-closed；#3 瞬时 `storage_unavailable` 不再锁存，保留期/容量清理改为落盘后登记链楼层（`collector-state.json`，原子写、严格校验、损坏按无楼层 fail closed），未登记楼层的外部删除仍锁存并拒绝读写；#12 `createMatch` 支持 `sealedTraining: false`（经 settings 传递，`startMatch` 重建后保持），A/B 评测显式 opt-out 密封捕获，存档剥离捕获开关。回归：`lan_server.test.py` **53/53**（容量/保留期清理续采、重启续写、楼层损坏与外部删除 fail closed、read 拒读、短写不锁存），队列 **46/46**，UI 静态 **48/48**，集成回归双向（捕获开启/关闭两副完整对局）通过，e2e 通过。以上改动均未提交。边界：#3 改变了 RT-3 时代"清理即锁存"的语义——有意清理不再锁存，但消费者凭自身 cursor 仍能发现被清理区间，未登记的外部删除依旧 fail closed；#12 改变 `game.js`，评测依赖闭包 SHA 随之变化，历史 checkpoint 不可 resume（当前无在跑正式长跑，符合停止线）。
+- 0902 本轮 RT 残余 + STRAT-5：在 HEAD `6337e8b` 的干净树上关闭 RT #2/#4/#5 GET 限流/#6/#9/#10/#11/#13，并实现 STRAT-5 共享 eligible-action 层。`game.js` 未改。定向回归：`lan_server.test.py` **58/58**，`test_replay_consumer.mjs` **25/25**，密封训练 **36/36**，转换器 **10/10**，队列 **50/50**，UI 静态 **51/51**，观察器 **14/14**，`ai.test.js` **369/369**，`ai.hybrid.test.js` **105/105**，夹具 **24/24**；当时 `verify.ps1` 退出 0、**46 checks**。独立 Sol 最终审查 PASS（有残余风险），P0/P1 为 0。本轮未运行 `-FullData`、远端 CI、发布晋级或正式种子。expert 默认、`trainingEligible=false`、采集器默认关闭不变。未提交、未推送。
+- 0902 本轮 STRAT-6 + REL：预登记种子与消融汇总、脚本化专家封版验收已接入统一入口。正式三臂顺序跑完 exit 0（8641.61s），实现 SHA `94cccadd…` 与当前 22 文件闭包一致。STRAT-2 数字门通过、STRAT-3/4 未过门；晋级咨询 KEEP_CLOSED（无 git 提交冻结）。`node tools/test_strat6_ablation.mjs` **15/15**，夹具 **24/24**，REL 脚本化验收通过；`pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\verify.ps1` 退出 0、**48 checks**。独立 Sol 终审 PASS（有修改）。未运行 `-FullData`、远端 CI、ReleaseEvidence；未提交、未推送；三条 STRAT 开关仍为 `false`。
 
-### RT 审查残余风险清单（0902 独立审查；#1/#3/#7/#8/#12 已修复，其余保持打开）
+### RT 审查残余风险清单（0902 独立审查；#1/#2/#3/#4/#6/#7/#8/#9/#10/#11/#12/#13 已修复，#5 仅关闭 GET 限流）
 
 1. ~~`lan_server.py` `read()` 在链缺口锁存后仍返回记录~~ **已修复（0902）**：`read()` 在 `_gap` 锁存后抛出 `storage_corrupt`（HTTP 503），不再返回任何记录；负例覆盖未登记楼层的外部删除与楼层台账损坏。
-2. `lan_server.py` 有限数检查漏过 `Infinity` 字面量（Python `json.loads` 接受之）；一条含 `Infinity` 的行会让 `/api/replay/status` 每次调用抛未捕获异常（连接断开、不锁存 gap）。
+2. ~~`lan_server.py` 有限数检查漏过 `Infinity` 字面量~~ **已修复（0902 本轮）**：`json.loads(..., parse_constant=...)` 拒绝 `NaN`/`Infinity`，再走有限数/嵌套遍历；POST 为 `invalid_event` 400，已落盘的非有限数行为 `storage_corrupt`/503，`/api/replay/status` 不再因未捕获异常断连。`decisionMeta.budgetMs`/`latencyMs` 与 `hand.power` 要求 `math.isfinite`。
 3. ~~`lan_server.py` 任何瞬时存储 OSError 永久锁存 `_gap`；保留期清理后无运行时恢复路径~~ **已修复（0902）**：瞬时 `storage_unavailable`（含写入回滚后的短写）只失败本次操作、记录 `lastError`，不再锁存；有意的保留期/容量清理改为在新事件落盘后登记"链楼层"（`collector-state.json`，原子写、严格校验、损坏按无楼层 fail closed），留存链可继续采集与续读、进程重启后可续写；未登记楼层的外部删除仍锁存缺口并拒绝读写。
-4. `lan_server.py` 深层嵌套 JSON（约 1000 层）触发 `RecursionError` 不在捕获列表内，处理线程崩溃、客户端挂起而非干净 400。
-5. `lan_server.py` GET 读取无速率限制；append 每次全量扫描日志至多 3 次，日志接近 64MB 上限时操作退化为平方级，持 token 者 `waitMs=0` 轮询可占满回环 CPU。
-6. `tools/replay_consumer.mjs` 单次模式 drain 循环为死代码，超过一页（默认 100 条）的事件流静默消费不全且退出码为 0。
+4. ~~`lan_server.py` 深层嵌套 JSON 触发 `RecursionError`~~ **已修复（0902 本轮）**：公开事件 JSON 嵌套上限 12，`RecursionError` 映射为 400/503，处理线程不再崩溃挂起。
+5. **部分关闭（0902 本轮）**：GET `/api/replay/events` 现有独立于 POST 的 240/60s 限流，超限 429 且 `retryable=true`，`waitMs=0` 轮询不能占满回环 CPU。**仍打开**：append 每次全量扫描日志（接近 64MB 时平方级）；follow 空闲轮询约 10 GET/s，约 24s 后会 429 并 1s 重试，CPU 空转已停但空闲 follow 变粗。未做日志索引。
+6. ~~`tools/replay_consumer.mjs` 单次模式 drain 循环为死代码~~ **已修复（0902 本轮）**：`--once` 持续分页直到 `hasMore=false`；超过一页的事件流完整消费后才退出 0。`--follow` 仍在空页后短轮询。
 7. ~~`js/replay-event-queue.js` `clearPending()` 与进行中的 flush 竞争~~ **已修复（0902）**：flush 进行中时清空被推迟到回执落地之后，在途事件正常投递并推进游标，不再误锁存完整性缺口；回归覆盖推迟清空、游标推进与不重复投递。
 8. ~~`js/replay-event-queue.js` + `js/ui.js` 对局中途清空待发破坏链但无警告~~ **已修复（0902）**：`clearPending()` 返回 `brokenMatchIds`，UI 明确提示"当前对局剩余事件将无法采集，下一副新对局自动恢复"；UI 静态回归锁定该文案。
-9. `tools/replay_consumer.mjs` 进程在 `writeSync` 与 `fsync` 之间被杀会留下半行 NDJSON，之后每次启动 `annotation_invalid` 退出 1，无截断/修复路径（游标有原子 rename 保护，annotation 没有）。
-10. `js/sealed-training.js` `createSealedTrainingBatch` 接受调用方任意 `upgradeCode`，不与 `finishOrder` 派生值交叉校验；篡改输入可带错误胜利类型标签静默入库（数值收益仍正确，误标无门能检出）。
-11. `js/sealed-training.js` 牌张守恒仅按座位检查，同一物理牌可出现在两个座位手中而不触发；仅对伪造/损坏的转换器输入 fail-open，真实捕获不会产生。
+9. ~~`tools/replay_consumer.mjs` 半行 NDJSON 无恢复路径~~ **已修复（0902 本轮）**：加载时仅当**最后一行** JSON 解析失败才截断并 `fsync`，中间行损坏仍 fail closed，不发明 annotation。**残余**：最后一行能 parse 但 `validateStoredAnnotation` 失败时仍不截断。
+10. ~~`js/sealed-training.js` `upgradeCode` 不与名次交叉校验~~ **已修复（0902 本轮）**：若提供则必须等于 `teamUtilitiesFromFinishOrder(finishOrder).upgradeCode`，批次始终持久化派生值；转换器重放同样拒绝不一致。
+11. ~~`js/sealed-training.js` 牌张守恒仅按座位检查~~ **已修复（0902 本轮）**：开局手牌与每手后剩余牌按 `cardIdentity` 跨座位唯一；重复物理牌 fail closed。仅作用于伪造/损坏转换器输入，真实捕获不会产生。
 12. ~~`js/ai.ab.simulation.js` 无开关地支付密封捕获成本~~ **已修复（0902）**：`createMatch` 支持 `sealedTraining: false`（经 settings 传递，`startMatch` 重建后仍然保持），A/B 评测显式 opt-out，跳过每动作合法候选枚举与每轮末全量重放；存档剥离捕获开关，恢复的浏览器对局永远回到默认开启；集成回归现双向覆盖捕获开启/关闭两副完整对局。
-13. 对局中途清空待发队列（或清空 `guandan_replay_pending_v1`  localStorage）后，对局存档 `guandan_active_match_v2` 仍保留 `replaySequence`/`replayPreviousEventSha256`，刷新自动续局从 seq≥1 继续发射，落入空队列即触发完整性缺口并永久 fail-closed，无用户可操作的恢复路径（只能新开一局）。0902 真人长局验收首次失败的根因即为此组合：恢复流程只清了队列键，旧对局被存档自动恢复，seq 0 随被清记录丢失。缓解方向：恢复对局时若队列无任何本对局游标/待发事件且 seq>0，给出显式提示或引导新开一局；采集胶囊的缺口提示文案可补充"新开一局自动恢复"。
-- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2、STRAT-1/2/3/4 和 RT-1～RT-6 的当前本地回归通过；EVID-9b 冻结提交远端 CI 已完成。RT-6 仅证明回环 HTTP 与合成收束对局的本地代码门，不证明浏览器真人长局、密封刷新持久化或训练准入。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 合并双侧回归后为 **93/93**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
+13. ~~刷新后续局 seq≥1 落入空队列永久 fail-closed~~ **已修复（0902 本轮）**：恢复对局若 `replaySequence>0` 且队列对本 `matchId` 无待发/已确认游标，观察器以 `unreproducible_match` 停采（不锁存完整性缺口），UI 提示“当前对局采集链已中断、请新开一局以恢复采集”；胶囊文案含“新开一局自动恢复”。`startMatch`/新开一局清除该标记，从 seq 0 恢复采集。**残余**：对局进行中 `clearPending()` 仍保留 cursor，`hasMatchTrace` 为真，继续出牌仍会缺口（#8 已警告）。
+- 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2、STRAT-1/2/3/4/5 和 RT-1～RT-6 的当前本地回归通过；EVID-9b 冻结提交远端 CI 已完成。RT-6 证明回环 HTTP、合成收束对局和一次真人长局公开链，仍不是密封刷新持久化或训练准入。STRAT-1～5 仅形成可复算代码门，正式 expert 仍关闭候选；本轮 `node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **369/369**，`node js/ai.hybrid.test.js` 为 **105/105**。TEL-1 预算遥测语义已澄清（见 P1-C 节）；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
 
 ## P1-A：实时复盘智能体桥与真人训练候选（RT-1～RT-6 本地代码门完成；训练准入未满足）
 
@@ -90,11 +93,11 @@
 ## P1-B：复盘驱动的专家策略修复（新增，可与 R0/R1A 并行）
 
 - [x] **STRAT-1：冻结可复算反例与证据边界。** 新增 `tools/strategy-counterexamples.json` 与 `tools/test_strategy_counterexamples.mjs`：只保存行动座位手牌、公开历史、合法候选和预期不变量，observation 顶层采用严格白名单，绑定 `guandan-rules-v1`、`js/ai.js`/`js/cards.js`/`js/evaluator.js`/`js/rules.js`/`js/strategy-core.js` 文件摘要及聚合 SHA；4 个 STRAT-4 机制夹具与换名暗牌负例验证 24/24。历史复盘原始导出已删除，旧命中数仍只作不可独立复算线索，不作为失误率。
-- [x] **STRAT-2：收口当前满手保留大三张修复。** 新增独立 `policyFeatures.reserveHighControlLead` 与 `with-reserved-high-control-lead` 候选变体，正式 expert/baseline 默认关闭；AI、共享策略和教练统一按出牌后剩余张数 `>8` 判定，特殊惩罚只由共享策略源产生，移除 `ai.js` 对三带二的重复 `power×系数` 惩罚，并移除教练入口的重复事件。已覆盖 11/13/14 张边界、三带二主张/带对、逢人配多解声明、默认关闭、候选开启时的两手收官豁免和单次扣分；镜像收益/灾难门仍待 STRAT-6。
-- [x] **STRAT-3：实现任一对手报单的安全领牌约束。** 新增默认关闭的 `enemyReportLeadSafety` 与 `with-enemy-report-lead-safety` 候选；共享 `strategy-core` 按所有未出完敌方座位识别报单，并仅在完整合法候选含不拆炸/逢人配/王的安全非单或 `public_lock_lead` 路线时过滤 J 及以下低单。无替代动作、整手收官或跟牌分支不触发，避免机械“永不出 ≤J”；AI、教练与本地混合候选池复用同一过滤器。领牌解释、云端咨询和旧式混合首选回退也经过同一安全门，不能把被过滤低单重新送入搜索。已覆盖上家/下家双报单、仅炸弹回退、默认关闭、唯一共享事件、紧凑顶层 `tags`、`{play,strategy}` 包装和跨入口回归；镜像收益/灾难门仍待 STRAT-6。
-- [x] **STRAT-4：修正队友牌权的硬优先级。** `assessPartnerTrickControl` 先用公开历史确认对家仍是本圈赢家，再确认活跃对手均已过牌/出完；`partnerTrickControl` 候选开关默认关闭。AI、教练评价和混合咨询在进入 P3、紧急拦截或普通接牌前优先接风，并写入唯一 `tacticalConstraint`/共享标签；整手出完保留明确例外，`partnerFinished=true` 不再静默落入接对手。已补未行动对手、刚出完、无历史证据和整手收官回归；镜像收益/灾难门仍待 STRAT-6。
-- [ ] **STRAT-5：把同一安全约束放在搜索候选入口。** expert、root PIMC、ISMCTS v2/v3 和云端增强共用同一 eligible-action/invariant 层；搜索不得重新引入被 STRAT-3/4 排除的送单或抢队友牌，也不在每个引擎复制一套易漂移规则。逐引擎回归证明合法回退、无候选时 fail closed、关闭 feature 后恢复对照行为。
-- [ ] **STRAT-6：独立消融和座位分层晋级。** 每条规则单独开关、单独镜像臂、使用未见种子；先跑定向反例与短 smoke，再比较团队效用、头游/双上/双下、灾难率和 search-triggered 性能，未达门保持关闭。策略与未来网络继续采用座位/队伍规范化共享参数，不为下家/对家/上家复制三套规则；报告按绝对座位、队伍角色、先手与贡还状态分层，只有稳定偏科证据才新增角色特征。
+- [x] **STRAT-2：收口当前满手保留大三张修复。** 新增独立 `policyFeatures.reserveHighControlLead` 与 `with-reserved-high-control-lead` 候选变体，正式 expert/baseline 默认关闭；AI、共享策略和教练统一按出牌后剩余张数 `>8` 判定，特殊惩罚只由共享策略源产生，移除 `ai.js` 对三带二的重复 `power×系数` 惩罚，并移除教练入口的重复事件。已覆盖 11/13/14 张边界、三带二主张/带对、逢人配多解声明、默认关闭、候选开启时的两手收官豁免和单次扣分。STRAT-6 正式臂数字门通过（见下），因无 git 提交冻结仍保持关闭。
+- [x] **STRAT-3：实现任一对手报单的安全领牌约束。** 新增默认关闭的 `enemyReportLeadSafety` 与 `with-enemy-report-lead-safety` 候选；共享 `strategy-core` 按所有未出完敌方座位识别报单，并仅在完整合法候选含不拆炸/逢人配/王的安全非单或 `public_lock_lead` 路线时过滤 J 及以下低单。无替代动作、整手收官或跟牌分支不触发，避免机械“永不出 ≤J”；AI、教练与本地混合候选池复用同一过滤器。领牌解释、云端咨询和旧式混合首选回退也经过同一安全门，不能把被过滤低单重新送入搜索。已覆盖上家/下家双报单、仅炸弹回退、默认关闭、唯一共享事件、紧凑顶层 `tags`、`{play,strategy}` 包装和跨入口回归。STRAT-6 正式臂 CI 下界跨 0 且灾难门失败，保持关闭。
+- [x] **STRAT-4：修正队友牌权的硬优先级。** `assessPartnerTrickControl` 先用公开历史确认对家仍是本圈赢家，再确认活跃对手均已过牌/出完；`partnerTrickControl` 候选开关默认关闭。AI、教练评价和混合咨询在进入 P3、紧急拦截或普通接牌前优先接风，并写入唯一 `tacticalConstraint`/共享标签；整手出完保留明确例外，`partnerFinished=true` 不再静默落入接对手。已补未行动对手、刚出完、无历史证据和整手收官回归。STRAT-6 正式臂与 expert 完全等价（CI `[0,0]`），下界未严格大于 0，保持关闭。
+- [x] **STRAT-5：把同一安全约束放在搜索候选入口（本地代码门）。** `js/strategy-core.js` 新增 `filterEligibleStrategyActions`：STRAT-3 后 STRAT-4，feature 关闭返回同一数组引用；STRAT-3 阻断后不再还原原集合。expert 领出、`getAIConsultation`、`chooseHybridFromConsultation`、`evaluateInformationSetCandidates`（PIMC / 成对根 PIMC / ISMCTS v2/v3 根）共用该层；ISMCTS 内节点仅当 `seat === observation.seat` 时过滤，对手/对家内节点与 `chooseRolloutPlay` 不套用本家规则。空集：跟牌注入/回退过牌，领出不合成 pass、不执行被阻断首选。`enemyReportLeadSafety` / `partnerTrickControl` 仍默认关闭。逐引擎回归：`node js/ai.test.js` **369/369**，`node js/ai.hybrid.test.js` **105/105**，夹具指纹 **24/24**。独立 Sol 审查 PASS（有残余风险）：根执行不能选出被排除着法；内节点仍用根 `publicHistory` 判断 STRAT-4（后续模拟圈可能漏过滤），rollout 估值仍可走被禁线。这不是镜像收益、灾难率、性能或 expert 默认晋级。
+- [x] **STRAT-6：独立消融和座位分层晋级。** 每条规则单独开关、单独镜像臂、预登记未见种子 `20268111–20268150`（smoke `20268101–02` 已消耗、不得复用）；`opponentModelMode=off`、全 13 级 `same-deal-cross-level-blocks`、每臂 40 区组 / 520 镜像对 / 1040 局。实现 SHA `94cccaddac6e29c08b3d69ff8f35aac716bb881909cb173c8400e1010dd5d8ed`（工作树闭包，非 git 提交）。三臂均 0 失败/死锁/镜像不一致，`searchTriggered.decisionTurns=0`（expert 对 expert，搜索 P95/P99 不适用）。STRAT-2：CI `[0.047,0.188]`、双上 255/220，数字门通过；因无 git 提交冻结，`reserveHighControlLead` 保持 `false`。STRAT-3：CI `[-0.015,0.041]`、双上 240/243，CI 与灾难均失败。STRAT-4：CI `[0,0]`、双上 237/237，本种子集完全等价，下界未严格 >0。贡还层不可识别（单副 A/B）；先手角色与候选队伍分层来自 checkpoint 局对象，不作新的角色特征。产物：`data/eval-strat6-formal-strat{2,3,4}.json` SHA-256 `8bb14602…` / `9e8dbd44…` / `e3ef13f7…`。
 
 ### 当前 STRAT 审计基线
 
@@ -104,6 +107,8 @@
 - [x] STRAT-2 代码门已完成：`strategy-core` 提供唯一剩余张数阈值，AI 与 `evaluator` 共用 `premature_high_control`，教练的 breakdown/tips 只记录一次；显式候选覆盖 11/13/14 张、带对 A/级牌、逢人配多解和收官豁免。与 STRAT-3/4 合并回归后的 `node js/ai.test.js` 为 **363/363**；这不是镜像收益、灾难率或发布证据。
 - [x] STRAT-3 代码门已完成：`strategy-core` 提供 `assessEnemyReportLead` / `filterEnemyReportLeadCandidates`，AI、教练和混合候选池共享任一方向报单识别；只在存在安全非单/公开锁牌路线时过滤低单，无替代动作时 fail open，且跟牌不触发。领牌解释/咨询使用过滤后候选，混合层也不会把旧式被阻断首选重新作为搜索锚点；`node js/ai.test.js` **363/363**、`node js/ai.hybrid.test.js` **81/81** 通过；这不是镜像收益、灾难率或发布证据。
 - [x] STRAT-1/4 代码门已完成：脱敏夹具绑定规则/实现摘要，observation 顶层严格白名单；`assessPartnerTrickControl` 按公开过牌与完成状态 fail closed；`with-partner-trick-control` 为独立候选，正式 expert/baseline 保持关闭。AI、评价和 hybrid 入口共享接风约束；`test_strategy_counterexamples.mjs` **24/24**、`ai.test.js` **363/363**、`ai.hybrid.test.js` **81/81**。未运行正式镜像赛，不形成收益、灾难率、性能或晋级证据。
+- [x] STRAT-5 代码门已完成：共享 `filterEligibleStrategyActions` 覆盖 expert、咨询/云端候选子集、四种搜索根入口和本家内节点；feature 关闭为同一数组引用；PIMC / 成对根 PIMC / ISMCTS v2 / ISMCTS v3 注入低单或抢队友牌都不得成为 `finalCandidateId` 或根 `candidateResults`。本轮 `ai.test.js` **369/369**、`ai.hybrid.test.js` **105/105**、夹具 **24/24**。Sol 最终审查 PASS（有残余风险）。未运行正式镜像赛，候选不进入 expert 默认。
+- [x] STRAT-6 正式三臂已收割（见上条任务）。夹具指纹已随 `js/ai.js` Probe 历史迁出重算，聚合 SHA `021c7a411762990ef0687ca91d047164cdc6193a3c555a1d32490d9e33663fac`，`test_strategy_counterexamples.mjs` **24/24**。summarizer 读取正式报告 `performance.decisionLatencyByPolicy[<candidate>].searchTriggered.decisionTurns`。独立晋级咨询 KEEP_CLOSED；终审 PASS（有修改）：不得把 numeric `promote=true` 写成产品打开。
 - [ ] 原始 0831 复盘已按安全流程删除，无法重新核对 7 次送单、3 次压队友和 55/1 搜索统计；这些数字不得晋升为发布证据。
 
 ## P1-C：定位并修复搜索尾延迟
@@ -129,9 +134,9 @@
 
 ## P3：可并行的专家版封版
 
-- [ ] **REL-1：三副人工验收。** 覆盖普通升级、贡还、打 A / 不过 A；保存版本和结果。
-- [ ] **REL-2：隐私与交互验收。** 核对本地/云端数据边界，记录笔记本与手机 UI 卡顿、已知限制和回滚步骤。
-- [ ] **REL-3：文档与复盘标签收敛。** README 只保留当前摘要并链接总纲；修正对手画像迁移版本和 v3 仅离线评测的边界；复盘将 `ismcts-v3` 正确显示为 ISMCTS v3/成对 sweep，但不把它加入产品选择器；把 `ai.js` 的 Probe 历史移入证据台账，并把 `ai-hybrid.js` 的“三个模式”改为“四个”。
+- [x] **REL-1：脚本化三副验收（非真人手打）。** `tools/expert_release_acceptance.mjs` 以 expert / easy 走通普通升级、贡还、打 A；本机写入 `data/expert-release-acceptance.json`（SHA-256 `5c32d72a8bf1f405e231c9ba522f09be79542851dc06506e8dd7182610a7b833`）：finishOrder `0,2,3,1`、出现进贡/还贡、打 A 过 A。这不是笔记本浏览器手打三副，也不等于大师难度手感。
+- [x] **REL-2：隐私与回滚台账（静态；设备卡顿未测）。** 同一验收报告记录：默认离线、云端只经回环、API Key 不进 localStorage、采集器默认关闭、`trainingEligible=false`，以及停止服务 / 改回专家策略 / 清 localStorage + git 回退。`notebookMeasured=false`、`phoneMeasured=false`；未做运行时 localStorage 抽查或真机卡顿测量。
+- [x] **REL-3：文档与复盘标签收敛。** README 只保留当前摘要并链接总纲；对手画像为公开行动 v3（含 v1/v2 迁移）；v3 仅离线评测。复盘将 `ismcts-v3` 显示为 ISMCTS v3/成对 sweep，产品选择器仍无该选项。`ai.js` Probe 历史注释已指向证据台账；`ai-hybrid.js` 改为“四个”可验证搜索模式。
 
 ## P4：后续路线（当前不启动长训）
 
@@ -147,4 +152,4 @@
 - availability-aware UCT 已改为 `log(availability + 1) / visits`；旧错误实现报告全部退出正式证据集。
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
-- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2/RT-3 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。随后 RT-4 将统一入口复验为 **43 checks**；本轮 RT-5 再复验为 **45 checks**，RT-6 再复验为 **46 checks**，评测闭包 21→22。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+- 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2/RT-3 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。随后 RT-4 将统一入口复验为 **43 checks**；本轮 RT-5 再复验为 **45 checks**，RT-6 再复验为 **46 checks**，评测闭包 21→22。0902 本轮 STRAT-5 与 RT 残余修复后统一入口仍为 **46 checks**（新增断言计入既有步骤，未增加 verify 步骤数）。随后 STRAT-6/REL 工具测试计入后为 **48 checks**。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。

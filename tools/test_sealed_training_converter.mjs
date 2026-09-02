@@ -106,4 +106,32 @@ assert.throws(
 );
 assert.equal(fs.existsSync(path.join(badOutput, 'manifest.json')), false, '失败时不写切分产物');
 
-console.log('sealed training converter: 8 passed');
+const mismatchInput = path.join(tempRoot, 'upgrade-mismatch.ndjson');
+const mismatchOutput = path.join(tempRoot, 'mismatch-out');
+const wrongCode = batch.upgradeCode === 'head_last' ? 'double_up' : 'head_last';
+fs.writeFileSync(mismatchInput, `${JSON.stringify({ ...batch, upgradeCode: wrongCode })}\n`, 'utf8');
+assert.throws(
+  () => convertSealedTrainingFile({ inputPath: mismatchInput, outputDir: mismatchOutput }),
+  (error) => error instanceof SealedTrainingConverterError && error.code === 'convert_failed',
+);
+assert.equal(fs.existsSync(path.join(mismatchOutput, 'manifest.json')), false, 'upgradeCode 不一致时不写切分产物');
+
+const duplicateCard = batch.turns[0].hand[0];
+const duplicateInput = path.join(tempRoot, 'duplicate-card.ndjson');
+const duplicateOutput = path.join(tempRoot, 'duplicate-out');
+const duplicated = {
+  ...batch,
+  turns: batch.turns.map((turn, index) => (
+    index === 0
+      ? { ...turn, hand: [...turn.hand, { ...duplicateCard }] }
+      : turn
+  )),
+};
+fs.writeFileSync(duplicateInput, `${JSON.stringify(duplicated)}\n`, 'utf8');
+assert.throws(
+  () => convertSealedTrainingFile({ inputPath: duplicateInput, outputDir: duplicateOutput }),
+  (error) => error instanceof SealedTrainingConverterError && error.code === 'convert_failed',
+);
+assert.equal(fs.existsSync(path.join(duplicateOutput, 'manifest.json')), false, '物理牌身份重复时不写切分产物');
+
+console.log('sealed training converter: 10 passed');

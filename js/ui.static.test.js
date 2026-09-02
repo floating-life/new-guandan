@@ -45,6 +45,15 @@ assert(ui.includes('replaySubmitPaused') && ui.includes('clearPending')
 assert(ui.includes('brokenMatchIds') && ui.includes('result.deferred')
   && ui.includes('下一副新对局会自动恢复'),
   '清空待发对链破坏给出明确警告，进行中提交时推迟清空而非竞争回执');
+assert(ui.includes('replayCollectionInterruptedMatchId') && ui.includes('hasMatchTrace')
+  && ui.includes('unreproducible_match')
+  && ui.includes('当前对局采集链已中断、请新开一局以恢复采集')
+  && ui.includes('新开一局自动恢复')
+  && ui.includes('replayEventQueue.hasMatchTrace'),
+  '待发队列被清空后恢复进行中对局会停止采集并提示新开一局自动恢复');
+assert(ui.includes('replayCollectionInterruptedMatchId = null')
+  && ui.includes("startMatch(state)"),
+  '新开一局会清除采集中断标记并从 sequence 0 恢复采集');
 assert(ui.includes('事件构造失败') && ui.includes('replayLastEventError')
   && ui.includes('replayObserverErrors'),
   '复盘胶囊暴露事件构造失败与观察器错误计数，便于定位缺口来源');
@@ -52,6 +61,9 @@ assert(ui.includes('混合搜索') && ui.includes('个可能牌面') && ui.inclu
   '逐手复盘展示混合层是否改选、采样数和模拟节点数');
 assert(ui.includes('成对根 PIMC') && ui.includes('次成对 rollout'),
   '逐手复盘区分 PIMC 与成对根 PIMC，并展示真实 rollout 数');
+assert(ui.includes('ISMCTS v3/成对 sweep') && ui.includes('次成对 sweep')
+  && !html.includes('value="ismcts-v3"'),
+  '复盘正确标注 ISMCTS v3/成对 sweep，但不把它加入产品选择器');
 assert(html.includes('id="btnValueModel"') && html.includes('id="fileValueModel"')
   && ui.includes('configureAIWorkerValueModel') && ui.includes('restoreValueModel'),
  '界面可加载并在刷新后恢复经过本地校验的训练价值模型');

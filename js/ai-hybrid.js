@@ -16,12 +16,12 @@ import { createPublicAIObservation } from './ai-observation.js';
 import {
   VALUE_MODEL_STATUS, isPromotedValueModel, valueModelStatus,
 } from './value-model-gate.js';
-import { filterEnemyReportLeadCandidates } from './strategy-core.js';
+import { filterEligibleStrategyActions } from './strategy-core.js';
 
 export const HYBRID_ENGINE_VERSION = 1;
 export const HYBRID_VALUE_SCHEMA = 'guandan-candidate-v1';
 /**
- * 信息集增强的三个可验证搜索模式：
+ * 信息集增强的四个可验证搜索模式：
  * - pimc-v1：每个候选在每个公平采样世界各 rollout 一次（现有基线）。
  * - paired-root-pimc-v1：在相同假想世界成对覆盖全部候选，并用完整世界数
  *   和有效访问数约束改选。世界仍来自当前公开信息集，不会把真实暗牌传入
@@ -869,9 +869,26 @@ function actionFromPlay(play) {
 }
 
 /** Pick a bounded, deterministic expert-oriented branch set for an inner node. */
-function selectOpenLoopActions(state, seat, maxBranch) {
-  const plays = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
+function selectOpenLoopActions(state, seat, maxBranch, options = null) {
+  const rawPlays = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
     .map(actionFromPlay);
+  const observation = options?.observation;
+  const deciding = observation && seat === observation.seat;
+  const filterCtx = deciding ? {
+    ...observation,
+    hand: state.hands[seat],
+    lastHand: state.lastHand,
+    lastSeat: state.lastSeat,
+    finishOrder: state.finishOrder,
+    handCounts: state.hands.map((item) => item.length),
+    passedSeats: [...(state.passed || [])],
+    mode: state.lastHand ? 'beat' : 'lead',
+    seat,
+    teams: state.teams,
+  } : null;
+  const plays = filterCtx
+    ? filterEligibleStrategyActions(rawPlays, filterCtx, { allowPlacementExceptions: false }).entries
+    : rawPlays;
   const actions = [];
   const add = (action) => {
     if (!action || actions.some((item) => publicActionKey(item) === publicActionKey(action))) return;
@@ -879,8 +896,15 @@ function selectOpenLoopActions(state, seat, maxBranch) {
   };
   // 先加入专家 rollout 的首选，使扩展与默认安全策略一致；随后只补少量
   // 低结构成本的合法分支，防止信息集树把完整候选空间展开到不可交互。
+  // STRAT-5：本家内节点不得把已被 STRAT-3/4 排除的送单/抢队友牌重新加入。
   const expert = chooseRolloutPlay(state, seat);
-  if (expert) add(actionFromPlay(expert));
+  if (expert) {
+    const expertAction = actionFromPlay(expert);
+    const expertKey = publicActionKey(expertAction);
+    if (!filterCtx || plays.some((play) => publicActionKey(play) === expertKey)) {
+      add(expertAction);
+    }
+  }
   if (state.lastHand) add({ action: 'pass', cards: [], hand: null, signature: null });
   const ordered = plays.slice().sort((left, right) => {
     const leftCost = rolloutStructureCost(left, state.hands[seat], state.level);
@@ -900,11 +924,11 @@ function selectOpenLoopActions(state, seat, maxBranch) {
 // 只读诊断：量化“专家首选 + pass + 低成本普通着法”在有限分支内是否挤掉
 // 合法炸弹。它不接入正式树搜索，不改变默认排序或搜索预算；若未来实验要
 // 预留炸弹槽，必须另行通过收益、灾难率和尾延迟门。
-export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5) {
+export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5, options = null) {
   const branch = clamp(Math.floor(Number(maxBranch) || 5), 2, 10);
   const legal = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
     .map(actionFromPlay);
-  const baseline = selectOpenLoopActions(state, seat, branch);
+  const baseline = selectOpenLoopActions(state, seat, branch, options);
   const bombs = legal.filter((action) => isBomb(action.hand)).sort((left, right) => (
     rolloutStructureCost(left, state.hands[seat], state.level)
     - rolloutStructureCost(right, state.hands[seat], state.level)
@@ -1173,7 +1197,7 @@ function runISMCTSSearch(observation, candidates, limits, options) {
       const seat = state.currentSeat;
       const legalActions = depth === 0
         ? candidates
-        : selectOpenLoopActions(state, seat, branchLimit);
+        : selectOpenLoopActions(state, seat, branchLimit, { observation });
       if (!legalActions.length) {
         invalidReason = 'tree_no_legal_action';
         break;
@@ -1717,6 +1741,35 @@ function runPairedRootPIMCSearch(observation, sampling, candidates, limits, opti
 export function evaluateInformationSetCandidates(ctx, candidates, options = {}) {
   const observation = createPublicAIObservation(ctx);
   const searchMode = normalizeSearchMode(options.searchMode);
+  const eligible = filterEligibleStrategyActions(candidates, {
+    ...ctx,
+    ...observation,
+    hand: ctx.hand || observation.hand,
+    mode: observation.lastHand ? 'beat' : 'lead',
+  }, { allowPlacementExceptions: true });
+  const searchCandidates = Array.isArray(eligible.entries) ? eligible.entries : [];
+  if (!searchCandidates.length) {
+    return {
+      applied: false,
+      reason: eligible.reason || 'eligible_actions_empty',
+      searchMode,
+      searchAttempted: false,
+      searchTriggered: false,
+      observation,
+      candidateResults: [],
+    };
+  }
+  if (searchCandidates.length < 2) {
+    return {
+      applied: false,
+      reason: 'single_eligible_candidate',
+      searchMode,
+      searchAttempted: false,
+      searchTriggered: false,
+      observation,
+      candidateResults: [],
+    };
+  }
   const critical = criticalHybridSituation(observation, searchMode);
   if (!critical.active) {
     return {
@@ -1760,10 +1813,10 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     rolloutDiagnostics: {},
   };
   const search = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
-    ? runPairedRootPIMCSearch(observation, sampling, candidates, limits, options)
+    ? runPairedRootPIMCSearch(observation, sampling, searchCandidates, limits, options)
     : [HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3].includes(searchMode)
-      ? runISMCTSSearch(observation, candidates, limits, { ...options, searchMode })
-      : runPIMCSearch(observation, sampling, candidates, limits);
+      ? runISMCTSSearch(observation, searchCandidates, limits, { ...options, searchMode })
+      : runPIMCSearch(observation, sampling, searchCandidates, limits);
   const { candidateResults } = search;
   const completeCandidates = candidateResults.filter((item) => item.completedSamples > 0).length;
   const rootMinimumEffectiveVisits = clamp(
@@ -1786,14 +1839,14 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
       ? candidateResults.every((item) => (
         item.visits >= rootMinimumEffectiveVisits
         && Number(item.availability) >= rootMinimumEffectiveVisits
-      )) && Number(search.sampledWorlds) >= candidates.length * rootMinimumEffectiveVisits
+      )) && Number(search.sampledWorlds) >= searchCandidates.length * rootMinimumEffectiveVisits
       : searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3
         ? candidateResults.every((item) => item.visits >= rootMinimumEffectiveVisits)
           && Number(search.pairedSweeps) >= requiredPairedSweeps
         : true;
-  const completed = completeCandidates === candidates.length;
+  const completed = completeCandidates === searchCandidates.length;
   return {
-    applied: completed && candidates.length > 1 && rootEvidenceSufficient,
+    applied: completed && searchCandidates.length > 1 && rootEvidenceSufficient,
     reason: !completed ? 'budget_exhausted'
       : rootEvidenceSufficient ? 'completed' : 'insufficient_search_evidence',
     searchMode: search.searchMode,
@@ -2004,23 +2057,61 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
 
   if (!consultation || !localCandidate) return fallback('missing_local_candidate');
   const allCandidates = consultation.candidates || [];
-  const guardedCandidates = ctx?.policyFeatures?.enemyReportLeadSafety === true
-    && !ctx?.lastHand
-    ? filterEnemyReportLeadCandidates(allCandidates, {
-      ...ctx,
-      hand: ctx.hand,
-      mode: 'lead',
-    }).entries
-    : allCandidates;
-  // STRAT-3 是混合搜索前的硬候选门。正常咨询已经把专家首选放在安全池中，
-  // 但这里仍防御直接调用/旧缓存：被阻断的低单不得借“本地锚点”身份重新进入
-  // 搜索；用过滤后的首个候选重建锚点，也让证据不足回退保持同一安全口径。
+  const eligible = filterEligibleStrategyActions(allCandidates, {
+    ...ctx,
+    hand: ctx.hand,
+    mode: ctx.lastHand ? 'beat' : 'lead',
+  }, { allowPlacementExceptions: true });
+  const guardedCandidates = eligible.entries;
+  // STRAT-5：expert/PIMC/ISMCTS/云端增强共用同一 eligible 层。被 STRAT-3/4
+  // 排除的送单或抢队友牌不得借本地锚点或空集还原重新进入搜索。
+  if (!Array.isArray(guardedCandidates) || !guardedCandidates.length) {
+    if (ctx?.lastHand) {
+      const passDecision = {
+        action: 'pass',
+        reason: eligible.reason || '安全候选为空，过牌 fail closed',
+        hybrid: {
+          version: HYBRID_ENGINE_VERSION,
+          applied: false,
+          reason: 'eligible_actions_empty',
+          searchMode: normalizeSearchMode(options.searchMode),
+          searchAttempted: false,
+          searchTriggered: false,
+          fallbackKind: 'expert_safety_fallback',
+          iterations: 0,
+          localCandidateId: consultation?.localCandidateId || null,
+          finalCandidateId: 'pass',
+          changedDecision: consultation?.action !== 'pass',
+          model: getHybridValueModelStatus(),
+        },
+      };
+      return {
+        decision: passDecision,
+        telemetry: {
+          applied: false,
+          reason: 'eligible_actions_empty',
+          searchAttempted: false,
+          searchTriggered: false,
+          fallbackKind: 'expert_safety_fallback',
+        },
+      };
+    }
+    return {
+      decision: null,
+      telemetry: {
+        applied: false,
+        reason: 'eligible_actions_empty',
+        searchAttempted: false,
+        searchTriggered: false,
+        fallbackKind: 'expert_safety_fallback',
+      },
+    };
+  }
   const guardedLocalCandidate = guardedCandidates.find(
     (candidate) => candidate.id === consultation.localCandidateId,
   );
   if (!guardedLocalCandidate) {
     const safeAnchor = guardedCandidates[0];
-    if (!safeAnchor) return fallback('enemy_report_lead_no_safe_candidate');
     consultation = {
       ...consultation,
       action: safeAnchor.action,
@@ -2029,7 +2120,9 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
         hand: safeAnchor.hand,
         signature: safeAnchor.signature || handSignature(safeAnchor.hand),
       } : {}),
-      reason: '报单安全门阻断原专家首选，回退到安全候选',
+      reason: eligible.partnerTrickControl?.shouldYield
+        ? '队友牌权门阻断原专家首选，回退到安全候选'
+        : '报单安全门阻断原专家首选，回退到安全候选',
       localCandidateId: safeAnchor.id,
     };
   }

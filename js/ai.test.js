@@ -21,7 +21,7 @@ import {
 import { evaluatePlay, summarizeSession } from './evaluator.js';
 import {
   assessEnemyReportLead, assessPartnerTrickControl, evaluateStrategicPlay,
-  filterEnemyReportLeadCandidates,
+  filterEnemyReportLeadCandidates, filterEligibleStrategyActions,
   isLowSingleLead,
 } from './strategy-core.js';
 import {
@@ -4259,6 +4259,132 @@ console.log('STRAT-4：队友当前圈赢家的接风硬优先级');
   const formal = recommendPlay({ ...yielded, policyFeatures: resolvePolicyFeatures('expert') });
   assert(formal?.tacticalConstraint !== 'partner_trick_control',
   'STRAT-4 候选开关关闭时保持正式 expert 对照行为');
+}
+
+console.log('STRAT-5：共享 eligible-action 层');
+{
+  const level = 2;
+  const hand = [
+    C(3, 'S'), C(3, 'H'), C(5, 'S'), C(5, 'H'),
+    C(7, 'S'), C(9, 'S'), C(10, 'S'), C(11, 'S'),
+  ];
+  const lowSingle = { cards: [hand[4]], hand: parseHand([hand[4]], level) };
+  const safePair = { cards: hand.slice(0, 2), hand: parseHand(hand.slice(0, 2), level) };
+  const frozen = Object.freeze([lowSingle, safePair]);
+  const off = filterEligibleStrategyActions(frozen, {
+    ...context(hand, { level, handCounts: [hand.length, 1, 12, 1], mode: 'lead' }),
+    policyFeatures: resolvePolicyVariant('expert').policyFeatures,
+  });
+  assert(off.entries === frozen && off.closed === false,
+    '两个 feature 均关闭时返回同一候选数组引用');
+
+  const source = [lowSingle, safePair];
+  const blockedMix = filterEnemyReportLeadCandidates(source, context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    policyFeatures: resolvePolicyVariant('with-enemy-report-lead-safety').policyFeatures,
+    mode: 'lead',
+  }));
+  assert(blockedMix.safety.blocked && blockedMix.entries.length === 1
+      && blockedMix.entries[0] === safePair && blockedMix.entries !== source,
+    'STRAT-3 阻断后返回过滤结果，不把低单还原进原集合');
+
+  const explicitOff = { ...resolvePolicyFeatures('expert'), enemyReportLeadSafety: false, partnerTrickControl: false };
+  const leadCtx = context(hand, {
+    level,
+    handCounts: [hand.length, 1, 12, 1],
+    difficulty: 'master',
+    deterministic: true,
+  });
+  const defaultLead = recommendPlay({ ...leadCtx, policyFeatures: resolvePolicyFeatures('expert') });
+  const explicitLead = recommendPlay({ ...leadCtx, policyFeatures: explicitOff });
+  assert(defaultLead?.action === explicitLead?.action
+      && JSON.stringify(defaultLead?.cards?.map((card) => card.id))
+        === JSON.stringify(explicitLead?.cards?.map((card) => card.id))
+      && defaultLead?.tacticalConstraint === explicitLead?.tacticalConstraint,
+  'expert 默认与显式关闭 STRAT-3/4 的领出决策一致');
+
+  const partnerPlay = [C(5, 'C')];
+  const publicHistory = [
+    {
+      turn: 37, trickNumber: 10, seat: 2, action: 'play', cards: partnerPlay,
+      hand: parseHand(partnerPlay, level), countsBefore: [4, 0, 4, 8], countsAfter: [4, 0, 4, 7],
+    },
+    {
+      turn: 38, trickNumber: 10, seat: 3, action: 'pass', cards: [],
+      countsBefore: [4, 0, 4, 7], countsAfter: [4, 0, 4, 7],
+    },
+  ];
+  const yieldHand = [C(7, 'S'), C(8, 'S'), C(9, 'S'), C(10, 'S')];
+  const yieldCtx = context(yieldHand, {
+    level, lastHand: parseHand(partnerPlay, level), lastSeat: 2,
+    handCounts: [yieldHand.length, 0, 4, 7], finishOrder: [1], publicHistory,
+    difficulty: 'master', deterministic: true, policyProfile: 'expert',
+    policyFeatures: resolvePolicyVariant('with-partner-trick-control').policyFeatures,
+  });
+  const steal = {
+    id: 'steal_single',
+    action: 'play',
+    cards: [yieldHand[0]],
+    hand: parseHand([yieldHand[0]], level),
+    signature: handSignature(parseHand([yieldHand[0]], level)),
+  };
+  const yieldFilter = filterEligibleStrategyActions([steal], yieldCtx, { allowPlacementExceptions: true });
+  assert(yieldFilter.entries.length === 1 && yieldFilter.entries[0].action === 'pass'
+      && !yieldFilter.entries.some((item) => item.id === steal.id),
+  'STRAT-4 shouldYield 且输入缺少 pass 时注入过牌，不还原抢队友牌');
+
+  const onlyLow = {
+    id: 'only_low_single',
+    action: 'play',
+    cards: [hand[4]],
+    hand: parseHand([hand[4]], level),
+    signature: handSignature(parseHand([hand[4]], level)),
+    localScore: 100,
+  };
+  const noAlt = chooseHybridFromConsultation(
+    context(hand, {
+      level,
+      handCounts: [hand.length, 1, 12, 1],
+      policyFeatures: resolvePolicyVariant('with-enemy-report-lead-safety').policyFeatures,
+      decisionEngine: 'ismcts-v3',
+      difficulty: 'master',
+      deterministic: true,
+    }),
+    {
+      action: 'play',
+      cards: onlyLow.cards,
+      hand: onlyLow.hand,
+      signature: onlyLow.signature,
+      candidates: [onlyLow],
+      localCandidateId: onlyLow.id,
+      cloudConstraint: 'soft_rerank',
+    },
+    { searchMode: 'ismcts-v3', seed: 20260903 },
+  );
+  assert(noAlt.decision?.hybrid?.finalCandidateId === onlyLow.id
+      && noAlt.decision?.cards?.some((card) => card.rank === 7),
+  'STRAT-3 没有安全替代时不机械禁低单，保留无替代回退');
+
+  const yieldHybrid = chooseHybridFromConsultation(yieldCtx, {
+    action: 'play',
+    cards: steal.cards,
+    hand: steal.hand,
+    signature: steal.signature,
+    candidates: [steal, {
+      id: 'pass',
+      action: 'pass',
+      cards: [],
+      hand: null,
+      signature: null,
+    }],
+    localCandidateId: steal.id,
+    cloudConstraint: 'soft_rerank',
+  }, { searchMode: 'ismcts-v3', seed: 20260904 });
+  assert(yieldHybrid.decision?.action === 'pass'
+      && yieldHybrid.decision?.hybrid?.searchTriggered === false
+      && yieldHybrid.decision?.hybrid?.finalCandidateId === 'pass',
+  'STRAT-4 只剩过牌时混合层不搜索，回退过牌而不是抢队友牌');
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

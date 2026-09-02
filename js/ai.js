@@ -15,7 +15,8 @@ import {
   countPotentialBombs, createStrategicMemo, downstreamEnemyNeedsBlock,
   evaluateStrategicPlay, selectEmergencyBlock, assessTeamFinishDelay,
   RESPONSE_DAMAGE_WEIGHT, selectPressureOrdinaryResponse, strategicResponseDamage,
-  shouldReserveHighControlLead, filterEnemyReportLeadCandidates, assessPartnerTrickControl,
+  shouldReserveHighControlLead, assessPartnerTrickControl,
+  filterEligibleStrategyActions, isPartnerTrickControlException,
 } from './strategy-core.js';
 import {
   estimateThreeStepRoute, inferPublicThreats, createBeatModel,
@@ -176,10 +177,9 @@ export function resolveHybridSearchConfig(decisionEngine, {
     sampleCount: deterministic ? 6 : extendedBudget ? 8 : 4,
     behaviorAttempts: 2,
     maxPlies: extendedBudget ? 120 : 88,
-    // Probe10 with the corrected UCT measured search-triggered P95/P99 at
-    // 576.4/762.3ms under 2400 nodes, exceeding the unchanged 500/750ms
-    // gate.  1800 is a precommitted work-budget calibration for v3 only;
-    // it reduces work rather than weakening the acceptance threshold.
+    // Deterministic v3 uses a precommitted 1800-node work budget. Historical
+    // Probe10 2400-node P95/P99 numbers live in the evidence ledger, not here;
+    // the 500/750ms acceptance threshold is unchanged.
     nodeBudget: deterministic
       ? (baseDecisionEngine === 'ismcts-v3' ? 1800 : 3600)
       : extendedBudget ? 5200 : 2400,
@@ -850,8 +850,7 @@ function chooseAIPlayInternal(ctx, options) {
   const respond = (decision, ranked = [], reason = '', candidate = null) => {
     if (!options.explain || !decision) return decision;
     const explanationRanked = !decisionCtx.lastHand
-      && policyFeatureActive(decisionCtx, 'enemyReportLeadSafety')
-      ? filterEnemyReportLeadCandidates(ranked, decisionCtx).entries
+      ? filterEligibleStrategyActions(ranked, { ...decisionCtx, mode: 'lead' }).entries
       : ranked;
     return explainDecision(decision, explanationRanked, reason, candidate, decisionCtx);
   };
@@ -864,9 +863,10 @@ function chooseAIPlayInternal(ctx, options) {
 
   if (!lastHand) {
     const ranked = rankPlays(plays, 'lead', hand, level, decisionCtx, c, search);
-    const guarded = policyFeatureActive(decisionCtx, 'enemyReportLeadSafety')
-      ? filterEnemyReportLeadCandidates(ranked, decisionCtx).entries
-      : ranked;
+    const guarded = filterEligibleStrategyActions(ranked, {
+      ...decisionCtx,
+      mode: 'lead',
+    }).entries;
     const finish = guarded.filter((play) => play.cards.length === hand.length);
     const resourceSafe = guarded.filter((play) => (
       !isBombType(play.hand)
@@ -918,10 +918,7 @@ function chooseAIPlayInternal(ctx, options) {
   // 共享策略显式标记，不能因为 partnerFinished 静默落入普通接对手路径。
   if (partnerTrickControl.shouldYield) {
     const ranked = rankPlays(plays, 'beat', hand, level, decisionCtx, c, search);
-    const placementException = ranked.find((play) => (
-      play.strategy?.tags?.includes('double_up_block')
-      || play.strategy?.tags?.includes('avoid_double_down')
-    ));
+    const placementException = ranked.find((play) => isPartnerTrickControlException(play));
     if (placementException) {
       return respond(
         { action: 'play', cards: placementException.cards, hand: placementException.hand,
@@ -2668,7 +2665,7 @@ export function getAIConsultation(ctx, options = {}) {
   const startedAt = monotonicNow();
   const deterministic = options.deterministic !== false;
   const timeBudgetMs = Math.max(0, Number(options.timeBudgetMs ?? ctx?.timeBudgetMs) || 0);
-  const consultation = chooseAIPlayInternal({
+  let consultation = chooseAIPlayInternal({
     ...ctx,
     policyProfile: ctx.policyProfile === 'baseline' ? 'baseline' : 'expert',
   }, {
@@ -2678,10 +2675,32 @@ export function getAIConsultation(ctx, options = {}) {
     timeBudgetMs,
   });
   if (!consultation?.candidates?.length) return consultation;
-  const localCandidate = consultation.candidates.find(
+  const eligibleConsultation = filterEligibleStrategyActions(consultation.candidates, {
+    ...ctx,
+    hand: ctx.hand,
+    mode: ctx.lastHand ? 'beat' : 'lead',
+  }, { allowPlacementExceptions: true });
+  if (eligibleConsultation.entries !== consultation.candidates) {
+    consultation = { ...consultation, candidates: eligibleConsultation.entries };
+  }
+  let localCandidate = consultation.candidates.find(
     (candidate) => candidate.id === consultation.localCandidateId,
   );
-  if (!localCandidate) return consultation;
+  if (!localCandidate) {
+    const safeAnchor = consultation.candidates[0];
+    if (!safeAnchor) return consultation;
+    consultation = {
+      ...consultation,
+      action: safeAnchor.action,
+      ...(safeAnchor.action === 'play' ? {
+        cards: safeAnchor.cards,
+        hand: safeAnchor.hand,
+        signature: safeAnchor.signature,
+      } : { cards: [], hand: null, signature: null }),
+      localCandidateId: safeAnchor.id,
+    };
+    localCandidate = safeAnchor;
+  }
 
   let cloudConstraint = 'soft_rerank';
   const teammateLead = ctx.lastSeat != null

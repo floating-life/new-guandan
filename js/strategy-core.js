@@ -402,9 +402,126 @@ export function filterEnemyReportLeadCandidates(entries, ctx = {}) {
     const play = entry?.play || entry;
     return !isLowSingleLead(play, ctx.level) || isEnemyReportLeadExempt(entry, ctx);
   });
+  // STRAT-5：被阻断后不得把原集合还原。无剩余候选时 fail closed（空集），
+  // 由调用方走合法回退，而不是把已排除的低单重新送入搜索。
+  return { entries: filtered, safety };
+}
+
+export const PARTNER_TRICK_CONTROL_EXCEPTION_TAGS = Object.freeze([
+  'double_up_block', 'avoid_double_down',
+]);
+
+function isPassEntry(entry) {
+  return entry?.action === 'pass' || entry?.play?.action === 'pass';
+}
+
+export function isPartnerTrickControlException(entry) {
+  return PARTNER_TRICK_CONTROL_EXCEPTION_TAGS.some((tag) => hasCandidateTag(entry, tag));
+}
+
+export function isWholeHandFinish(entry, hand) {
+  if (isPassEntry(entry)) return false;
+  const play = candidatePlay(entry) || entry;
+  const cards = play?.cards;
+  return Array.isArray(cards) && Array.isArray(hand) && cards.length > 0
+    && cards.length === hand.length;
+}
+
+function injectedPass(entries) {
+  const hybridStyle = Array.isArray(entries) && entries.some((entry) => typeof entry?.id === 'string');
+  return hybridStyle
+    ? { id: 'pass', action: 'pass', cards: [], hand: null, signature: null }
+    : { action: 'pass', cards: [], hand: null, signature: null };
+}
+
+/**
+ * STRAT-4 的集合过滤器。shouldYield 时只保留过牌、整手收官，以及根/专家
+ * 入口显式打开的名次例外标签。不得为了凑搜索候选而放回普通接队友牌。
+ */
+export function filterPartnerTrickControlCandidates(entries, ctx = {}, options = {}) {
+  const partnerTrickControl = assessPartnerTrickControl(ctx);
+  if (!Array.isArray(entries)) {
+    return { entries: [], partnerTrickControl, closed: true, reason: 'invalid_entries' };
+  }
+  if (!partnerTrickControl.shouldYield) {
+    return { entries, partnerTrickControl, closed: false, reason: null };
+  }
+  const hand = ctx.hand || ctx.handBefore || [];
+  const allowPlacement = options.allowPlacementExceptions === true;
+  const filtered = entries.filter((entry) => (
+    isPassEntry(entry)
+    || isWholeHandFinish(entry, hand)
+    || (allowPlacement && isPartnerTrickControlException(entry))
+  ));
+  const withPass = filtered.some(isPassEntry) || !ctx.lastHand
+    ? filtered
+    : [injectedPass(entries), ...filtered];
   return {
-    entries: filtered.length ? filtered : entries,
+    entries: withPass,
+    partnerTrickControl,
+    closed: withPass.length === 0,
+    reason: partnerTrickControl.reason,
+  };
+}
+
+/**
+ * STRAT-5 唯一 eligible-action 层。expert、混合咨询、PIMC/ISMCTS 根候选和
+ * 本家内节点共用；feature 关闭时返回同一数组引用。STRAT-3 先于 STRAT-4。
+ */
+export function filterEligibleStrategyActions(entries, ctx = {}, options = {}) {
+  const strat3 = ctx?.policyFeatures?.enemyReportLeadSafety === true;
+  const strat4 = ctx?.policyFeatures?.partnerTrickControl === true;
+  if (!strat3 && !strat4) {
+    return {
+      entries,
+      safety: assessEnemyReportLead(null, ctx),
+      partnerTrickControl: assessPartnerTrickControl(ctx),
+      closed: false,
+      reason: null,
+    };
+  }
+  if (!Array.isArray(entries)) {
+    return {
+      entries: [],
+      safety: assessEnemyReportLead(null, ctx),
+      partnerTrickControl: assessPartnerTrickControl(ctx),
+      closed: true,
+      reason: 'invalid_entries',
+    };
+  }
+
+  let current = entries;
+  let safety = assessEnemyReportLead(null, ctx);
+  if (strat3) {
+    const filtered = filterEnemyReportLeadCandidates(current, ctx);
+    safety = filtered.safety;
+    current = filtered.entries;
+    if (safety.blocked && current.length === 0) {
+      return {
+        entries: current,
+        safety,
+        partnerTrickControl: assessPartnerTrickControl(ctx),
+        closed: true,
+        reason: safety.reason,
+      };
+    }
+  }
+
+  let partnerTrickControl = assessPartnerTrickControl(ctx);
+  if (strat4) {
+    const filtered = filterPartnerTrickControlCandidates(current, ctx, options);
+    partnerTrickControl = filtered.partnerTrickControl;
+    current = filtered.entries;
+  }
+
+  return {
+    entries: current,
     safety,
+    partnerTrickControl,
+    closed: current.length === 0,
+    reason: current.length === 0
+      ? (safety.reason || partnerTrickControl.reason || 'eligible_actions_empty')
+      : null,
   };
 }
 

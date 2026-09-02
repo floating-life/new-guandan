@@ -287,18 +287,60 @@ function validateStoredAnnotation(value) {
   )) throw new ReplayConsumerError('annotation_invalid', 'annotation confidence 无效');
 }
 
+function truncateAnnotationFile(annotationPath, size) {
+  const descriptor = fs.openSync(annotationPath, 'r+');
+  try {
+    fs.ftruncateSync(descriptor, size);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function splitAnnotationLines(buffer) {
+  const lines = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] === 0x0a) {
+      lines.push({
+        start,
+        content: buffer.subarray(start, index).toString('utf8').replace(/\r$/, ''),
+      });
+      start = index + 1;
+    }
+  }
+  if (start < buffer.length) {
+    lines.push({
+      start,
+      content: buffer.subarray(start).toString('utf8'),
+    });
+  }
+  return lines;
+}
+
 export function readAnnotationStore(annotationPath) {
   if (!fs.existsSync(annotationPath)) return new Map();
-  let data;
-  try { data = fs.readFileSync(annotationPath, 'utf8'); } catch {
+  let buffer;
+  try { buffer = fs.readFileSync(annotationPath); } catch {
     throw new ReplayConsumerError('storage_unavailable', 'annotation 存储无法读取');
   }
   const records = new Map();
-  for (const [index, line] of data.split(/\r?\n/).entries()) {
-    if (!line.trim()) continue;
+  const lines = splitAnnotationLines(buffer);
+  for (const [index, line] of lines.entries()) {
+    if (!line.content.trim()) continue;
     let value;
-    try { value = JSON.parse(line); } catch {
-      throw new ReplayConsumerError('annotation_invalid', `annotation 存储第 ${index + 1} 行损坏`);
+    try {
+      value = JSON.parse(line.content);
+    } catch {
+      if (index !== lines.length - 1) {
+        throw new ReplayConsumerError('annotation_invalid', `annotation 存储第 ${index + 1} 行损坏`);
+      }
+      try {
+        truncateAnnotationFile(annotationPath, line.start);
+      } catch {
+        throw new ReplayConsumerError('storage_unavailable', 'annotation 半行无法安全截断');
+      }
+      break;
     }
     validateStoredAnnotation(value);
     if (records.has(value.annotationId)) {
@@ -584,15 +626,14 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help) { console.log(usage()); return 0; }
   const token = options.token;
   delete options.token;
-  let first = true;
-  while (first || options.follow) {
-    first = false;
+  while (true) {
     try {
       const result = await consumeOnce({ ...options, token });
       if (options.json) console.log(JSON.stringify(result.summary));
       else printHuman(result.summary);
-      if (!options.follow && !result.hasMore) break;
-      if (!result.hasMore && options.follow) await new Promise((resolve) => setTimeout(resolve, 100));
+      if (result.hasMore) continue;
+      if (!options.follow) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
     } catch (error) {
       const safeError = error instanceof ReplayConsumerError
         ? error : new ReplayConsumerError('consumer_error', '复盘消费者失败');

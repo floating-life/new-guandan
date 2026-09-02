@@ -259,6 +259,13 @@ export function createReplayEventQueue({
     return null;
   }
 
+  function hasMatchTrace(matchId) {
+    if (typeof matchId !== 'string' || !matchId) return false;
+    if (cursor.matchId === matchId) return true;
+    if (events.some((event) => event.matchId === matchId)) return true;
+    return acked.some((item) => item.matchId === matchId);
+  }
+
   function recomputeIntegrity() {
     let activeMatchId = cursor.matchId;
     let expected = activeMatchId == null ? 0 : cursor.sequence + 1;
@@ -479,6 +486,9 @@ export function createReplayEventQueue({
           persist();
           return { ok: false, reason: 'event_conflict' };
         }
+        if (event.sequence > 0 && !hasMatchTrace(event.matchId)) {
+          return { ok: false, reason: 'unreproducible_match', queued: false };
+        }
         if (events.length >= limit) {
           droppedCount += 1;
           latchIntegrityGap('本地待发复盘队列已满，已记录 sequence 缺口');
@@ -533,6 +543,7 @@ export function createReplayEventQueue({
       submitter = typeof fn === 'function' ? fn : null;
       if (submitter && enabled) scheduleFlush();
     },
+    hasMatchTrace,
     snapshot() {
       return {
         schema: REPLAY_QUEUE_SCHEMA,

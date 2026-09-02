@@ -550,6 +550,24 @@ console.log('RT-2 本机复盘待发队列');
   assert(submitted.length === 1, '进行中的事件完成投递且不重复提交');
 }
 
+{
+  const queue = createReplayEventQueue({ storage: storage(), enabled: false });
+  const orphan = event(3, sha('b'), 'orphan-event-3', 'wiped-match');
+  const rejected = queue.enqueue(orphan);
+  const snapshot = queue.snapshot();
+  assert(!rejected.ok && rejected.reason === 'unreproducible_match' && snapshot.pendingCount === 0,
+    '待发队列被清空后拒绝续写 seq>0 的无链对局，且不入队');
+  assert(!snapshot.integrityGap && !snapshot.integrityLock && !queue.hasMatchTrace('wiped-match'),
+    '无链续写不会锁存完整性缺口，以免永久阻断后续新对局');
+  const fresh = event(0, null, 'fresh-event-0', 'fresh-match');
+  const queued = queue.enqueue(fresh);
+  assert(queued.ok && queued.queued && queue.snapshot().pendingCount === 1 && !queue.snapshot().integrityGap,
+    '新对局 sequence=0 仍可正常采集');
+  const continued = queue.enqueue(event(1, fresh.eventSha256, 'fresh-event-1', 'fresh-match'));
+  assert(continued.ok && queue.hasMatchTrace('fresh-match'),
+    '同一对局后续序号在已有轨迹上继续入队');
+}
+
 await new Promise((resolve) => setTimeout(resolve, 0));
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
