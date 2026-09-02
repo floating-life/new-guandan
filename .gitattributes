@@ -1,0 +1,34 @@
+# 评测闭包字节冻结：以下 22 个文件参与 guandan-evaluation-implementation-v2
+# 指纹（js/ai.ab.simulation.js EVALUATION_IMPLEMENTATION_SOURCES），正式报告
+# 的逐文件/聚合 SHA-256 按工作树原始字节计算。
+# closure-eol 宏：
+#   -text              关闭 Git 的一切 EOL/编码转换（含 autocrlf 的 checkin/checkout
+#                      归一），保证提交 blob 与评测时字节逐一一致，使晋级证据可绑
+#                      定到提交；
+#   whitespace=cr-at-eol  把行尾 CR 视为行终止符的一部分，避免 `git diff --check`
+#                      把 CRLF 文件的每一行误判为 trailing whitespace（其余空白
+#                      检查全部保留）。
+# 新增或移除该清单成员时必须同步更新本文件。
+[attr]closure-eol -text whitespace=cr-at-eol
+js/ai-hybrid.js closure-eol
+js/ai-observation.js closure-eol
+js/ai-route.js closure-eol
+js/ai.ab.environment-telemetry.js closure-eol
+js/ai.ab.provenance.js closure-eol
+js/ai.ab.simulation.js closure-eol
+js/ai.ab.telemetry.js closure-eol
+js/ai.js closure-eol
+js/ai.worker-client.js closure-eol
+js/ai.worker.js closure-eol
+js/cards.js closure-eol
+js/evaluator.js closure-eol
+js/game.js closure-eol
+js/llm.js closure-eol
+js/model-fingerprint.js closure-eol
+js/opponent-model.js closure-eol
+js/replay-contracts.js closure-eol
+js/rules.js closure-eol
+js/sealed-training.js closure-eol
+js/stats.js closure-eol
+js/strategy-core.js closure-eol
+js/value-model-gate.js closure-eol
