@@ -101,6 +101,7 @@ $nodeTests = @(
   'js/ai.hybrid.test.js',
   'tools/test_strategy_counterexamples.mjs',
   'tools/test_strat6_ablation.mjs',
+  'tools/test_strat6_summarize.mjs',
   'tools/test_expert_release_acceptance.mjs',
   'js/opponent-model.test.js',
   'js/value-model-gate.test.js',
