@@ -337,10 +337,14 @@ function replayStatusView() {
     };
   }
   if (snapshot.gap) {
+    const detail = snapshot.lastError
+      || state.replayLastEventError
+      || (state.replayEventFailures ? `复盘事件构造失败 ${state.replayEventFailures} 次` : null)
+      || (state.replayObserverErrors ? `复盘观察器错误 ${state.replayObserverErrors} 次` : null);
     return {
       text: '复盘采集有缺口',
       className: 'error',
-      title: snapshot.lastError || '公开复盘事件存在持久化、顺序或采集失败，已停止提交',
+      title: detail || '公开复盘事件存在持久化、顺序或采集失败，已停止提交',
     };
   }
   if (snapshot.enabled) {
@@ -384,6 +388,8 @@ function replayCollectorDetailText() {
     `智能体：${reader}`,
     `本机待发：${snapshot.pendingCount}`,
     `提交：${snapshot.enabled ? '进行中' : (replaySubmitPaused ? '已暂停' : '未启用')}`,
+    `事件构造失败：${state.replayEventFailures || 0}${state.replayLastEventError ? `（${state.replayLastEventError}）` : ''}`,
+    `观察器错误：${state.replayObserverErrors || 0}`,
   ].join('；') + '。启用采集请用启动脚本的显式选项。';
 }
 

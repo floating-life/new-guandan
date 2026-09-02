@@ -45,6 +45,9 @@ assert(ui.includes('replaySubmitPaused') && ui.includes('clearPending')
 assert(ui.includes('brokenMatchIds') && ui.includes('result.deferred')
   && ui.includes('下一副新对局会自动恢复'),
   '清空待发对链破坏给出明确警告，进行中提交时推迟清空而非竞争回执');
+assert(ui.includes('事件构造失败') && ui.includes('replayLastEventError')
+  && ui.includes('replayObserverErrors'),
+  '复盘胶囊暴露事件构造失败与观察器错误计数，便于定位缺口来源');
 assert(ui.includes('混合搜索') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
   '逐手复盘展示混合层是否改选、采样数和模拟节点数');
 assert(ui.includes('成对根 PIMC') && ui.includes('次成对 rollout'),
