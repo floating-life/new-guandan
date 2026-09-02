@@ -1,8 +1,8 @@
 # 掼蛋训练大师：近期待办
 
-> 更新：2026-09-01
+> 更新：2026-09-02
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。实时复盘智能体桥仅部分满足。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
+> 当前结论：**expert 保持默认；没有 `promoted` 模型；最新 v3 正常臂收益 CI 为正但性能门失败；浏览器原始导出、WPSDrive 同步历史与回收站均已按安全流程处置。EVID-9b 冻结提交 `585f099` 的远端 Windows CI（run `33470270032`）已通过。RT-1/RT-2 定向代码门已完成，但完整统一入口当前因目标外既有改动删除 `tools/test_ai_ab_simulation.mjs` 而在该步骤退出 1；实时复盘智能体桥仍仅部分满足。STRAT-1/3/4 已完成脱敏夹具、共享代码门和跨入口回归，但候选仍默认关闭，尚未完成镜像收益与灾难回归。ALGO-2 的 rollout 首出不变量与异常回退代码门已通过，仍不构成性能、强度或发布证据。**
 
 ## 当前停止线
 
@@ -26,7 +26,7 @@
 
 - [x] **EVID-1：修正 ReleaseEvidence 退出语义。** `validate_release_evidence.mjs` 现在只有在 `promotion.promoted=true` 时才允许 `releaseEvidenceReady=true` 和退出 0；已覆盖模型哈希一致但 CI 下界≤0 的拒绝负例、主 A/B 绑定旧文件哈希的合成拒绝负例，以及完整正例。当前真实命令仍因旧主报告哈希不匹配返回 1，符合停止线。
 - [x] **EVID-2：修正遥测覆盖率分母。** `collectDecisionTelemetry` 现在对每个 AI 决策生成记录；缺少 `variant` 或 `localDecision` 时保留 `latencyMs=null` 并计入未测量。搜索/回退采用显式 `searchAttempted / searchTriggered / fallbackKind`；普通 expert 回合也明确记录“未搜索/无回退”，本地超时和决策错误保留真实 fallback 类型。`tools/test_ai_ab_simulation.mjs` 的生产者负例证明漏记仍须入账：搜索子集即使 100% 覆盖，缺一座策略/本地耗时也会拉低测量覆盖率，缺搜索或回退字段则令 `integrityComplete=false`；性能门从原始计数重算覆盖率并拒绝矛盾回执。
-- [x] **EVID-3：绑定完整评测依赖闭包。** `guandan-evaluation-implementation-v2` 已绑定 runner、`game.js` 及其 Worker、评价、存储和 LLM 路径共 20 个源码文件（含环境遥测模块）；测试独立复算静态/动态/副作用 import 与 Worker URL 闭包，并逐一变异此前遗漏的间接依赖，确认 implementation SHA 改变且旧 checkpoint `--resume` 被拒绝。
+- [x] **EVID-3：绑定完整评测依赖闭包。** `guandan-evaluation-implementation-v2` 已绑定 runner、`game.js` 及其 Worker、评价、存储、LLM 与实时复盘契约路径共 21 个源码文件（含环境遥测模块）；测试独立复算静态/动态/副作用 import 与 Worker URL 闭包，并逐一变异此前遗漏的间接依赖，确认 implementation SHA 改变且旧 checkpoint `--resume` 被拒绝。
 - [x] **EVID-4：checkpoint 原子与可恢复。** `guandan-ai-ab-checkpoint-v3` 现要求 `checkpointIntegrity.sha256`；按同目录唯一临时文件写入 → `fsync` → 重读全量校验 → 不删除目标的原子替换，并保留 `.last-valid`。resume 严格校验 `complete/nextBlockIndex`、配置签名、精确 seed×level×team 覆盖、pair↔game 及 failure 派生一致；主坏仅可从同配置有效备份恢复，主备均坏拒绝。已回归截断/残留临时文件、可解析篡改、重复或错配对象、数组重排和 Windows `FileShare.None` 写锁；不保证同一路径多 writer 互斥，也不把 SHA-256 视为带密钥认证。
 - [x] **EVID-5：加固性能回执 provenance（本地代码门已关闭）。** `guandan-ai-ab-report-v1` / `guandan-ai-ab-checkpoint-v3` 绑定 `evaluationId`、机器/Node/V8、PID/PPID、fresh/resume 段链和输入 checkpoint 摘要；每局与镜像对象归属运行段，resume 只接受同机同 Node/V8。汇总器按本机字节复算完整依赖闭包、逐文件及聚合 SHA，并固定要求 80 区组、精确 `[2..14]`、`opponentModelMode=off` 与候选/当前 `searchMode` 一致。每个运行段的 `searchTriggered` 必须独立通过固定门，且 decision/measured/unmeasured/fallback-evaluable/timeout 五项与总体严格守恒；跨机器或运行时、旧报告/v2 checkpoint、伪造摘要、缺失/断裂运行段或不守恒均 fail closed。边界：这是本地可审计完整性，不是远程可信硬件证明；不能为历史 statefix 产物生成正式回执，也不改变 expert 默认。
 - [x] **EVID-6：修正盲评灾难门（本地代码门已关闭）。** `summarize_blind_eval.mjs` 升级 `guandan-blind-eval-summary-v3`；严格校验 manifest 的非空唯一 `scenarioIds` 与 `selectedScenarios` 数量，按全部题目分别统计 expert/proposed 灾难数，并以同一 manifest 场景数为分母。灾难门直接比较未舍入原始计数；不完整复核时两率为 `null` 且 fail closed。新增“玩家选择 expert、未选 proposed 却为灾难”反例、翻转选择不改变双臂统计、缺复核、重复 ID 和数量不一致回归。
@@ -36,18 +36,18 @@
 - [x] **VERIFY-1：恢复 `-FullData` 独立契约。** `verify.ps1` 将 FullData 与 ReleaseEvidence 的输入解析拆分：前者只保留历史完整性所需的 checkpoint，后者才要求连续赛报告及 M2 专属工件。`tools/test_verify_full_data_contract.mjs` 固定这一分支契约；以故意不存在的 `-ContinuousReport` 执行 `-FullData` 仍完整通过，证明不依赖本机恰有默认报告。
 - [x] **EVID-9b：代码门同一提交与远端 CI 闭环。** SEC-1～3、UI-0 和 VERIFY-1 后的冻结提交 [`585f099`](https://github.com/floating-life/new-guandan/commit/585f0996c727abe77709a3b864f3d1f7ac3819e0) 已在独立脱离工作树完成默认统一验证 **38 checks**、`-FullData` **42 checks**，并单独通过 A/B checkpoint 原子写入/Windows 锁/恢复及环境遥测回归；其远端 Windows CI [run `33470270032`](https://github.com/floating-life/new-guandan/actions/runs/33470270032) 已通过。真实 ReleaseEvidence/M2 工件仍到 RUN-2～6 后才可能形成，不作为 R0 代码门循环前置，也不消费新的正式种子。
 
-### 0901 本轮 EVID-8 / EVID-9a / EVID-9b / STRAT 证据记录
+### 0901–0902 本轮 EVID-8 / EVID-9a / EVID-9b / STRAT / RT 证据记录
 
-- 前序 EVID-8/9a/9b 已于冻结提交 `585f099` 完成；该提交在独立脱离工作树通过默认统一验证 **38 checks**、`-FullData` **42 checks**，并通过远端 Windows CI run `33470270032`。本轮只在当前工作树继续 STRAT 开发，未向 EVID-9b 冻结提交追加改动。
-- 当前工作树 `verify.ps1` 同时检查工作区与 staged diff，并显式拒绝 unmerged index；本轮默认统一验证实际为 **39/39**，`-FullData` 实际为 **45/45**（后者只读引用既有本地数据工件）。性能 provenance、M2 正负例、环境遥测、Windows 目录别名冲突、checkpoint 原子锁/恢复和 STRAT 夹具回归均通过。
+- 前序 EVID-8/9a/9b 已于冻结提交 `585f099` 完成；该提交在独立脱离工作树通过默认统一验证 **38 checks**、`-FullData` **42 checks**，并通过远端 Windows CI run `33470270032`。本轮只在当前工作树追加 RT-1/RT-2 实现、回归与文档改动，未向 EVID-9b 冻结提交追加改动。
+- 0901 前序工作树的默认统一验证为 **39/39**、`-FullData` 为 **45/45**（后者只读引用既有本地数据工件）；这两个数字以及此前性能 provenance、M2 正负例、环境遥测、Windows 目录别名冲突、checkpoint 原子锁/恢复和 STRAT 夹具回归的通过记录，均仅作 0901 历史记录。RT-2 修复后于 0902 重新执行默认统一验证：RT-2 相关步骤均通过，但在目标外既有改动删除 `tools/test_ai_ab_simulation.mjs` 后，于该步骤以 `MODULE_NOT_FOUND` 退出 1，不能记为全仓通过；`verify.ps1` 同时检查工作区与 staged diff，并显式拒绝 unmerged index。当前定向回归为契约 **41/41**、队列 **39/39**、观察器 **12/12**，完整一副集成回归通过；本轮未重跑 `-FullData`、远端 CI 或发布晋级验证。
 - 独立复算：直接读取 43,653,388 字节 legacy v2 checkpoint，确认 2,080 局 / 1,040 镜像组 / 80 区组、无重复/缺失/失败，效用 `+0.028/局`、区组 bootstrap 95% CI `[+0.005,+0.051]`；6,677 个搜索代理回合 P95/P99 `619/1022ms`，1–60 为 `421.8/550ms`，61–80 为 `942/1481ms`。报告/checkpoint SHA-256 分别为 `3b4ebd543d56af0d9c860eef1c07d5fc294b3817a7da006612f3b0e04161762a` / `1a8ed1de8a4a67d6b474bd0bbf1a16f38cebcbff2f1294edd12c91aa26f9a887`。
 - 未通过/未完成：真实 M2 所需 checkpoint、raw telemetry、正式性能回执和盲评工件均不存在；严格旧价值模型发布校验按预期退出 1。STRAT-1～4 尚未冻结、未跑正式镜像赛，expert 默认和现有性能停止线保持不变。
 - 代码审计边界：EVID-1～9b、SEC-1～3、UI-0、VERIFY-1、ALGO-2 和 STRAT-1/2/3/4 的本地回归通过；EVID-9b 冻结提交远端 CI 已完成。STRAT-1～4 仅形成可复算代码门，正式 expert 仍关闭候选；`node tools/test_strategy_counterexamples.mjs` 为 **24/24**，`node js/ai.test.js` 为 **363/363**，`node js/ai.hybrid.test.js` 为 **81/81**。预算遥测语义缺口仍待 TEL-1；ALGO-2 仅为首出保护和异常回退代码门，不构成性能/强度/晋级证据。GC 仅能证明基本计数关系，不能把没有原始 GC duration 的汇总宣称为完整可复算。DMC-0 已关闭格式/畸形输入假绿路径，仍不构成 Python 独立规则环境或训练准入。
 
-## P1-A：实时复盘智能体桥与真人训练候选（新增，当前未满足）
+## P1-A：实时复盘智能体桥与真人训练候选（RT-1/RT-2 代码门完成；RT-3～6 未满足）
 
-- [ ] **RT-1：冻结三层数据契约。** 定义 `guandan-live-public-event-v1`、`guandan-sealed-training-turn-v1`、`guandan-agent-annotation-v1`；都绑定唯一 match/round/trick/turn、`eventId`、单调 `sequence`、时间、规则版本、实现 SHA 和前序事件摘要。公开事件只含已公开动作/牌张、余牌数、贡还、引擎与脱敏决策元数据；密封 turn 才含行动座位自己的手牌、当时公开 observation、完整合法候选和唯一 chosen；annotation 只引用事件 ID，不复制或修改源数据。
-- [ ] **RT-2：在真实动作提交边界发事件。** 在 `applyPlay` / `applyPass` 成功后以及 `trick_end / round_end` 接入独立 `setReplayEventObserver`，不复用可能重复触发的 UI `setUpdateCallback`。浏览器先写有界本地待发队列，再异步提交；失败重试不得阻断牌局，相同 `eventId` 重发必须幂等，并能检测 sequence 缺口。覆盖真人、三个 AI、贡还、接风、双上提前结束和打 A 终局。
+- [x] **RT-1：冻结三层数据契约。** `js/replay-contracts.js` 定义并校验 `guandan-live-public-event-v1`、`guandan-sealed-training-turn-v1`、`guandan-agent-annotation-v1`；三类对象绑定 match/round/trick/turn、`eventId`、单调 `sequence`、时间、规则版本、实现 SHA 和前序事件摘要。公开事件与密封 turn 使用不同白名单，公开决策元数据只允许受控 token，未知值归一为 `unknown`，annotation 只引用源事件；公开事件实现摘要绑定完整的契约序列化依赖清单；`node js/replay-contracts.test.js` 为 **41/41**。
+- [x] **RT-2：在真实动作提交边界发事件。** `js/game.js` 在 `applyPlay` / `applyPass` 状态写入成功后发出独立公开事件，并在 `trick_end / round_end` 边界补齐链；公开牌按白名单构造，不暴露实体牌 ID 或副本索引，结束事件拒绝动作载荷，完整链首事件强制从 `sequence=0` 开始。`js/ui.js` 只把事件先写入有界本机队列，`js/replay-event-queue.js` 默认关闭网络提交，异步失败重试、重复 `eventId` 幂等、sequence 缺口、HTTP 业务拒绝/错配/无身份回执、持久化失败、无可用持久化存储和刷新后保留的溢出/一般完整性缺口锁存均 fail closed，不阻断牌局。覆盖真人、三个 AI、贡还、接风、双上提前结束和打 A 终局；`node js/replay-event-queue.test.js` **39/39**、`node js/replay-observer.test.js` **12/12**，完整一副集成回归通过。
 - [ ] **RT-3：实现 opt-in 本机采集与游标读取。** `lan_server.py` 增加 `POST /api/replay/events` 与 `GET /api/replay/events?afterSequence=...&limit=...`（可带短长轮询）；默认关闭，只绑定 `127.0.0.1`。浏览器写入受同源、schema、请求体和速率限制；智能体读取要求短期 capability token。事件以原子追加 NDJSON 写入 `LOCALAPPDATA/GuandanTrainer/replays/`，配置保留期/轮转/最大空间，禁止进入仓库或 WPSDrive；磁盘满时降级并在 UI 明示缺口。
 - [ ] **RT-4：提供智能体只读消费与独立注释。** 新增 CLI（后续可包装为 MCP resource）按 cursor 持续读取、恢复和校验事件链，输出每手/每圈/每副复盘；分析结果写入独立 annotation 存储并记录模型、提示版本、时间和源事件摘要。禁止智能体修改源事件、当前牌局状态或直接把建议写成训练标签。
 - [ ] **RT-5：副末生成密封训练候选。** 对每个行动 turn 保存“行动座位手牌 + 当时公开观察 + 全部合法候选 + 实际动作”，副末再连接真实名次/团队收益；不向实时读 API 暴露密封内容。转换器逐条重放规则、牌张守恒、座位轮转、牌型声明、候选归属和唯一 chosen，去重后按完整 match 切分 train/validation/held-out；未人工批准前固定 `trainingEligible=false`，不为未选择动作伪造反事实标签。
@@ -57,6 +57,7 @@
 
 - [x] 每手出牌/过牌已经写入内存 `trickLog`，含圈号、座位、公开牌张、余牌数、评价和决策元数据；副末复盘保存后，最近 100 副可从浏览器手工导出。
 - [x] `tools/replay_ai_audit.mjs` 能对手工导出文件做事后、公开信息边界内的逐手反事实审计。
+- [x] RT-2 已把真实动作提交后的公开事件交给独立观察器，并由 `guandan_replay_pending_v1` 有界保存在本机；队列保持默认关闭，只有后续 RT-3 opt-in 采集端点完成后才启用网络提交。
 - [ ] 当前没有复盘 POST/GET、cursor/订阅、智能体 token 或 annotation 存储；副末 localStorage 不是实时接口。
 - [ ] 进行中存档包含四家 `hands` 与 `roundInitialHands`，明确不得作为实时智能体数据源；现有导出也不是训练 schema。
 
@@ -120,4 +121,4 @@
 - availability-aware UCT 已改为 `log(availability + 1) / visits`；旧错误实现报告全部退出正式证据集。
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
-- 默认验证在 0831 审核时为 31 项通过；本轮当前工作树统一入口为 **39 checks**、`-FullData` **45 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零。SEC-1～3 与 EVID-9b 冻结提交的远端 CI 均已完成；STRAT 改动尚未冻结，严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+- 默认验证在 0831 审核时为 31 项通过；0901 前序工作树的默认统一验证曾为 **39 checks**、`-FullData` 曾为 **45 checks**，均为历史记录。本轮 0902 当前工作树统一入口在 `node tools/test_ai_ab_simulation.mjs` 因目标外既有删除而以 `MODULE_NOT_FOUND`、退出 **1** 停止；本轮未运行 `-FullData`，`git ls-files -u` 与工作区/staged 差异检查均为零。SEC-1～3 与 EVID-9b 冻结提交的远端 CI 均已完成；STRAT 改动尚未冻结，严格价值模型发布校验当前按预期返回 1，专家默认未改变。

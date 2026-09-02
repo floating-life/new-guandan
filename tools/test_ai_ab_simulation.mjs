@@ -305,7 +305,7 @@ assert.equal(evaluationImplementation?.schema, 'guandan-evaluation-implementatio
 const receiptSources = (evaluationImplementation?.sources || []).map((source) => source.file).sort();
 assert.deepEqual(receiptSources, collectEvaluationRuntimeClosure(runner),
   '评测回执源码清单必须精确覆盖 runner、game.js 及其 Worker/评价/存储闭包');
-assert.equal(receiptSources.length, 20, '当前评测依赖闭包必须包含运行环境遥测模块在内的 20 个源码文件');
+assert.equal(receiptSources.length, 21, '当前评测依赖闭包必须包含运行环境遥测与实时复盘契约在内的 21 个源码文件');
 for (const source of evaluationImplementation.sources) {
   assert.match(source.sha256, /^[a-f0-9]{64}$/,
     `评测依赖必须记录有效 SHA-256：${source.file}`);
@@ -556,7 +556,7 @@ try {
   assert.equal(compatibleResume.status, 0,
     `同字节的完整依赖闭包必须可以恢复：${String(compatibleResume.stderr || compatibleResume.stdout).slice(-1200)}`);
   for (const relativeFile of [
-    'ai.worker-client.js', 'ai.worker.js', 'evaluator.js', 'llm.js', 'stats.js',
+    'ai.worker-client.js', 'ai.worker.js', 'evaluator.js', 'llm.js', 'replay-contracts.js', 'stats.js',
   ]) {
     const dependency = path.join(fixtureJs, relativeFile);
     const originalSource = fs.readFileSync(dependency, 'utf8');

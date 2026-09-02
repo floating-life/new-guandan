@@ -113,6 +113,7 @@ const EVALUATION_IMPLEMENTATION_SOURCES = Object.freeze([
   'llm.js',
   'model-fingerprint.js',
   'opponent-model.js',
+  'replay-contracts.js',
   'rules.js',
   'stats.js',
   'strategy-core.js',

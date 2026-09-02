@@ -2,13 +2,15 @@
 import {
   createMatch, startMatch, humanPlay, humanPass, humanSelectSet,
   humanPickReturnCard, humanConfirmReturn, getLegalHints, getReturnCandidates,
-  setUpdateCallback, PHASE,
+  setUpdateCallback, setReplayEventObserver, PHASE,
 } from './game.js';
+import { validateLiveEventChain } from './replay-contracts.js';
 
 const state = createMatch({ difficulty: 'easy', aiSpeed: 'fast', coachMode: false });
 let pumping = false;
 let finished = false;
 let failure = null;
+const replayEvents = [];
 
 function schedulePump() {
   if (pumping || finished) return;
@@ -77,7 +79,22 @@ function finish() {
     assert(replay.llmReport && Number.isFinite(replay.llmReport.cloudCalls)
       && Number.isFinite(replay.llmReport.successes), '复盘保存云端 API 调用报告');
     assert(replay.localAiEngine === 'expert', '复盘保存本副使用的本地决策引擎');
+    const actionEvents = replayEvents.filter((event) => ['play', 'pass'].includes(event.eventType));
+    assert(new Set(actionEvents.map((event) => event.seat)).size === 4,
+      '真实一副牌的真人与三个AI均从动作提交边界发出公开事件');
+    const chain = validateLiveEventChain(replayEvents);
+    assert(chain.ok && state.replayEventFailures === 0,
+      `真实事件流 sequence、eventId 与前序摘要链连续且无构造失败${chain.ok && state.replayEventFailures === 0 ? '' : `：${chain.errors.slice(0, 3).join('|')}；序号 ${replayEvents.map((event) => event.sequence).join(',')}；构造失败 ${state.replayEventFailures}（${state.replayLastEventError || '无'}）`}`);
+    assert(replayEvents.some((event) => event.eventType === 'trick_end')
+      && replayEvents.filter((event) => event.eventType === 'round_end').length === 1,
+    '真实事件流覆盖 trick_end 与 round_end，且副末只发一次 round_end');
+    assert(replayEvents.every((event) => !('hands' in event)
+      && !('initialHands' in event) && !('remainingHands' in event)
+      && event.cards.every((card) => !('id' in card) && !('deckIndex' in card))
+      && event.tribute.every((item) => !('id' in item.card) && !('deckIndex' in item.card))),
+    '真实公开事件不包含四家暗牌、终局手牌或实体牌 ID/副本索引');
     console.log(`\n结果: 完整一副 ${replay.trickLog.length} 手，回归通过`);
+    setReplayEventObserver(null);
     process.exit(0);
   } catch (error) {
     console.error('  ✗', error.message);
@@ -91,5 +108,6 @@ const timeout = setTimeout(() => {
 }, 45000);
 
 setUpdateCallback(schedulePump);
+setReplayEventObserver((event) => replayEvents.push(event));
 startMatch(state);
 schedulePump();

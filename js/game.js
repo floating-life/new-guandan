@@ -20,6 +20,14 @@ import { requestAIDecision } from './ai.worker-client.js';
 import { createPublicAIObservation } from './ai-observation.js';
 import { requestLLMDecision, LLM_POLICY_MODE } from './llm.js';
 import { evaluatePlay, summarizeSession, analyzeHandStructure } from './evaluator.js';
+import { sha256Hex } from './model-fingerprint.js';
+import {
+  createLivePublicEvent,
+  PUBLIC_REPLAY_DECISION_SOURCES,
+  PUBLIC_REPLAY_FALLBACK_KINDS,
+  REPLAY_RULE_VERSION,
+  REPLAY_CONTRACT_IMPLEMENTATION_SHA256,
+} from './replay-contracts.js';
 import {
   loadSettings, saveSettings, recordRoundResult, saveReplay, loadStats, avgScore,
   unassistedAvgScore, saveActiveMatch, loadActiveMatch, clearActiveMatch,
@@ -39,6 +47,11 @@ export const PHASE = {
 
 const SEAT_NAMES = ['你', '下家', '对家', '上家'];
 const TEAM_OF = [0, 1, 0, 1]; // seat -> team
+
+function createReplayMatchId() {
+  if (globalThis.crypto?.randomUUID) return `match_${globalThis.crypto.randomUUID()}`;
+  return `match_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
 
 const AI_SPEED_MS = {
   slow: [900, 700],
@@ -321,6 +334,16 @@ export function createMatch(preserveSettings = null) {
     lastRoundResult: null,
     prevFinishOrder: null,
     prevHeadTeam: null,
+    matchId: createReplayMatchId(),
+    replaySequence: 0,
+    replayTurn: 0,
+    replayPreviousEventSha256: null,
+    replayClosedTrick: null,
+    replayRoundEndEmitted: false,
+    replayPendingTribute: [],
+    replayEventFailures: 0,
+    replayLastEventError: null,
+    replayObserverErrors: 0,
     trickLog: [],
     round: 0,
     winner: null,
@@ -450,6 +473,10 @@ export function startRound(state) {
   state.trickLog = [];
   state.trickNumber = 1;
   state.currentTrickStartIndex = 0;
+  state.replayTurn = 0;
+  state.replayClosedTrick = null;
+  state.replayRoundEndEmitted = false;
+  state.replayPendingTribute = [];
   state.reported = [false, false, false, false];
   state.selectedIds = new Set();
   state.selectedDeclaration = null;
@@ -535,6 +562,7 @@ function setupTribute(state) {
     state.currentSeat = head;
     state.phase = PHASE.PLAYING;
     state.tributeState = null;
+    state.replayPendingTribute = [];
     captureRoundStart(state);
     pushMsg(state, `${seatName(head)}（头游）先出牌`);
     maybeAutoPlay(state);
@@ -687,6 +715,14 @@ function finishTribute(state) {
   }
   state.currentSeat = state.firstPlayer;
   state.phase = PHASE.PLAYING;
+  state.replayPendingTribute = [
+    ...(ts.tributes || []).map((item) => ({
+      kind: 'tribute', from: item.from, to: item.to, card: item.card,
+    })),
+    ...(ts.returns || []).map((item) => ({
+      kind: 'return', from: item.from, to: item.to, card: item.card,
+    })),
+  ];
   captureRoundStart(state);
   pushMsg(state, `还贡完成，${seatName(state.currentSeat)} 先出牌`);
   maybeAutoPlay(state);
@@ -977,6 +1013,7 @@ function applyPlay(state, seat, cards, hand, evaluation = null, decisionMeta = n
     pushMsg(state, `🏆 ${seatName(seat)} → ${place}`);
   }
   if (seat === 0) state.handTips = analyzeHandStructure(state.hands[0], state.currentLevel);
+  emitReplayAction(state, state.trickLog[state.trickLog.length - 1]);
 }
 
 function applyPass(state, seat, evaluation = null, decisionMeta = null) {
@@ -993,6 +1030,7 @@ function applyPass(state, seat, evaluation = null, decisionMeta = null) {
     text: `${seatName(seat)} 过`,
   });
   pushMsg(state, `${seatName(seat)} 过`);
+  emitReplayAction(state, state.trickLog[state.trickLog.length - 1]);
 }
 
 // 座位视觉：南0 → 东1 → 北2 → 西3。
@@ -1072,6 +1110,7 @@ function advanceAfterPass(state) {
     ? active - (windPartner == null ? 0 : 1)
     : Math.max(active - 1, 0);
   if (state.passCount >= needPass && state.lastSeat != null) {
+    closeReplayTrick(state);
     // 新一轮领出
     let leader = state.lastSeat;
     // 借风：若领出者已出完，由对家接风
@@ -1109,6 +1148,7 @@ function advanceAfterPass(state) {
 let _aiTimer = null;
 let _onUpdate = null;
 let _aiDecisionObserver = null;
+let _replayEventObserver = null;
 
 function cloneCard(card) {
   return card ? {
@@ -1184,6 +1224,161 @@ export function setUpdateCallback(fn) {
 export function setAIDecisionObserver(fn) {
   _aiDecisionObserver = typeof fn === 'function' ? fn : null;
 }
+
+/**
+ * 真实牌局复盘事件钩子。它与 UI 更新回调完全分离，且只接收 RT-1
+ * 白名单公开事件；观察器异常只能记录为缺口，不能阻断出牌状态机。
+ */
+export function setReplayEventObserver(fn) {
+  _replayEventObserver = typeof fn === 'function' ? fn : null;
+}
+
+function replayEngine(state, item) {
+  if (item?.seat == null) return null;
+  if (item.seat === 0) return { name: 'human', version: 'browser-v1' };
+  const name = state.settings?.aiDecisionEngineBySeat?.[item.seat]
+    || state.settings?.localAiEngine
+    || 'expert';
+  return { name: String(name), version: 'game-js-v1' };
+}
+
+function replayPublicToken(value, allowed) {
+  const token = String(value);
+  return allowed.includes(token) ? token : 'unknown';
+}
+
+function replayDecisionMeta(item) {
+  if (!item) return null;
+  const source = item.seat === 0
+    ? 'human'
+    : item.decisionMeta?.localDecision?.source || 'local';
+  const input = item.decisionMeta || {};
+  const localDecision = input.localDecision || {};
+  const result = { source: replayPublicToken(source, PUBLIC_REPLAY_DECISION_SOURCES) };
+  if (input.fallbackKind != null && String(input.fallbackKind).length) {
+    result.fallbackKind = replayPublicToken(input.fallbackKind, PUBLIC_REPLAY_FALLBACK_KINDS);
+  }
+  for (const key of ['searchAttempted', 'searchTriggered']) {
+    if (typeof input[key] === 'boolean') result[key] = input[key];
+  }
+  for (const key of ['budgetMs', 'latencyMs']) {
+    if (Number.isFinite(Number(localDecision[key])) && Number(localDecision[key]) >= 0) {
+      result[key] = Number(localDecision[key]);
+    }
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function deepFreezeReplay(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const item of Object.values(value)) deepFreezeReplay(item);
+  return value;
+}
+
+function emitReplayEvent(state, eventType, item = null) {
+  if (typeof _replayEventObserver !== 'function') return null;
+  const sequence = Number.isSafeInteger(state.replaySequence) ? state.replaySequence : 0;
+  const turn = (Number.isSafeInteger(state.replayTurn) ? state.replayTurn : 0) + 1;
+  const tribute = eventType === 'play' || eventType === 'pass'
+    ? (state.replayPendingTribute || [])
+    : [];
+  const input = {
+    matchId: state.matchId,
+    round: state.round,
+    trick: state.trickNumber,
+    // turn is the ordinal of the emitted public event within this round;
+    // boundary events therefore cannot collide with action turns.
+    turn,
+    eventId: `${state.matchId}:event:${sequence}`,
+    sequence,
+    occurredAt: new Date().toISOString(),
+    ruleVersion: REPLAY_RULE_VERSION,
+    implementationSha256: REPLAY_IMPLEMENTATION_SHA256,
+    previousEventSha256: state.replayPreviousEventSha256 || null,
+    eventType,
+    seat: item?.seat ?? null,
+    action: item?.action || null,
+    cards: item?.cards || [],
+    hand: item?.hand || null,
+    countsBefore: item?.countsBefore || state.handCounts.slice(),
+    countsAfter: item?.countsAfter || state.handCounts.slice(),
+    tribute,
+    engine: replayEngine(state, item),
+    decisionMeta: replayDecisionMeta(item),
+  };
+  let event;
+  try {
+    event = deepFreezeReplay(createLivePublicEvent(input));
+  } catch (error) {
+    // A malformed state must leave an observable sequence gap rather than
+    // silently resetting the next event to the same sequence number.
+    state.replayEventFailures = (Number(state.replayEventFailures) || 0) + 1;
+    state.replayLastEventError = String(error?.message || error || '复盘事件构造失败').slice(0, 240);
+    state.replaySequence = sequence + 1;
+    state.replayTurn = turn;
+    return null;
+  }
+
+  state.replaySequence = sequence + 1;
+  state.replayTurn = turn;
+  state.replayPreviousEventSha256 = event.eventSha256;
+  if (tribute.length) state.replayPendingTribute = [];
+  try {
+    _replayEventObserver(event);
+  } catch {
+    state.replayObserverErrors = (Number(state.replayObserverErrors) || 0) + 1;
+  }
+  return event;
+}
+
+function emitReplayAction(state, item) {
+  emitReplayEvent(state, item?.action || 'play', item);
+}
+
+function closeReplayTrick(state) {
+  if (state.replayClosedTrick === state.trickNumber) return null;
+  const event = emitReplayEvent(state, 'trick_end');
+  state.replayClosedTrick = state.trickNumber;
+  return event;
+}
+
+function emitReplayRoundEnd(state) {
+  return emitReplayEvent(state, 'round_end');
+}
+
+// Browser modules cannot synchronously read their own source files. Fingerprint
+// the actual boundary functions and the contract module's complete explicit
+// serialization manifest instead of hashing a fixed label.
+const REPLAY_IMPLEMENTATION_FUNCTIONS = Object.freeze([
+  ['createReplayMatchId', createReplayMatchId],
+  ['startRound', startRound],
+  ['setupTribute', setupTribute],
+  ['finishTribute', finishTribute],
+  ['applyPlay', applyPlay],
+  ['applyPass', applyPass],
+  ['finishRoundIfDecided', finishRoundIfDecided],
+  ['advanceAfterPlay', advanceAfterPlay],
+  ['advanceAfterPass', advanceAfterPass],
+  ['setReplayEventObserver', setReplayEventObserver],
+  ['replayEngine', replayEngine],
+  ['replayPublicToken', replayPublicToken],
+  ['replayDecisionMeta', replayDecisionMeta],
+  ['emitReplayEvent', emitReplayEvent],
+  ['closeReplayTrick', closeReplayTrick],
+  ['emitReplayRoundEnd', emitReplayRoundEnd],
+  ['endRound', endRound],
+  ['createLivePublicEvent', createLivePublicEvent],
+  ['replayContractImplementation', REPLAY_CONTRACT_IMPLEMENTATION_SHA256],
+]);
+
+export const REPLAY_IMPLEMENTATION_SHA256 = sha256Hex([
+  'guandan-replay-observer-runtime-v2',
+  `ruleVersion=${REPLAY_RULE_VERSION}`,
+  ...REPLAY_IMPLEMENTATION_FUNCTIONS.map(([name, value]) => (
+    `${name}\n${typeof value === 'function' ? value.toString() : String(value)}`
+  )),
+].join('\n'));
 
 function observeAIDecision(state, context, decision) {
   if (!_aiDecisionObserver) return;
@@ -1967,7 +2162,10 @@ function summarySnapshot(summary) {
 }
 
 function endRound(state) {
+  if (state.replayRoundEndEmitted) return;
+  state.replayRoundEndEmitted = true;
   state.phase = PHASE.ROUND_END;
+  closeReplayTrick(state);
   const fo = state.finishOrder;
   const head = fo[0];
   const winTeam = teamOf(head);
@@ -2115,6 +2313,8 @@ function endRound(state) {
     opponentModelMode: state.settings?.opponentModelMode || 'adaptive',
   });
   state.opponentModel = updatedStats.opponentModel;
+
+  emitReplayRoundEnd(state);
 
   notify(state);
 }

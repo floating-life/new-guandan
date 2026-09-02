@@ -5,6 +5,7 @@
 import {
   createMatch, startMatch, nextRound, humanPlay, humanPass, humanSelectToggle,
   humanClearSelect, humanPickReturnCard, humanConfirmReturn, setUpdateCallback,
+  setReplayEventObserver,
   getLegalHints, getHandAnalysis, getReturnCandidates, PHASE, seatName,
   applySettings, refreshCoach, getSkillStats, humanSelectSet, humanSelectAllOfRank,
   humanSelectRankCycle, getSelectedCards, getCombosFromSelection, restoreMatch,
@@ -28,9 +29,13 @@ import { persistThenActivateValueModel } from './value-model-persistence.js';
 import {
   checkLLMHealth, getLLMHealth, getLLMConfig, updateLLMConfig, LLM_POLICY_MODE,
 } from './llm.js';
+import { createReplayEventQueue } from './replay-event-queue.js';
 
 const restoredState = restoreMatch();
 const state = restoredState || createMatch();
+// RT-2 先把公开事件可靠地落入有界本机队列；RT-3 的用户显式启用后，
+// 再调用 queue.setEnabled(true) 让同一队列异步提交到本机采集端点。
+const replayEventQueue = createReplayEventQueue({ enabled: false });
 const $ = (sel) => document.querySelector(sel);
 let llmHealth = getLLMHealth();
 let llmHealthEpoch = 0;
@@ -1611,6 +1616,10 @@ function setupChrome() {
     }
   });
 }
+
+setReplayEventObserver((event) => {
+  replayEventQueue.enqueue(event);
+});
 
 setUpdateCallback(() => {
   render();
