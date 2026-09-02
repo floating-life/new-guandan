@@ -35,6 +35,9 @@ export const SEALED_STATE_KEYS = Object.freeze([
   'sealedTrainingLastError',
   'sealedPreviousTurnSha256',
   'sealedSequence',
+  // 捕获开关也随存档剥离：恢复的浏览器对局永远回到默认开启，无头评测进程
+  // 在每局 createMatch 后显式关闭，与存档/实时读 API 无关。
+  'sealedTrainingCapture',
 ]);
 
 const SHA256 = /^[a-f0-9]{64}$/;

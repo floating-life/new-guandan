@@ -42,6 +42,9 @@ assert(ui.includes('replaySubmitPaused') && ui.includes('clearPending')
   && ui.includes('readerConnected') && ui.includes('lastSequence')
   && ui.includes('retentionSeconds'),
   '采集面板展示最后序号、保留期和智能体连接，暂停不会被状态刷新覆盖');
+assert(ui.includes('brokenMatchIds') && ui.includes('result.deferred')
+  && ui.includes('下一副新对局会自动恢复'),
+  '清空待发对链破坏给出明确警告，进行中提交时推迟清空而非竞争回执');
 assert(ui.includes('混合搜索') && ui.includes('个可能牌面') && ui.includes('个模拟节点'),
   '逐手复盘展示混合层是否改选、采样数和模拟节点数');
 assert(ui.includes('成对根 PIMC') && ui.includes('次成对 rollout'),

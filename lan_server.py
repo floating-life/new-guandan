@@ -46,6 +46,9 @@ REPLAY_DEFAULT_TOKEN_TTL_SECONDS = 15 * 60
 REPLAY_MAX_WAIT_MS = 5000
 REPLAY_RATE_LIMIT = 240
 REPLAY_RATE_WINDOW_SECONDS = 60
+REPLAY_COLLECTOR_STATE_SCHEMA = "guandan-replay-collector-state-v1"
+REPLAY_COLLECTOR_STATE_FILE = "collector-state.json"
+REPLAY_MAX_CHAIN_FLOORS = 256
 _ENV_LLM_API_URL = os.environ.get("GUANDAN_LLM_API_URL", "").strip()
 _ENV_LLM_API_KEY = os.environ.get("GUANDAN_LLM_API_KEY", "").strip()
 _ENV_LLM_MODEL = os.environ.get("GUANDAN_LLM_MODEL", "").strip()
@@ -1169,8 +1172,59 @@ class ReplayEventStore:
         self._last_error = None
         self._reader_last_at = None
         self._reader_last_sequence = None
+        self._chain_floors = self._load_chain_floors()
         if enabled:
             self.enable(capability_token, token_ttl_seconds)
+
+    def _load_chain_floors(self) -> dict:
+        """读取保留期/容量清理留下的链楼层台账；损坏或不合规时按无楼层 fail closed。"""
+        path = self.root / REPLAY_COLLECTOR_STATE_FILE
+        try:
+            if not path.exists() or path.is_symlink() or not path.is_file():
+                return {}
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict) or payload.get("schema") != REPLAY_COLLECTOR_STATE_SCHEMA:
+            return {}
+        floors = payload.get("floors")
+        if not isinstance(floors, dict):
+            return {}
+        cleaned = {}
+        for match_id, floor in floors.items():
+            if (
+                isinstance(match_id, str) and 1 <= len(match_id) <= 120
+                and isinstance(floor, dict) and set(floor) == {"sequence", "previousEventSha256"}
+                and isinstance(floor["sequence"], int) and not isinstance(floor["sequence"], bool)
+                and 0 <= floor["sequence"] <= 1_000_000
+                and isinstance(floor["previousEventSha256"], str)
+                and _REPLAY_SHA256.fullmatch(floor["previousEventSha256"])
+            ):
+                cleaned[match_id] = {
+                    "sequence": floor["sequence"],
+                    "previousEventSha256": floor["previousEventSha256"],
+                }
+                if len(cleaned) >= REPLAY_MAX_CHAIN_FLOORS:
+                    break
+        return cleaned
+
+    def _store_chain_floors_locked(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"schema": REPLAY_COLLECTOR_STATE_SCHEMA, "floors": self._chain_floors},
+            ensure_ascii=False, sort_keys=True,
+        ).encode("utf-8")
+        target = self.root / REPLAY_COLLECTOR_STATE_FILE
+        temporary = self.root / f".{REPLAY_COLLECTOR_STATE_FILE}.{os.getpid()}.tmp"
+        descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("复盘采集链楼层台账未完整写入")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, target)
 
     @property
     def capability_token(self) -> str:
@@ -1207,8 +1261,10 @@ class ReplayEventStore:
                     last_sequence = records[-1]["sequence"]
                     last_match_id = records[-1]["matchId"]
             except ReplayStoreError as exc:
-                self._gap = True
                 self._last_error = str(exc)
+                # 瞬时 I/O 故障不锁存；结构性损坏才锁存缺口。
+                if exc.code != "storage_unavailable":
+                    self._gap = True
             reader_age = None if self._reader_last_at is None else time.time() - self._reader_last_at
             return {
                 "enabled": self._enabled,
@@ -1262,7 +1318,7 @@ class ReplayEventStore:
         except OSError as exc:
             raise ReplayStoreError("storage_unavailable", f"无法读取复盘采集目录：{exc}") from exc
 
-    def _scan_locked(self) -> list[dict]:
+    def _read_records_locked(self) -> list[dict]:
         records = []
         try:
             for file in self._files_locked():
@@ -1280,15 +1336,28 @@ class ReplayEventStore:
             raise
         except OSError as exc:
             raise ReplayStoreError("storage_unavailable", f"无法读取复盘事件：{exc}") from exc
+        return records
+
+    def _scan_locked(self) -> list[dict]:
+        records = self._read_records_locked()
         grouped: dict[str, list[dict]] = {}
         for event in records:
             grouped.setdefault(event["matchId"], []).append(event)
-        for match_records in grouped.values():
+        for match_id, match_records in grouped.items():
             ordered = sorted(match_records, key=lambda item: item["sequence"])
             previous = None
+            floor = self._chain_floors.get(match_id)
             for event in ordered:
                 if previous is None:
-                    broken = event["sequence"] != 0 or event["previousEventSha256"] is not None
+                    if floor is not None:
+                        # 保留期/容量清理有意删除前段后，首条留存事件必须精确落在
+                        # 台账记录的链楼层上；未登记的外部删除仍然视为链缺口。
+                        broken = (
+                            event["sequence"] != floor["sequence"]
+                            or event["previousEventSha256"] != floor["previousEventSha256"]
+                        )
+                    else:
+                        broken = event["sequence"] != 0 or event["previousEventSha256"] is not None
                 else:
                     broken = (
                         event["sequence"] != previous["sequence"] + 1
@@ -1301,6 +1370,25 @@ class ReplayEventStore:
                     break
                 previous = event
         return records
+
+    def _record_chain_floors_locked(self) -> None:
+        """有意的保留期/容量清理之后，为不再从 sequence=0 开始的留存链记录链楼层。"""
+        records = self._read_records_locked()
+        grouped: dict[str, list[dict]] = {}
+        for event in records:
+            grouped.setdefault(event["matchId"], []).append(event)
+        floors = {}
+        for match_id, match_records in grouped.items():
+            head = min(match_records, key=lambda item: item["sequence"])
+            if head["sequence"] != 0 or head["previousEventSha256"] is not None:
+                floors[match_id] = {
+                    "sequence": head["sequence"],
+                    "previousEventSha256": head["previousEventSha256"],
+                }
+        if len(floors) > REPLAY_MAX_CHAIN_FLOORS:
+            raise ReplayStoreError("storage_corrupt", "复盘链楼层数量超过安全上限")
+        self._chain_floors = floors
+        self._store_chain_floors_locked()
 
     def _prune_locked(self, needed_bytes: int = 0) -> bool:
         now = time.time()
@@ -1329,13 +1417,14 @@ class ReplayEventStore:
                 capacity_pruned = True
             except OSError as exc:
                 raise ReplayStoreError("storage_unavailable", f"无法释放复盘空间：{exc}") from exc
-        if pruned_committed:
-            self._gap = True
-            self._last_error = "复盘保留期或容量清理删除了已提交事件，已停止安全消费"
-            raise ReplayStoreError("storage_corrupt", self._last_error)
-        if total + needed_bytes > self.max_bytes:
+        if capacity_pruned and total + needed_bytes > self.max_bytes:
+            # 删完仍超容量：已删除文件的链楼层不会登记，后续扫描按结构损坏锁存。
             raise ReplayStoreError("storage_full", "复盘采集空间已满")
-        return capacity_pruned
+        if not capacity_pruned and total + needed_bytes > self.max_bytes:
+            raise ReplayStoreError("storage_full", "复盘采集空间已满")
+        # 返回是否删除了非空已提交文件；链楼层由 append 在新事件落盘后记录，
+        # 因为清理时留存链的新头（即待写入事件）尚未存在。
+        return pruned_committed
 
     def _target_file_locked(self, line_bytes: int) -> Path:
         today = time.strftime("%Y%m%d", time.localtime())
@@ -1375,14 +1464,7 @@ class ReplayEventStore:
                 elif event["sequence"] != previous["sequence"] + 1 or event["previousEventSha256"] != previous["eventSha256"]:
                     raise ReplayStoreError("event_chain_gap", "复盘事件 sequence 或前序摘要不连续")
                 self.root.mkdir(parents=True, exist_ok=True)
-                capacity_pruned = self._prune_locked(len(line))
-                if capacity_pruned:
-                    self._gap = True
-                    self._last_error = "容量清理删除了既有复盘分片，已停止安全采集"
-                    raise ReplayStoreError("storage_corrupt", self._last_error)
-                self._scan_locked()
-                if self._gap:
-                    raise ReplayStoreError("storage_corrupt", "容量或保留期清理造成复盘事件链缺口，采集已停止")
+                pruned_committed = self._prune_locked(len(line))
                 target = self._target_file_locked(len(line))
                 original_size = target.stat().st_size if target.exists() else 0
                 descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -1398,17 +1480,26 @@ class ReplayEventStore:
                         raise
                 finally:
                     os.close(descriptor)
+                if pruned_committed:
+                    # 有意的保留期/容量清理之后，新事件已落盘成为留存链的新头，
+                    # 此刻才能把链楼层登记到它的序号与前序摘要上。
+                    self._record_chain_floors_locked()
+                self._scan_locked()
+                if self._gap:
+                    raise ReplayStoreError("storage_corrupt", "容量或保留期清理造成复盘事件链缺口，采集已停止")
                 self._last_error = None
                 self._condition.notify_all()
                 return {"ok": True, "duplicate": False, "eventId": event["eventId"], "eventSha256": event["eventSha256"]}
             except ReplayStoreError as exc:
-                self._gap = True if exc.code in {"storage_full", "storage_unavailable", "storage_corrupt"} else self._gap
+                # 瞬时 I/O 故障（storage_unavailable）只让本次操作失败并记录 lastError，
+                # 下次操作重试扫描；结构性损坏（storage_corrupt/storage_full）才锁存缺口。
+                self._gap = True if exc.code in {"storage_full", "storage_corrupt"} else self._gap
                 self._last_error = str(exc)
                 raise
             except OSError as exc:
-                self._gap = True
+                # 写入失败已按原始大小回滚；是否损坏由下一次扫描裁决，不提前锁存。
                 self._last_error = str(exc)
-                raise ReplayStoreError("storage_unavailable", "复盘事件写入失败，已标记采集缺口") from exc
+                raise ReplayStoreError("storage_unavailable", "复盘事件写入失败，已回滚本次写入") from exc
 
     def read(self, after_sequence: int = -1, limit: int = 100, match_id: str | None = None, wait_ms: int = 0) -> dict:
         after_sequence = _replay_integer(after_sequence, "afterSequence", -1)
@@ -1422,6 +1513,12 @@ class ReplayEventStore:
                 raise ReplayStoreError("collector_disabled", "复盘采集未启用")
             while True:
                 records = self._scan_locked()
+                if self._gap:
+                    # fail-closed 读取：链缺口/结构损坏锁存后不得再返回任何记录，
+                    # 避免只按 nextSequence 翻页的读取方静默吞掉有洞的事件链。
+                    raise ReplayStoreError(
+                        "storage_corrupt", self._last_error or "复盘事件链存在缺口，读取已停止",
+                    )
                 selected_match = match_id
                 if selected_match is None and records:
                     selected_match = records[-1]["matchId"]

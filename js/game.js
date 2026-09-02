@@ -354,6 +354,11 @@ export function createMatch(preserveSettings = null) {
     sealedTrainingTurns: [],
     sealedTrainingBatch: null,
     sealedTrainingHistory: [],
+    // Headless harnesses that never consume sealed batches (e.g. A/B evaluation)
+    // pass `sealedTraining: false` in settings to skip per-action candidate
+    // enumeration and per-round replay. Browser play keeps the default true.
+    // Read from settings so the opt-out survives startMatch's Object.assign.
+    sealedTrainingCapture: settings.sealedTraining !== false,
     sealedTrainingFailures: 0,
     sealedTrainingLastError: null,
     sealedPreviousTurnSha256: null,
@@ -993,6 +998,7 @@ export function humanPass(state) {
 }
 
 function captureSealedAction(state, seat, action, cards, hand) {
+  if (state.sealedTrainingCapture === false) return null;
   try {
     return snapshotSealedAction({
       seat,
@@ -2361,9 +2367,11 @@ function endRound(state) {
   });
   state.opponentModel = updatedStats.opponentModel;
 
-  finalizeSealedTrainingBatch(state, {
-    publicImplementationSha256: REPLAY_IMPLEMENTATION_SHA256,
-  });
+  if (state.sealedTrainingCapture !== false) {
+    finalizeSealedTrainingBatch(state, {
+      publicImplementationSha256: REPLAY_IMPLEMENTATION_SHA256,
+    });
+  }
   emitReplayRoundEnd(state);
 
   notify(state);

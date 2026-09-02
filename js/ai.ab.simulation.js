@@ -949,6 +949,9 @@ async function playGame({ seed, candidateTeam, level }) {
     )),
     aiDecisionEngineBySeat: variantBySeat.map((variant) => variant.decisionEngine),
     opponentModelMode: EVALUATION_OPPONENT_MODEL_MODE,
+    // 无头评测从不消费密封批次：关闭每动作合法候选枚举与每轮末全量重放，
+    // 避免 RT-5 捕获成本污染性能测量并随轮数涨内存。浏览器对局保持默认开启。
+    sealedTraining: false,
   });
 
   return new Promise((resolve) => {

@@ -217,19 +217,22 @@ def main() -> int:
                 max_bytes=64 * 1024, rotate_bytes=64 * 1024,
             )
             previous = None
-            capacity_failed = False
             for index in range(140):
                 item = replay_event(index, previous, f"capacity-event-{index}")
                 try:
                     capacity_store.append(item)
                 except lan_server.ReplayStoreError as exc:
-                    assert exc.code == "storage_corrupt"
-                    capacity_failed = True
+                    # 唯一允许的拒绝：容量清理把整副进行中对局清空后该对局无法续写；
+                    # 有意的清理本身不再触发结构性锁存。
+                    assert exc.code == "event_chain_gap"
                     break
                 previous = item["eventSha256"]
-            assert capacity_failed and capacity_store.status()["gap"] is True
+            assert capacity_store.status()["gap"] is False
+            assert (capacity_root / "collector-state.json").exists()
+            capacity_page = capacity_store.read(-1, 1)
+            assert capacity_page["ok"] is True
             passed += 1
-            print("  [OK] 容量清理造成链缺口时锁存 gap 并停止安全采集")
+            print("  [OK] 容量清理记录链楼层后继续采集与读取，不再误锁存结构性缺口")
 
             assert lan_server._replay_number(1e-7) == "1e-7"
             assert lan_server._replay_number(1e-6) == "0.000001"
@@ -254,10 +257,12 @@ def main() -> int:
                     assert exc.code == "storage_unavailable"
             finally:
                 lan_server.os.write = original_write
-            assert short_store.status()["gap"] is True
+            assert short_store.status()["gap"] is False
+            short_store.append(short_second)
+            assert short_store.status()["gap"] is False
             assert short_store.root.joinpath(next(short_store.root.glob("events-*.ndjson")).name).read_text(encoding="utf-8").count("short-write-0") == 1
             passed += 1
-            print("  [OK] NDJSON 短写回滚半行并锁存存储缺口")
+            print("  [OK] NDJSON 短写回滚半行，瞬时写入故障不锁存结构性缺口且可恢复写入")
 
             rotated_root = Path(temporary) / "rotated"
             rotated_store = lan_server.ReplayEventStore(
@@ -387,18 +392,66 @@ def main() -> int:
                 retention_root, enabled=True, capability_token="n" * 40,
                 retention_seconds=3600,
             )
-            retention_store.append(replay_event(0, None, "retention-0"))
-            old_file = next(retention_root.glob("events-*.ndjson"))
-            os.utime(old_file, (1, 1))
+            first = replay_event(0, None, "retention-0")
+            retention_store.append(first)
+            # 把首条事件挪到旧日期分片并老化，使保留期清理只删除链的前段
+            old_segment = retention_root / "events-20000101.ndjson"
+            next(retention_root.glob("events-*.ndjson")).rename(old_segment)
+            os.utime(old_segment, (1, 1))
+            second = replay_event(1, first["eventSha256"], "retention-1")
+            retention_store.append(second)
+            assert retention_store.status()["gap"] is False
+            floors = json.loads((retention_root / "collector-state.json").read_text(encoding="utf-8"))["floors"]
+            assert floors["rt3-test-match"] == {"sequence": 1, "previousEventSha256": first["eventSha256"]}
+            retention_page = retention_store.read(0, 10, "rt3-test-match")
+            assert [item["sequence"] for item in retention_page["events"]] == [1]
+            passed += 1
+            print("  [OK] 保留期清理记录链楼层，采集与续读不再误锁存缺口")
+
+            restarted = lan_server.ReplayEventStore(
+                retention_root, enabled=True, capability_token="n" * 40,
+            )
+            assert restarted.status()["gap"] is False
+            restarted.append(replay_event(2, second["eventSha256"], "retention-2"))
+            assert restarted.status()["lastSequence"] == 2
+            passed += 1
+            print("  [OK] 进程重启后链楼层台账仍支持续写")
+
+            (retention_root / "collector-state.json").write_text("{broken", encoding="utf-8")
+            blind = lan_server.ReplayEventStore(retention_root, enabled=True, capability_token="n" * 40)
+            assert blind.status()["gap"] is True
             try:
-                with retention_store._lock:
-                    retention_store._prune_locked(16)
-                raise AssertionError("保留期清理未 fail closed")
+                blind.read(-1, 10)
+                raise AssertionError("楼层台账损坏时读取未 fail closed")
             except lan_server.ReplayStoreError as exc:
                 assert exc.code == "storage_corrupt"
-            assert retention_store.status()["gap"] is True
             passed += 1
-            print("  [OK] 保留期清理造成链缺口时 fail closed")
+            print("  [OK] 链楼层台账损坏按无楼层 fail closed")
+
+            tampered_root = Path(temporary) / "tampered"
+            tampered_store = lan_server.ReplayEventStore(
+                tampered_root, enabled=True, capability_token="t" * 40,
+            )
+            t_first = replay_event(0, None, "tampered-0")
+            tampered_store.append(t_first)
+            old_t = tampered_root / "events-20000101.ndjson"
+            next(tampered_root.glob("events-*.ndjson")).rename(old_t)
+            t_second = replay_event(1, t_first["eventSha256"], "tampered-1")
+            tampered_store.append(t_second)
+            old_t.unlink()
+            try:
+                tampered_store.append(replay_event(2, t_second["eventSha256"], "tampered-2"))
+                raise AssertionError("未登记楼层的外部删除未被发现")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            assert tampered_store.status()["gap"] is True
+            try:
+                tampered_store.read(-1, 10)
+                raise AssertionError("链缺口锁存后读取未 fail closed")
+            except lan_server.ReplayStoreError as exc:
+                assert exc.code == "storage_corrupt"
+            passed += 1
+            print("  [OK] 未登记楼层的外部删除锁存缺口，读取与写入均 fail closed")
 
             full_store = lan_server.ReplayEventStore(
                 Path(temporary) / "full", enabled=True, capability_token="f" * 40,

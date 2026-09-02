@@ -195,6 +195,7 @@ export function createReplayEventQueue({
   let enabled = initiallyEnabled === true;
   let timer = null;
   let flushing = false;
+  let clearAfterFlush = false;
   let durable = storageIsDurable;
   let integrityGap = false;
   let durabilityGap = !storageIsDurable;
@@ -442,6 +443,14 @@ export function createReplayEventQueue({
       return { ok: false, reason: 'submit_failed', sent, retryable: error?.retryable !== false };
     } finally {
       flushing = false;
+      if (clearAfterFlush) {
+        // A paused clear arrived while a submission was in flight. The in-flight
+        // event has already been acknowledged normally above; drop only the
+        // remaining pending events now that no await is outstanding.
+        clearAfterFlush = false;
+        events = [];
+        persist();
+      }
       if (retryAfter != null) scheduleFlush(retryAfter);
     }
   }
@@ -499,9 +508,26 @@ export function createReplayEventQueue({
     },
     clearPending() {
       if (enabled) return { ok: false, reason: 'must_pause', pendingCount: events.length };
+      // Any dropped event's match can never be collected completely: future
+      // events of that match fail the contiguous-sequence check. Surface the
+      // affected matches so the caller can warn; a new match (sequence 0)
+      // automatically restores a clean chain.
+      const brokenMatchIds = [...new Set(events.map((event) => event.matchId))];
+      if (flushing) {
+        // Never clear underneath an in-flight submission: its acknowledgement
+        // must still match the head event. Defer the clear to flush's finally.
+        clearAfterFlush = true;
+        return {
+          ok: true, deferred: true, pendingCount: events.length, brokenMatchIds,
+          gap: integrityGap || durabilityGap || droppedCount > 0,
+        };
+      }
       events = [];
       persist();
-      return { ok: true, pendingCount: 0, gap: integrityGap || durabilityGap || droppedCount > 0 };
+      return {
+        ok: true, pendingCount: 0, brokenMatchIds,
+        gap: integrityGap || durabilityGap || droppedCount > 0,
+      };
     },
     setSubmitter(fn) {
       submitter = typeof fn === 'function' ? fn : null;

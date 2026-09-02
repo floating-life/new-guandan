@@ -1589,9 +1589,17 @@ function setupChrome() {
   });
   $('#btnReplayClear')?.addEventListener('click', () => {
     const result = replayEventQueue.clearPending();
-    flash(result.ok
-      ? '已清空本机待发公开复盘队列'
-      : '请先暂停提交，再清空本机待发队列');
+    if (!result.ok) {
+      flash('请先暂停提交，再清空本机待发队列');
+    } else if (result.brokenMatchIds?.length) {
+      // Dropping pending events breaks the current match's chain for the
+      // collector; say so explicitly instead of flashing a bare success.
+      flash('已清空本机待发队列；当前对局剩余事件将无法采集（序号不再连续），下一副新对局会自动恢复');
+    } else if (result.deferred) {
+      flash('已暂停提交；进行中的提交完成后将清空本机待发队列');
+    } else {
+      flash('已清空本机待发公开复盘队列');
+    }
     render();
   });
 

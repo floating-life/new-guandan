@@ -511,6 +511,43 @@ console.log('RT-2 本机复盘待发队列');
   assert(cleared.ok && cleared.pendingCount === 0 && queue.snapshot().pendingCount === 0
     && persisted.events.length === 0,
     '暂停后可清空本机待发队列并持久化空队列');
+  assert(Array.isArray(cleared.brokenMatchIds) && cleared.brokenMatchIds.length === 1,
+    '清空待发会点名链被破坏的对局，供 UI 明确警告');
+}
+
+{
+  const empty = createReplayEventQueue({ storage: storage(), enabled: false });
+  const result = empty.clearPending();
+  assert(result.ok && result.brokenMatchIds.length === 0, '空队列清空不报告链破坏');
+}
+
+{
+  const jobs = scheduler();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const submitted = [];
+  const queue = createReplayEventQueue({
+    storage: storage(),
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+    submit: async (item) => { submitted.push(item.eventId); await gate; return accepted(item); },
+  });
+  const first = event(0, null, 'race:event-0', 'race-match');
+  const second = event(1, first.eventSha256, 'race:event-1', 'race-match');
+  queue.enqueue(first);
+  queue.enqueue(second);
+  const flushing = queue.flush();
+  queue.setEnabled(false);
+  const cleared = queue.clearPending();
+  assert(cleared.ok && cleared.deferred === true && cleared.pendingCount === 2,
+    '进行中的提交期间清空被推迟，而不是与回执竞争');
+  release();
+  await flushing;
+  const after = queue.snapshot();
+  assert(after.pendingCount === 0 && after.lastSequence === 0 && !after.integrityGap,
+    '回执正常落地后推迟的清空只丢弃剩余待发，不误锁存完整性缺口');
+  assert(submitted.length === 1, '进行中的事件完成投递且不重复提交');
 }
 
 await new Promise((resolve) => setTimeout(resolve, 0));
