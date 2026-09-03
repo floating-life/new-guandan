@@ -129,6 +129,7 @@ $nodeTests = @(
   'tools/test_analyze_force_expert_ablation.mjs',
   'tools/test_summarize_ai_performance_baseline.mjs',
   'tools/test_analyze_statefix_performance.mjs',
+  'tools/test_analyze_search_tail_attribution.mjs',
   'tools/test_blind_eval_tools.mjs',
   'tools/test_validate_release_evidence.mjs',
   'tools/test_validate_m2_release.mjs',
