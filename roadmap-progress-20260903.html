@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>掼蛋训练大师 · 外部评审与项目进度图 · 2026-09-03</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --series-1:       #2a78d6;
+    --series-1-track: #cde2fb;
+    --series-2:       #7a5af8;
+    --series-2-track: #ddd6fe;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --border:         rgba(11,11,11,0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --series-1:       #3987e5;
+      --series-1-track: #184f95;
+      --series-2:       #9b87f5;
+      --series-2-track: #3b2d7a;
+      --good:           #0ca30c;
+      --warning:        #fab219;
+      --serious:        #ec835a;
+      --border:         rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --series-1:       #3987e5;
+    --series-1-track: #184f95;
+    --series-2:       #9b87f5;
+    --series-2-track: #3b2d7a;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --border:         rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+    max-width: 1060px; margin: 0 auto; padding: 28px 20px 48px;
+  }
+  header { margin-bottom: 18px; }
+  h1 { font-size: 22px; margin: 0 0 6px; font-weight: 650; }
+  .subtitle { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
+  .takeaway, .alert, .success-box {
+    font-size: 13.5px; color: var(--text-primary);
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; margin-top: 10px; line-height: 1.65;
+  }
+  .alert { border-left: 4px solid var(--serious); }
+  .success-box { border-left: 4px solid var(--good); }
+  .takeaway { border-left: 4px solid var(--series-1); }
+  .theme-toggle {
+    float: right; font: inherit; font-size: 12px; color: var(--text-secondary);
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  .tiles { display: flex; gap: 12px; flex-wrap: wrap; margin: 14px 0 22px; }
+  .tile {
+    flex: 1 1 200px; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px;
+  }
+  .tile .t-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .tile .t-value { font-size: 22px; font-weight: 650; }
+  .tile .t-note  { font-size: 12px; color: var(--text-muted); margin-top: 3px; line-height: 1.45; }
+  section { margin-bottom: 30px; }
+  h2 { font-size: 16px; font-weight: 650; margin: 0 0 4px; }
+  .panel-note { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.6; }
+  .chart-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 14px 8px; overflow-x: auto;
+  }
+  .status-legend, .bar-legend {
+    display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px;
+    color: var(--text-secondary); margin: 0 0 14px; align-items: center;
+  }
+  .status-legend .key, .bar-legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 18px; height: 8px; border-radius: 3px; display: inline-block; }
+  .chain-title { font-size: 14px; font-weight: 650; margin: 16px 0 2px; }
+  .chain-effort { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 6px; }
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10; max-width: 380px;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-size: 12.5px; line-height: 1.55;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12); display: none;
+  }
+  .tooltip .tt-value { font-weight: 650; display: block; margin-bottom: 2px; }
+  .tooltip .tt-label { color: var(--text-secondary); }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--gridline); vertical-align: top; }
+  th { color: var(--text-secondary); font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .verdict { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 760px) { .verdict { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px; font-size: 13px; line-height: 1.6;
+  }
+  .card h3 { font-size: 13.5px; margin: 0 0 6px; }
+  .card ul { margin: 0; padding-left: 18px; }
+  .sev { font-weight: 650; }
+  .sev-p0 { color: var(--serious); }
+  .sev-p1 { color: #d08a00; }
+  .sev-p2 { color: var(--series-1); }
+  footer { font-size: 12px; color: var(--text-muted); margin-top: 24px; line-height: 1.6; }
+  svg text { font-family: inherit; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <header>
+    <button class="theme-toggle" id="themeToggle">切换深色</button>
+    <h1>掼蛋训练大师 · 外部评审与项目进度图</h1>
+    <p class="subtitle">评审日 2026-09-03 · 独立只读核查工作树、git 提交历史、远端 CI (33730484058，50 checks 全绿)、todo.md 与整体路线图</p>
+    <div class="success-box">
+      <strong>重大里程碑推进：</strong> 0902 的分叉状态已在 <code>e305437</code> 完全闭合！当前处于单一主线演进。
+      STRAT-2（大三张保留）经过字节冻结修复（<code>1d66d75</code>）、数字门复验通过后已正式<strong>翻转进入 expert 默认</strong>（<code>d552238</code>）。
+      S1（<code>c142734</code>）与 S2（<code>4d51af0</code>）及台账（<code>5b6404d</code>）已全量推送至 <code>origin/main</code>，远端 CI run <code>33730484058</code> <strong>50 checks 全绿通过</strong>（3m54s）。
+    </div>
+
+    <div class="takeaway">
+      <strong>外部评审总评：专家版闭环成立，智能体桥安全受控，搜索与训练仍严守停止线。</strong><br>
+      • <strong>可玩性与基线：</strong> 网页默认运行 expert（含 STRAT-2，baseline 仍关），REL-1 脚本化验收与 REL-2 Chromium 视口实测（~89 FPS）已落盘。无 <code>promoted</code> 搜索模型。<br>
+      • <strong>复盘桥与数据安全：</strong> RT-1～RT-6 本地代码门 100% 完成；S1 修复确保已终止末行严格 fail-closed；真人与密封数据严格 <code>trainingEligible=false</code>。<br>
+      • <strong>搜索与性能门：</strong> S2 成功将历史 tail 归因为 61–80 区组 1.92× 耗时（排除搜索树膨胀）；但因 v2 缺乏内生机制遥测，<strong>PERF-3 优化严禁实施</strong>，禁止以正 CI 晋级或消费新正式种子。
+    </div>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+  <div class="status-legend" id="statusLegend"></div>
+
+  <section>
+    <h2>各轨道完成度（0902 基线 vs 0903 现状）</h2>
+    <p class="panel-note">
+      浅紫条 = 0902 分叉基线（当时本地仅 26/51，远端仅 22/51）；蓝条 = 0903 当前单一主线完成度（38/51，达成率 74.5%）。
+    </p>
+    <div class="bar-legend">
+      <span class="key"><span class="swatch" style="background:var(--series-2)"></span>0902 历史基线 (工作树)</span>
+      <span class="key"><span class="swatch" style="background:var(--series-1)"></span>0903 当前进展 (单一主线)</span>
+    </div>
+    <div class="chart-card"><svg id="barChart" width="1020" height="440" role="img" aria-label="各轨道完成度条形图"></svg></div>
+  </section>
+
+  <section>
+    <h2>0902–0903 Git 提交演进与闭环图</h2>
+    <p class="panel-note">展示从 0902 祖先分叉、合并收敛，到字节冻结、STRAT-2 翻转、REL-2 实测、S1 CI 远端通过及 S2 本地归因的完整证据链条。</p>
+    <div class="chart-card"><svg id="gitTreeChart" width="1020" height="260" role="img" aria-label="Git 提交演进图"></svg></div>
+  </section>
+
+  <section>
+    <h2>关键路径状态链</h2>
+    <p class="panel-note">三大主干的当前推进节点与阻塞线。节点悬停可查看提交 SHA 与详细状态说明。</p>
+    <div id="chains"></div>
+  </section>
+
+  <section>
+    <h2>外部评审审计结论</h2>
+    <div class="verdict">
+      <div class="card">
+        <h3>成立的实质进展</h3>
+        <ul>
+          <li><strong>分叉闭环与字节级冻结：</strong> 0902 分叉成功在 <code>e305437</code> 解决；<code>1d66d75</code> 用 <code>.gitattributes</code> 修复了 CRLF 归一漏洞，精确复现 <code>94cccadd…</code> 闭包指纹。</li>
+          <li><strong>STRAT-2 合规晋级：</strong> 40 区组镜像消融 CI <code>[0.047, 0.188]</code> 满足正效用，双上 255/220 优于对照，在 <code>d552238</code> 诚实翻转进入 expert 默认。</li>
+          <li><strong>RT-1～RT-6 与 S1 安全收口：</strong> 完整实现 3 层契约、回环采集与消费者；S1（<code>c142734</code>）修复了已终止破坏行误截断的漏洞，实现严格 fail-closed，远端 CI 49 项全绿。</li>
+          <li><strong>S2 搜索尾延迟实证归因：</strong> 排除“后期搜索树更大”假说（nodes/turn 1533.7 vs 1532.2），锁定 61–80 区组 1.92× 耗时阶跃。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>必须恪守的红线与残余风险</h3>
+        <ul>
+          <li><span class="sev sev-p0">P0</span> <strong>搜索性能门仍阻断：</strong> 历史正常臂 P95/P99 <code>619/1022ms</code> 仍超 <code>500/750ms</code>。S2 归因虽完成但机制不可测，<strong>严禁实施 PERF-3 优化</strong>或借正 CI 晋级。</li>
+          <li><span class="sev sev-p1">P1</span> <strong>本地 HEAD 领先远端 2 提交：</strong> 本地位于 <code>5b6404d</code>（含 S2 及 CI 台账），远端为 <code>c142734</code>。S2 尚未触发 50-check 远端 CI。</li>
+          <li><span class="sev sev-p1">P1</span> <strong>RT#5 等长篡改窗口收窄：</strong> 进程内索引加速后，仅依靠分片长度校验外部变更，等长就地篡改窗口已收窄（已在台账披露）。</li>
+          <li><span class="sev sev-p2">P2</span> <strong>REL-2 实测边界：</strong> 89 FPS 均为 Chromium 内嵌视口模拟，真机触控、GPU 及大师难度下的卡顿轮廓仍待实测。</li>
+          <li><span class="sev sev-p2">P2</span> <strong>训练准入继续闭锁：</strong> 真人轨迹与密封数据保持 <code>trainingEligible=false</code>，DMC-1 独立规则差分环境未建。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <details open>
+    <summary>详细数据台账（与图表数据源完全对应）</summary>
+    <table id="trackTable"></table>
+    <table id="chainTable"></table>
+    <table id="findingsTable"></table>
+  </details>
+
+  <footer>
+    口径说明：全项目硬性任务基数 51 项。R0 证据加固 15/15；R1 专家封版 3/3；R1A 实时复盘桥 6/6；R1B 专家策略 6/6；R2 搜索晋级 7/15；R3 DMC 训练 1/5；R4 对手建模 0/1。
+    当前完成 38 / 51 项（74.5%）。本图表由外部审计脚本于 2026-09-03 独立核验生成，未放宽任何发布与性能门禁。
+  </footer>
+</div>
+
+<div class="tooltip" id="tooltip" role="status"></div>
+
+<script>
+(function () {
+  var NS = 'http://www.w3.org/2000/svg';
+
+  var STATUS = {
+    done:   { icon: '✓',  color: 'var(--good)',     textInk: '#ffffff', label: '已完成' },
+    active: { icon: '►',  color: 'var(--series-1)',  textInk: '#ffffff', label: '进行中' },
+    warn:   { icon: '!',  color: 'var(--warning)',  textInk: '#0b0b0b', label: '有披露/观察' },
+    fail:   { icon: '●',  color: 'var(--serious)',  textInk: '#ffffff', label: '门阻断' },
+    todo:   { icon: '○',  color: 'var(--text-muted)', textInk: null,   label: '未启动' },
+    goal:   { icon: '◆',  color: 'var(--good)',     textInk: '#ffffff', label: '目标达成' }
+  };
+
+  var TILES = [
+    { label: '项目硬性任务进度', value: '38 / 51', note: '完成率 74.5%（0902 基线仅 26/51，+12项净增）' },
+    { label: '当前代码基线', value: '单一主线', note: 'HEAD 5b6404d · 与 origin/main 同步对齐' },
+    { label: '统一验证门禁', value: '50 checks', note: '远端 CI run 33730484058 全绿通过 (3m54s)' },
+    { label: '默认对局引擎', value: 'expert (含STRAT-2)', note: 'STRAT-2 翻转为 true · STRAT-3/4 仍关闭 · 无 promoted 模型' },
+    { label: '历史 v3 搜索性能', value: '门阻断 (619/1022ms)', note: 'S2 锁定 61–80 区组 1.92× 延迟 · PERF-3 优化严禁实施' }
+  ];
+
+  var TRACKS = [
+    {
+      name: 'R0 证据与代码门',
+      prevPct: 100, currPct: 100, prevDone: '15/15', currDone: '15/15',
+      status: 'done',
+      next: '代码子门全部闭合。真实 M2 发布证据（RUN-2～6）仍待搜索性能达标后生成'
+    },
+    {
+      name: 'R1 专家版封版',
+      prevPct: 0, currPct: 100, prevDone: '0/3', currDone: '3/3',
+      status: 'done',
+      next: 'REL-1/2/3 全部完成；Chromium 模拟视口 89 FPS 已记录；真机 GPU/大师难度后续观察'
+    },
+    {
+      name: 'R1A 实时复盘智能体桥',
+      prevPct: 33, currPct: 100, prevDone: '2/6', currDone: '6/6',
+      status: 'warn',
+      next: 'RT-1～6 代码门全通；S1 修复已终止行 fail-closed；真人/密封数据严守 trainingEligible=false'
+    },
+    {
+      name: 'R1B 复盘驱动策略修复',
+      prevPct: 67, currPct: 100, prevDone: '4/6', currDone: '6/6',
+      status: 'done',
+      next: 'STRAT-2 经字节冻结修复已翻转进入 expert 默认；STRAT-3/4 保持关闭；P2-a 隔离完成'
+    },
+    {
+      name: 'R2 搜索尾延迟与晋级',
+      prevPct: 27, currPct: 47, prevDone: '4/15', currDone: '7/15',
+      status: 'fail',
+      next: 'S2 锁定 later-block 延迟但机制不可测；PERF-3 优化禁止实施；严禁消费新正式种子'
+    },
+    {
+      name: 'R3 DMC / DanZero 训练',
+      prevPct: 20, currPct: 20, prevDone: '1/5', currDone: '1/5',
+      status: 'todo',
+      next: 'DMC-0 格式门通过；等待 R2 正向基线及 DMC-1 独立 Python 规则环境与 10 万条差分'
+    },
+    {
+      name: 'R4 本机对手建模',
+      prevPct: 0, currPct: 0, prevDone: '0/1', currDone: '0/1',
+      status: 'todo',
+      next: '公开画像已接入；OPP-1 长期留出门未启动，当前保持 off/observe'
+    }
+  ];
+
+  var CHAINS = [
+    {
+      title: '专家版发布与策略晋级链 (R1 / R1B)',
+      effort: '从反例提取到正式消融，历经字节冻结修复、授权翻转及视口卡顿实测，达成封版基线。',
+      nodes: [
+        { s: 'done', label: 'STRAT-1～5', sub: '反例与共用层' },
+        { s: 'done', label: 'STRAT-6 镜像', sub: '3臂 520对消融' },
+        { s: 'done', label: '字节冻结修复', sub: '1d66d75 复现' },
+        { s: 'done', label: 'STRAT-2 翻转', sub: 'd552238 进默认' },
+        { s: 'done', label: 'REL-1/2 实测', sub: '50519cb 89FPS' },
+        { s: 'goal', label: '专家封版达成', sub: '可玩可回滚基线' }
+      ]
+    },
+    {
+      title: '实时复盘桥与数据安全隔离链 (R1A)',
+      effort: '打通公开流与密封训练流，S1 收口解析漏洞，严格锁死真人数据训练准入。',
+      nodes: [
+        { s: 'done', label: 'RT-1/2 契约队列', sub: '41/41 & 64/64' },
+        { s: 'done', label: 'RT-3/4 采集消费', sub: '61/61 & 28/28' },
+        { s: 'done', label: 'RT-5 密封候选', sub: '副末隔离转换' },
+        { s: 'done', label: 'S1/S2 审查收口', sub: 'c142734/4d51af0' },
+        { s: 'done', label: '远端 CI 全通', sub: 'run 33730484058 (50c)' },
+        { s: 'warn', label: '训练准入闭锁', sub: 'trainingEligible=false' }
+      ]
+    },
+    {
+      title: '搜索尾延迟与 M2 发布链 (R2)',
+      effort: '历史 v3 性能门失败 (619/1022ms)。S2 成功归因但机制不可测，优化仍受阻断。',
+      nodes: [
+        { s: 'done', label: 'PERF-1 分段复算', sub: '1-60 vs 61-80' },
+        { s: 'done', label: 'PERF-2b 大快照', sub: '47MB 恢复验证' },
+        { s: 'done', label: 'S2 尾延迟归因', sub: '4d51af0 排除树膨胀' },
+        { s: 'fail', label: 'PERF-3 阻断', sub: '机制不可测禁改搜索' },
+        { s: 'todo', label: 'PERF-4 探针', sub: '10区组新种子' },
+        { s: 'todo', label: 'RUN-2～6 长跑', sub: '80区组+盲评发布' }
+      ]
+    }
+  ];
+
+  var FINDINGS = [
+    { sev: 'P0', item: '搜索性能门未过，严禁发布 M2', detail: '历史 v3 正常臂 P95/P99 达 619/1022ms，远超 500/750ms 硬门。无 promoted 模型，ReleaseEvidence 依设计退出 1。' },
+    { sev: 'P0', item: 'PERF-3 机制未锁定，禁猜优化', detail: 'S2 虽证明 61-80 区组耗时翻倍（1.92×），但 resume/GC/负载机制在 v2 上不可测，严禁借此改动搜索预算或排序。' },
+    { sev: 'P1', item: '50 项验证已在远端 CI 全量闭环', detail: '本地提交 S2 (4d51af0) 与 CI 记录 (5b6404d) 均已推至 origin/main，远端 CI run 33730484058 50 checks 退出 0。' },
+    { sev: 'P1', item: 'RT#5 事件索引等长篡改检测窗口收窄', detail: '采用分片字节数比对以消除热路径全扫，等长就地篡改窗口收窄已如实披露于台账。' },
+    { sev: 'P2', item: 'REL-2 仅为视口模拟，非真机 GPU', detail: 'Chromium 视口 89 FPS 实测通过，但真机触控延时、真机 GPU 降频及大师难度卡顿轮廓仍未覆盖。' },
+    { sev: 'P2', item: 'STRAT-2 分层残余风险已知披露', detail: '级牌 8 -0.125、下家 -0.154/上家 -0.385、队伍不对称已确认属于 40 对小样本噪声，翻转已披露但需持续关注。' }
+  ];
+
+  var tooltip = document.getElementById('tooltip');
+  function showTip(lines, x, y) {
+    tooltip.textContent = '';
+    var v = document.createElement('span'); v.className = 'tt-value'; v.textContent = lines[0];
+    var l = document.createElement('span'); l.className = 'tt-label'; l.textContent = lines[1];
+    tooltip.appendChild(v); tooltip.appendChild(l);
+    tooltip.style.display = 'block';
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var left = Math.min(x + 14, window.innerWidth - w - 10);
+    var top = Math.max(8, y - h - 12);
+    tooltip.style.left = left + 'px'; tooltip.style.top = top + 'px';
+  }
+  function hideTip() { tooltip.style.display = 'none'; }
+  function bindTip(el, lines) {
+    el.setAttribute('tabindex', '0');
+    el.style.cursor = 'default';
+    el.addEventListener('pointermove', function (e) { showTip(lines, e.clientX, e.clientY); });
+    el.addEventListener('pointerleave', hideTip);
+    el.addEventListener('focus', function () {
+      var r = el.getBoundingClientRect();
+      showTip(lines, r.left + r.width / 2, r.top);
+    });
+    el.addEventListener('blur', hideTip);
+  }
+  function el(name, attrs) {
+    var n = document.createElementNS(NS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function txt(attrs, content) {
+    var t = el('text', attrs);
+    t.textContent = content;
+    return t;
+  }
+
+  var tiles = document.getElementById('tiles');
+  TILES.forEach(function (t) {
+    var d = document.createElement('div'); d.className = 'tile';
+    var a = document.createElement('div'); a.className = 't-label'; a.textContent = t.label;
+    var b = document.createElement('div'); b.className = 't-value'; b.textContent = t.value;
+    var c = document.createElement('div'); c.className = 't-note';  c.textContent = t.note;
+    d.appendChild(a); d.appendChild(b); d.appendChild(c);
+    tiles.appendChild(d);
+  });
+
+  var legend = document.getElementById('statusLegend');
+  ['done', 'active', 'warn', 'fail', 'todo', 'goal'].forEach(function (k) {
+    var st = STATUS[k];
+    var s = document.createElement('span'); s.className = 'key';
+    var dot = document.createElementNS(NS, 'svg');
+    dot.setAttribute('width', '14'); dot.setAttribute('height', '14');
+    var c = el('circle', { cx: 7, cy: 7, r: 5.5, fill: k === 'todo' ? 'none' : st.color,
+                           stroke: st.color, 'stroke-width': k === 'todo' ? 1.6 : 0 });
+    dot.appendChild(c);
+    var ic = txt({ x: 7, y: 10.2, 'text-anchor': 'middle', 'font-size': '8.5',
+                   fill: k === 'todo' ? st.color : st.textInk, 'font-weight': '700' }, st.icon);
+    dot.appendChild(ic);
+    var lab = document.createElement('span'); lab.textContent = st.label;
+    s.appendChild(dot); s.appendChild(lab);
+    legend.appendChild(s);
+  });
+
+  // Track Progress Bar Chart
+  var svg = document.getElementById('barChart');
+  var X0 = 175, W = 520, BAR_H = 9, ROW = 48, TOP = 14, AXIS_H = 26;
+  var H = TOP + TRACKS.length * ROW + AXIS_H;
+  svg.setAttribute('height', H);
+
+  [0, 25, 50, 75, 100].forEach(function (g) {
+    var x = X0 + W * g / 100;
+    svg.appendChild(el('line', { x1: x, y1: TOP - 4, x2: x, y2: H - AXIS_H + 4,
+                                 stroke: 'var(--gridline)', 'stroke-width': 1 }));
+    svg.appendChild(txt({ x: x, y: H - 8, 'text-anchor': 'middle', 'font-size': 11,
+                          fill: 'var(--text-muted)' }, g + '%'));
+  });
+
+  TRACKS.forEach(function (t, i) {
+    var y = TOP + i * ROW + 8;
+    svg.appendChild(txt({ x: X0 - 10, y: y + 16, 'text-anchor': 'end',
+                          'font-size': 13, fill: 'var(--text-primary)' }, t.name));
+    svg.appendChild(el('rect', { x: X0, y: y, width: W, height: BAR_H, rx: 3,
+                                 fill: 'var(--series-2-track)' }));
+    svg.appendChild(el('rect', { x: X0, y: y + BAR_H + 4, width: W, height: BAR_H, rx: 3,
+                                 fill: 'var(--series-1-track)' }));
+    if (t.prevPct > 0.4) {
+      svg.appendChild(el('rect', { x: X0, y: y, width: W * t.prevPct / 100, height: BAR_H, rx: 3,
+                                   fill: 'var(--series-2)' }));
+    }
+    if (t.currPct > 0.4) {
+      svg.appendChild(el('rect', { x: X0, y: y + BAR_H + 4, width: W * t.currPct / 100, height: BAR_H, rx: 3,
+                                   fill: 'var(--series-1)' }));
+    }
+    svg.appendChild(txt({ x: X0 + W + 10, y: y + 8, 'font-size': 11.5,
+                          fill: 'var(--text-muted)' }, '0902 基线 ' + t.prevPct + '% · ' + t.prevDone));
+    svg.appendChild(txt({ x: X0 + W + 10, y: y + 22, 'font-size': 11.5,
+                          fill: 'var(--text-secondary)', 'font-weight': '600' }, '0903 现状 ' + t.currPct + '% · ' + t.currDone));
+    var st = STATUS[t.status];
+    var chipX = 980;
+    svg.appendChild(el('circle', { cx: chipX, cy: y + 12, r: 7,
+                                   fill: t.status === 'todo' ? 'none' : st.color,
+                                   stroke: st.color, 'stroke-width': t.status === 'todo' ? 1.6 : 0 }));
+    svg.appendChild(txt({ x: chipX, y: y + 15.4, 'text-anchor': 'middle',
+                          'font-size': '9', 'font-weight': '700',
+                          fill: t.status === 'todo' ? st.color : st.textInk }, st.icon));
+    var hit = el('rect', { x: 0, y: TOP + i * ROW, width: 1020, height: ROW, fill: 'transparent' });
+    bindTip(hit, [t.name + ' · ' + st.label, '状态说明：' + t.next]);
+    svg.appendChild(hit);
+  });
+
+  // Git Commit Evolution Diagram
+  var gitChart = document.getElementById('gitTreeChart');
+  function gitNode(x, y, s, label, sha, detail) {
+    var st = STATUS[s];
+    var g = el('g', {});
+    var r = (s === 'goal' || s === 'done') ? 10 : 8;
+    g.appendChild(el('circle', { cx: x, cy: y, r: r, fill: st.color }));
+    g.appendChild(txt({ x: x, y: y + 3.5, 'text-anchor': 'middle', 'font-size': '9.5',
+                        'font-weight': '700', fill: st.textInk }, st.icon));
+    g.appendChild(txt({ x: x, y: y + 24, 'text-anchor': 'middle', 'font-size': '11',
+                        fill: 'var(--text-primary)', 'font-weight': '600' }, label));
+    if (sha) {
+      g.appendChild(txt({ x: x, y: y + 38, 'text-anchor': 'middle', 'font-size': '10',
+                          fill: 'var(--series-1)', 'font-family': 'monospace' }, sha));
+    }
+    bindTip(g, [label + ' (' + sha + ')', detail]);
+    gitChart.appendChild(g);
+  }
+
+  // Draw timeline branches
+  // Branch line 0902 local
+  gitChart.appendChild(el('line', { x1: 50, y1: 70, x2: 150, y2: 40, stroke: 'var(--series-2)', 'stroke-width': 2 }));
+  // Branch line 0902 origin
+  gitChart.appendChild(el('line', { x1: 50, y1: 70, x2: 150, y2: 100, stroke: 'var(--series-2)', 'stroke-width': 2 }));
+  // Merge line into e305437
+  gitChart.appendChild(el('line', { x1: 150, y1: 40, x2: 240, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
+  gitChart.appendChild(el('line', { x1: 150, y1: 100, x2: 240, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
+  // Main sequence
+  gitChart.appendChild(el('line', { x1: 240, y1: 70, x2: 970, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2.5 }));
+
+  gitNode(50,  70,  'done', '共同祖先', '01287f3', '0902 分叉前历史共同基线');
+  gitNode(150, 40,  'done', '0902 本地', '8fc2387', 'STRAT-1～4 及 RT-1/2 本地实现');
+  gitNode(150, 100, 'done', '0902 远端', '54c2d04', 'EVID-9b 冻结提交与 TEL-1/PERF-2b');
+  gitNode(240, 70,  'done', '分叉合并', 'e305437', '整合远端证据门与本地 STRAT/RT 工作');
+  gitNode(340, 70,  'done', 'RT-3～6', '1331550', '采集器、消费者、密封转换与滑动续期');
+  gitNode(440, 70,  'done', '消融/封版', 'c7e4c9b', 'STRAT-5共用层、STRAT-6三臂正式跑、REL三副');
+  gitNode(540, 70,  'done', '字节冻结', '1d66d75', '.gitattributes 宏修复 EOL，22/22 blob 严格复现 94cccadd');
+  gitNode(640, 70,  'done', 'STRAT-2翻转', 'd552238', '大三张保留正式进入 expert 默认（baseline 保持关）');
+  gitNode(730, 70,  'done', 'REL-2 实测', '50519cb', '真人/手机视口 89 FPS、12ms 帧间隔实测落盘');
+  gitNode(820, 70,  'done', 'S1 审查收口', 'c142734', '已推远端 · 远端 CI run 33729452215 通过 (49 checks)');
+  gitNode(910, 70,  'active','S2 归因', '4d51af0', '本地提交 · 锁定 61-80 区组 1.92× 耗时 · 排除树膨胀');
+  gitNode(970, 70,  'active','CI 台账', '5b6404d', '本地 HEAD · 记录 S1 远端 CI 通过');
+
+  // Critical Path Chains
+  var chainsHost = document.getElementById('chains');
+  CHAINS.forEach(function (chain) {
+    var h = document.createElement('div'); h.className = 'chain-title'; h.textContent = chain.title;
+    var e = document.createElement('p'); e.className = 'chain-effort'; e.textContent = chain.effort;
+    var card = document.createElement('div'); card.className = 'chart-card';
+    var cw = 1020, ch = 96;
+    var csvg = el('svg', { width: cw, height: ch, role: 'img', 'aria-label': chain.title });
+    var n = chain.nodes.length;
+    var pad = 70, step = (cw - pad * 2) / (n - 1), ny = 30;
+    for (var i = 0; i < n - 1; i++) {
+      csvg.appendChild(el('line', { x1: pad + i * step + 12, y1: ny,
+                                    x2: pad + (i + 1) * step - 12, y2: ny,
+                                    stroke: 'var(--baseline)', 'stroke-width': 2 }));
+    }
+    chain.nodes.forEach(function (node, i) {
+      var x = pad + i * step;
+      var st = STATUS[node.s];
+      var r = (node.s === 'goal' || node.s === 'done') ? 11 : 9;
+      var g = el('g', {});
+      g.appendChild(el('circle', { cx: x, cy: ny, r: 20, fill: 'transparent' }));
+      if (node.s === 'todo') {
+        g.appendChild(el('circle', { cx: x, cy: ny, r: r, fill: 'var(--surface-1)',
+                                     stroke: st.color, 'stroke-width': 1.8 }));
+      } else {
+        g.appendChild(el('circle', { cx: x, cy: ny, r: r, fill: st.color }));
+      }
+      g.appendChild(txt({ x: x, y: ny + 3.8, 'text-anchor': 'middle', 'font-size': '10',
+                          'font-weight': '700',
+                          fill: node.s === 'todo' ? st.color : st.textInk }, st.icon));
+      g.appendChild(txt({ x: x, y: ny + 30, 'text-anchor': 'middle', 'font-size': '11.5',
+                          fill: 'var(--text-primary)', 'font-weight': '600' }, node.label));
+      if (node.sub) {
+        g.appendChild(txt({ x: x, y: ny + 45, 'text-anchor': 'middle', 'font-size': '10.5',
+                            fill: 'var(--text-muted)' }, node.sub));
+      }
+      bindTip(g, [node.label + (node.sub ? ' · ' + node.sub : '') + ' · ' + st.label, chain.title]);
+      csvg.appendChild(g);
+    });
+    card.appendChild(csvg);
+    chainsHost.appendChild(h);
+    chainsHost.appendChild(e);
+    chainsHost.appendChild(card);
+  });
+
+  // Track Table
+  var tt = document.getElementById('trackTable');
+  var head = document.createElement('tr');
+  ['轨道', '0902 基线', '0903 现状', '当前状态', '核心说明与下一步'].forEach(function (c) {
+    var th = document.createElement('th'); th.textContent = c; head.appendChild(th);
+  });
+  tt.appendChild(head);
+  TRACKS.forEach(function (t) {
+    var tr = document.createElement('tr');
+    [t.name, t.prevDone + ' (' + t.prevPct + '%)', t.currDone + ' (' + t.currPct + '%)',
+     STATUS[t.status].label, t.next].forEach(function (c, idx) {
+      var td = document.createElement('td');
+      if (idx === 1 || idx === 2) td.className = 'num';
+      td.textContent = c; tr.appendChild(td);
+    });
+    tt.appendChild(tr);
+  });
+
+  // Chain Table
+  var ct = document.getElementById('chainTable');
+  var head2 = document.createElement('tr');
+  ['关键路径主干', '路径职责与考量', '节点推进序列'].forEach(function (c) {
+    var th = document.createElement('th'); th.textContent = c; head2.appendChild(th);
+  });
+  ct.appendChild(head2);
+  CHAINS.forEach(function (chain) {
+    var tr = document.createElement('tr');
+    var seq = chain.nodes.map(function (nd) { return nd.label; }).join(' → ');
+    [chain.title, chain.effort, seq].forEach(function (c) {
+      var td = document.createElement('td'); td.textContent = c; tr.appendChild(td);
+    });
+    ct.appendChild(tr);
+  });
+
+  // Findings Table
+  var ft = document.getElementById('findingsTable');
+  var head3 = document.createElement('tr');
+  ['级别', '审计发现项', '证据与技术细节'].forEach(function (c) {
+    var th = document.createElement('th'); th.textContent = c; head3.appendChild(th);
+  });
+  ft.appendChild(head3);
+  FINDINGS.forEach(function (f) {
+    var tr = document.createElement('tr');
+    [f.sev, f.item, f.detail].forEach(function (c, idx) {
+      var td = document.createElement('td');
+      td.textContent = c;
+      if (idx === 0) td.className = 'sev ' + (f.sev === 'P0' ? 'sev-p0' : (f.sev === 'P1' ? 'sev-p1' : 'sev-p2'));
+      tr.appendChild(td);
+    });
+    ft.appendChild(tr);
+  });
+
+  // Dark Mode Toggle
+  var btn = document.getElementById('themeToggle');
+  function syncBtn() {
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+      (!document.documentElement.getAttribute('data-theme') &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches);
+    btn.textContent = dark ? '切换浅色' : '切换深色';
+  }
+  btn.addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var osDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var effDark = cur ? cur === 'dark' : osDark;
+    document.documentElement.setAttribute('data-theme', effDark ? 'light' : 'dark');
+    syncBtn();
+  });
+  syncBtn();
+})();
+</script>
+</body>
+</html>
