@@ -338,9 +338,17 @@ export function createReplayEventQueue({
       // durable lock: a refresh must not turn an earlier integrity alarm into
       // a clean queue merely because the remaining events happen to be linked.
       integrityLock = parsed.integrityGap === true || parsed.integrityLock === true;
-      brokenMatches = Array.isArray(parsed.brokenMatches)
-        ? [...new Set(parsed.brokenMatches.filter((id) => typeof id === 'string' && id))].slice(-limit)
+      const uniqueBroken = Array.isArray(parsed.brokenMatches)
+        ? [...new Set(parsed.brokenMatches.filter((id) => typeof id === 'string' && id))]
         : [];
+      brokenMatches = uniqueBroken.slice(-limit);
+      // The pending-event cap is not a bound on historical broken match ids.
+      // Dropping the current cursor's id would reopen mid-game clear holes
+      // after a refresh.
+      if (cursor.matchId && uniqueBroken.includes(cursor.matchId)
+        && !brokenMatches.includes(cursor.matchId)) {
+        brokenMatches.push(cursor.matchId);
+      }
       durabilityGap = !storageIsDurable || parsed.durabilityGap === true;
       durable = storageIsDurable && !durabilityGap;
       const loaded = Array.isArray(parsed.events) ? parsed.events : [];
@@ -586,6 +594,7 @@ export function createReplayEventQueue({
         droppedCount,
         retryCount,
         lastError,
+        brokenMatches: clone(brokenMatches),
       };
     },
     dispose() {

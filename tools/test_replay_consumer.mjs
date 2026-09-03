@@ -253,18 +253,30 @@ async function main() {
       endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: tamperedTerminated,
       fetchImpl: fakeFetch([], []),
     }), 'annotation_invalid');
+    assert.equal(
+      fs.readFileSync(tamperedTerminated, 'utf8'),
+      `${JSON.stringify(validStored)}\n${JSON.stringify(tornRecord)}\n`,
+    );
     console.log('  [OK] annotation 已终止末行校验失败仍 fail closed（完整写入视为篡改）');
 
+    const terminatedParseFail = path.join(temporary, 'terminated-parse-fail.ndjson');
+    const terminatedParseBody = `${JSON.stringify(validStored)}\n{broken\n`;
+    fs.writeFileSync(terminatedParseFail, terminatedParseBody, { mode: 0o600 });
+    await expectConsumerError(consumeOnce({
+      endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: terminatedParseFail,
+      fetchImpl: fakeFetch([], []),
+    }), 'annotation_invalid');
+    assert.equal(fs.readFileSync(terminatedParseFail, 'utf8'), terminatedParseBody);
+    console.log('  [OK] annotation 已终止末行 JSON 解析失败仍 fail closed（完整写入视为篡改）');
+
     const corrupted = path.join(temporary, 'corrupt.ndjson');
-    fs.writeFileSync(
-      corrupted,
-      `${JSON.stringify(validStored)}\n{broken\n${JSON.stringify(validStored)}\n`,
-      { mode: 0o600 },
-    );
+    const corruptedBody = `${JSON.stringify(validStored)}\n{broken\n${JSON.stringify(validStored)}\n`;
+    fs.writeFileSync(corrupted, corruptedBody, { mode: 0o600 });
     await expectConsumerError(consumeOnce({
       endpoint: ENDPOINT, token: TOKEN, cursorPath, annotationPath: corrupted,
       fetchImpl: fakeFetch([], []),
     }), 'annotation_invalid');
+    assert.equal(fs.readFileSync(corrupted, 'utf8'), corruptedBody);
     console.log('  [OK] annotation 中间行损坏时拒绝继续消费');
 
     const malformed = { ...annotations.values().next().value, matchId: 42,
@@ -381,7 +393,7 @@ async function main() {
     }
     console.log('  [OK] --follow 在 hasMore=false 后继续轮询，非可重试错误时停止');
 
-    console.log('replay consumer: 27/27');
+    console.log('replay consumer: 28/28');
     return 0;
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });

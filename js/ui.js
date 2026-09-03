@@ -41,7 +41,10 @@ let replayCollectionInterruptedMatchId = (
   restoredState
   && Number(restoredState.replaySequence) > 0
   && restoredState.matchId
-  && !replayEventQueue.hasMatchTrace(restoredState.matchId)
+  && (
+    !replayEventQueue.hasMatchTrace(restoredState.matchId)
+    || replayEventQueue.snapshot().brokenMatches.includes(restoredState.matchId)
+  )
 ) ? restoredState.matchId : null;
 const $ = (sel) => document.querySelector(sel);
 let llmHealth = getLLMHealth();

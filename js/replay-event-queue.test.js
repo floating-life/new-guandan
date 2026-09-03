@@ -639,6 +639,76 @@ console.log('RT-2 本机复盘待发队列');
     '推迟清空的断链同样不锁存全局完整性缺口');
 }
 
+{
+  // RT#13：至少 seq0 已确认后清空，cursor/hasMatchTrace 仍真，刷新必须靠
+  // 持久化 brokenMatches 停采，且 snapshot 对恢复 UI 暴露该集合。
+  const target = storage();
+  const jobs = scheduler();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const queue = createReplayEventQueue({
+    storage: target,
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+    submit: async (item) => { await gate; return accepted(item); },
+  });
+  const first = event(0, null, 'rt13h:event-0', 'rt13-hydrate');
+  const second = event(1, first.eventSha256, 'rt13h:event-1', 'rt13-hydrate');
+  queue.enqueue(first);
+  queue.enqueue(second);
+  const flushing = queue.flush();
+  queue.setEnabled(false);
+  queue.clearPending();
+  release();
+  await flushing;
+  assert(queue.hasMatchTrace('rt13-hydrate') && queue.snapshot().lastSequence === 0,
+    '在途 seq0 确认后 cursor 仍构成本局轨迹');
+  assert(queue.snapshot().brokenMatches.includes('rt13-hydrate'),
+    'snapshot 向恢复路径暴露断链标记');
+  const resumed = createReplayEventQueue({
+    storage: target,
+    enabled: true,
+    schedule: jobs.schedule,
+    clearSchedule: jobs.clear,
+  });
+  assert(resumed.hasMatchTrace('rt13-hydrate')
+    && resumed.snapshot().brokenMatches.includes('rt13-hydrate'),
+    '刷新后 hasMatchTrace 仍为真，但 brokenMatches 仍在');
+  const continuation = resumed.enqueue(event(2, second.eventSha256, 'rt13h:event-2', 'rt13-hydrate'));
+  assert(!continuation.ok && continuation.reason === 'unreproducible_match'
+    && resumed.snapshot().pendingCount === 0,
+    'ack 后清空再刷新，seq>0 仍干净停采');
+}
+
+{
+  // hydrate 的 pending cap 不得丢掉当前 cursor 的 broken match id。
+  const target = storage();
+  const keepId = 'keep-cursor-match';
+  target.setItem('guandan_replay_pending_v1', JSON.stringify({
+    schema: 'guandan-replay-pending-queue-v1',
+    cursor: {
+      matchId: keepId, sequence: 0, eventId: 'keep-0', eventSha256: sha('c'),
+    },
+    acked: [],
+    events: [],
+    droppedCount: 0,
+    integrityGap: false,
+    integrityLock: false,
+    durabilityGap: false,
+    brokenMatches: [keepId, 'old-a', 'old-b'],
+  }));
+  const resumed = createReplayEventQueue({
+    storage: target, maxPending: 2, enabled: false,
+  });
+  assert(resumed.snapshot().brokenMatches.includes(keepId),
+    'brokenMatches 超出 pending cap 时仍保留 cursor.matchId');
+  const blocked = resumed.enqueue(event(1, sha('c'), 'keep:event-1', keepId));
+  assert(!blocked.ok && blocked.reason === 'unreproducible_match'
+    && resumed.snapshot().pendingCount === 0,
+    '被 cap 截断后当前对局 seq>0 仍拒绝入队');
+}
+
 await new Promise((resolve) => setTimeout(resolve, 0));
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

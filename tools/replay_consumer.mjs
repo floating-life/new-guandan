@@ -332,11 +332,15 @@ export function readAnnotationStore(annotationPath) {
   const lines = splitAnnotationLines(buffer);
   for (const [index, line] of lines.entries()) {
     if (!line.content.trim()) continue;
+    // Only an unterminated last segment can be a torn append. A newline-
+    // terminated last line is a complete write: parse or validation failure
+    // is tampering and must fail closed.
+    const tornFinalLine = index === lines.length - 1 && line.terminated === false;
     let value;
     try {
       value = JSON.parse(line.content);
     } catch {
-      if (index !== lines.length - 1) {
+      if (!tornFinalLine) {
         throw new ReplayConsumerError('annotation_invalid', `annotation 存储第 ${index + 1} 行损坏`);
       }
       try {
@@ -349,11 +353,6 @@ export function readAnnotationStore(annotationPath) {
     try {
       validateStoredAnnotation(value);
     } catch (error) {
-      // A torn final write can also land as complete JSON whose validation
-      // fails (truncated string fields, bad sha). Only an unterminated last
-      // line — the one position a torn write can occupy — is recoverable by
-      // truncation; terminated lines and earlier lines stay fail closed.
-      const tornFinalLine = index === lines.length - 1 && line.terminated === false;
       if (!tornFinalLine || error?.code !== 'annotation_invalid') throw error;
       try {
         truncateAnnotationFile(annotationPath, line.start);

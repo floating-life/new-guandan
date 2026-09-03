@@ -46,10 +46,12 @@ assert(ui.includes('brokenMatchIds') && ui.includes('result.deferred')
   && ui.includes('下一副新对局会自动恢复'),
   '清空待发对链破坏给出明确警告，进行中提交时推迟清空而非竞争回执');
 assert(ui.includes('replayCollectionInterruptedMatchId') && ui.includes('hasMatchTrace')
+  && ui.includes('brokenMatches')
   && ui.includes('unreproducible_match')
   && ui.includes('当前对局采集链已中断、请新开一局以恢复采集')
   && ui.includes('新开一局自动恢复')
-  && ui.includes('replayEventQueue.hasMatchTrace'),
+  && ui.includes('replayEventQueue.hasMatchTrace')
+  && ui.includes('snapshot().brokenMatches'),
   '待发队列被清空后恢复进行中对局会停止采集并提示新开一局自动恢复');
 assert(ui.includes('replayCollectionInterruptedMatchId = null')
   && ui.includes("startMatch(state)"),
