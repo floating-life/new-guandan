@@ -139,7 +139,7 @@
 ## P3：可并行的专家版封版
 
 - [x] **REL-1：脚本化三副验收（非真人手打）。** `tools/expert_release_acceptance.mjs` 以 expert / easy 走通普通升级、贡还、打 A；本机写入 `data/expert-release-acceptance.json`（SHA-256 `5c32d72a8bf1f405e231c9ba522f09be79542851dc06506e8dd7182610a7b833`）：finishOrder `0,2,3,1`、出现进贡/还贡、打 A 过 A。这不是笔记本浏览器手打三副，也不等于大师难度手感。
-- [x] **REL-2：隐私与回滚台账（静态；设备卡顿未测）。** 同一验收报告记录：默认离线、云端只经回环、API Key 不进 localStorage、采集器默认关闭、`trainingEligible=false`，以及停止服务 / 改回专家策略 / 清 localStorage + git 回退。`notebookMeasured=false`、`phoneMeasured=false`；未做运行时 localStorage 抽查或真机卡顿测量。
+- [x] **REL-2：隐私与回滚台账（静态+运行时抽查）+ 真人手打/手机视口卡顿实测（0903）。** 静态台账同 REL-1 报告；0903 运行时抽查本源 localStorage 仅含游戏数据五键、无 API Key（证实 `apiKeyNotInLocalStorage`）。真人手打实测（Chromium 内嵌浏览器 + 视口模拟 390×844，普通难度/专家引擎/本地 AI，`data/expert-release-interaction-measured.json`，SHA-256 `7f85829b512d235d343f74a4d95de950fedc0fd94c0151fce15fa19c7f6d6f79`）：笔记本轮 89.1 FPS、帧间隙 P95=12ms、2 次 367–871ms 主线程停顿；手机视口轮 89 FPS、P95=12ms、2 次 367–871ms 停顿；内存峰值 48MB；用户未报告可感知卡顿。**边界**：内嵌 Chromium+视口模拟，非真机触控/真机 GPU/日常浏览器全环境；难度为普通档；两次 ~0.5-0.9s 停顿根因未做火焰图定位；首轮（用户自开环境）无指标数据。台账已知Limits如实记录，不构成 PERF 性能门证据。
 - [x] **REL-3：文档与复盘标签收敛。** README 只保留当前摘要并链接总纲；对手画像为公开行动 v3（含 v1/v2 迁移）；v3 仅离线评测。复盘将 `ismcts-v3` 显示为 ISMCTS v3/成对 sweep，产品选择器仍无该选项。`ai.js` Probe 历史注释已指向证据台账；`ai-hybrid.js` 改为“四个”可验证搜索模式。
 
 ## P4：后续路线（当前不启动长训）
