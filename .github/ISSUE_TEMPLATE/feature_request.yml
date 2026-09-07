@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a scoped improvement to gameplay, AI, evaluation, tooling, or documentation
+title: "[Feature] "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / opportunity
+      description: What user, research, or maintenance problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest useful version of the change.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Rules engine
+        - AI strategy
+        - Evaluation / benchmarking
+        - Replay / analysis / coaching
+        - Local server / cloud enhancement
+        - UI / interaction
+        - Verification / CI
+        - Documentation / contributor experience
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: This proposal preserves the fair-play hidden-information boundary.
+        - label: This proposal does not require secrets to be stored in browser localStorage or committed to the repository.
+        - label: I have considered how the change can be tested or evaluated reproducibly.
