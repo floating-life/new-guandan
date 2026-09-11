@@ -60,6 +60,9 @@ const {
   configureHybridValueModel, validateHybridValueModel, HYBRID_ENGINE_VERSION,
 } = await import('./ai-hybrid.js');
 const {
+  configureOfflineLearningModel, LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, isLearningDecisionEngine,
+} = await import('./ai-learning.js');
+const {
   createSeedManifest, seedManifestOverlap, valueModelStatus,
 } = await import('./value-model-gate.js');
 const { modelPayloadSha256 } = await import('./model-fingerprint.js');
@@ -102,6 +105,7 @@ const EVALUATION_IMPLEMENTATION_SOURCES = Object.freeze([
   'ai.ab.telemetry.js',
   'ai.ab.provenance.js',
   'ai-hybrid.js',
+  'ai-learning.js',
   'ai-observation.js',
   'ai-route.js',
   'ai.js',
@@ -233,10 +237,15 @@ const hybridScenarioLogFlag = process.argv.find((item) => String(item).startsWit
 const hybridScenarioLogPath = hybridScenarioLogFlag
   ? path.resolve(String(hybridScenarioLogFlag).slice('--hybrid-scenario-log='.length)) : null;
 const resumeCheckpoint = process.argv.includes('--resume');
+const HYBRID_VALUE_MODEL_ENGINES = new Set(['hybrid', 'ismcts']);
+const LEARNING_VALUE_MODEL_ENGINES = new Set([LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE]);
+const LEARNING_PURPOSE = 'learning-development';
 let valueModelAudit = null;
 if (valueModelPath) {
-  if (!['hybrid', 'ismcts'].includes(CANDIDATE.decisionEngine)) {
-    throw new Error('--value-model 只可用于 hybrid-v1 或 root-pimc-v1 候选策略（ismcts-v1 仅为历史兼容别名）');
+  const usesLearningModel = LEARNING_VALUE_MODEL_ENGINES.has(CANDIDATE.decisionEngine);
+  const usesHybridModel = HYBRID_VALUE_MODEL_ENGINES.has(CANDIDATE.decisionEngine);
+  if (!usesLearningModel && !usesHybridModel) {
+    throw new Error('--value-model 只可用于 hybrid-v1、root-pimc-v1 或 learned-value-v1 候选策略（ismcts-v1 仅为历史兼容别名）');
   }
   // 当前价值模型是进程级配置。为保证对照组绝不读取候选权重，带模型的
   // 发布赛强制以稳定 expert 为对照；同引擎无模型消融应另起独立进程实现。
@@ -253,15 +262,33 @@ if (valueModelPath) {
     throw new Error(`评测种子与训练种子重叠（${overlappingSeeds.slice(0, 8).join(', ')}${
       overlappingSeeds.length > 8 ? '…' : ''}）；请改用未见种子后再启动 A/B`);
   }
-  const configured = configureHybridValueModel(model, { allowExperimental: true });
-  if (!configured.ok) throw new Error(`价值模型无法用于离线A/B：${configured.reason}`);
-  valueModelAudit = {
-    id: validation.model.id,
-    status: valueModelStatus(model),
-    sha256: modelPayloadSha256(model),
-    trainingSeedManifest,
-    trainingDatasetSha256: model.metadata?.trainingData?.sha256 || null,
-  };
+  if (usesLearningModel) {
+    if ((model.metadata?.featureEngine || LEARNING_DECISION_ENGINE) !== CANDIDATE.decisionEngine) {
+      throw new Error('学习模型 featureEngine 与候选引擎不匹配');
+    }
+    const configured = configureOfflineLearningModel(model);
+    if (!configured.ok) throw new Error(`离线学习模型无法配置：${configured.reason}`);
+    valueModelAudit = {
+      id: configured.modelId,
+      featureEngine: configured.featureEngine,
+      status: valueModelStatus(model),
+      purpose: LEARNING_PURPOSE,
+      promoted: false,
+      sha256: modelPayloadSha256(model),
+      trainingSeedManifest,
+      trainingDatasetSha256: model.metadata?.trainingData?.sha256 || null,
+    };
+  } else {
+    const configured = configureHybridValueModel(model, { allowExperimental: true });
+    if (!configured.ok) throw new Error(`价值模型无法用于离线A/B：${configured.reason}`);
+    valueModelAudit = {
+      id: validation.model.id,
+      status: valueModelStatus(model),
+      sha256: modelPayloadSha256(model),
+      trainingSeedManifest,
+      trainingDatasetSha256: model.metadata?.trainingData?.sha256 || null,
+    };
+  }
 }
 
 let activeRun = null;
@@ -518,6 +545,24 @@ function createHybridCounters() {
   };
 }
 
+function createLearningCounters() {
+  return {
+    turns: 0,
+    modelCalls: 0,
+    changed: 0,
+    fallback: 0,
+  };
+}
+
+function recordLearningDecision(run, decision) {
+  if (!run?.learning) return;
+  if (decision?.modelCalls == null && decision?.fallback == null) return;
+  run.learning.turns += 1;
+  run.learning.modelCalls += Number(decision.modelCalls) || 0;
+  run.learning.changed += Number(decision.changed === true);
+  run.learning.fallback += Number(decision.fallback === true);
+}
+
 function recordHybridDecision(run, decision, context = null) {
   const hybrid = decision?.hybrid;
   if (!hybrid || !run?.hybrid) return;
@@ -651,6 +696,7 @@ function playSeatZero(run) {
   const decisionStartedAt = performance.now();
   const decision = chooseAIPlay(view);
   recordHybridDecision(run, decision, view);
+  recordLearningDecision(run, decision);
   traceFirstDivergence(run, 0, view, decision);
   if (!decision) throw new Error('chooseAIPlay 在领出时没有返回出牌');
   if (decision.action === 'pass') {
@@ -843,6 +889,7 @@ function successfulResult(run) {
       roundResults: run.roundResults,
       firstDivergence: run.firstDivergence,
       hybrid: run.hybrid,
+      learning: run.learning,
       decisionTelemetry: run.decisionTelemetry.slice(),
       actions: run.totalActions,
       durationMs: performance.now() - run.startedAt,
@@ -866,6 +913,7 @@ function successfulResult(run) {
     baselineDoubleUp: doubleUp && headTeam !== candidateTeam,
     firstDivergence: run.firstDivergence,
     hybrid: run.hybrid,
+    learning: run.learning,
     decisionTelemetry: run.decisionTelemetry.slice(),
     actions: run.totalActions,
     durationMs: performance.now() - run.startedAt,
@@ -926,6 +974,7 @@ setUpdateCallback(pump);
 setAIDecisionObserver(({ seat, context, decision }) => {
   if (activeRun) {
     recordHybridDecision(activeRun, decision, context);
+    recordLearningDecision(activeRun, decision);
     traceFirstDivergence(activeRun, seat, context, decision);
   }
 });
@@ -974,6 +1023,7 @@ async function playGame({ seed, candidateTeam, level }) {
       totalFallbacks: 0,
       decisionTelemetry: [],
       hybrid: createHybridCounters(),
+      learning: createLearningCounters(),
     };
     activeRun = run;
     run.timeoutId = realSetTimeout(() => {
@@ -2225,6 +2275,18 @@ function summarizeHybridGames(items) {
 }
 
 const hybridTotals = summarizeHybridGames(completedGames);
+function summarizeLearningGames(items) {
+  return items.reduce((total, game) => {
+    const gameLearning = game.learning || createLearningCounters();
+    total.turns += gameLearning.turns || 0;
+    total.modelCalls += gameLearning.modelCalls || 0;
+    total.changed += gameLearning.changed || 0;
+    total.fallback += gameLearning.fallback || 0;
+    return total;
+  }, createLearningCounters());
+}
+const learningTotals = summarizeLearningGames(completedGames);
+const learningRun = isLearningDecisionEngine(CANDIDATE.decisionEngine);
 const finalizedEnvironmentTelemetry = environmentTelemetryPath
   ? new Map(runSegments.map((segment) => [
     segment.runSegmentId,
@@ -2256,6 +2318,7 @@ const performanceByRunSegment = runSegments.map((segment) => {
         ]),
     ),
     hybrid: summarizeHybridGames(segmentGames),
+    learning: summarizeLearningGames(segmentGames),
     ...(environmentTelemetryPath ? {
       environmentTelemetry: finalizedEnvironmentTelemetry.get(segment.runSegmentId)
         || unavailableEnvironmentTelemetry({
@@ -2296,6 +2359,7 @@ const finalReport = {
     comparisonThresholds: COMPARISON.policyThresholds,
     evaluationOpponentModelMode: EVALUATION_OPPONENT_MODEL_MODE,
     valueModel: valueModelAudit,
+    ...(learningRun ? { purpose: LEARNING_PURPOSE, promoted: false } : {}),
     evaluationImplementation,
     hybridEngineVersion: HYBRID_ENGINE_VERSION,
     candidateSearchConfig,
@@ -2361,6 +2425,14 @@ const finalReport = {
     averageIterationsPerAppliedTurn: rounded(hybridTotals.applied
       ? hybridTotals.iterations / hybridTotals.applied : null),
   },
+  learning: {
+    ...learningTotals,
+    changedRate: rounded(learningTotals.turns
+      ? learningTotals.changed / learningTotals.turns : null),
+    fallbackRate: rounded(learningTotals.turns
+      ? learningTotals.fallback / learningTotals.turns : null),
+  },
+  ...(learningRun ? { purpose: LEARNING_PURPOSE, promoted: false } : {}),
   continuousMatch: {
     enabled: continuousMatch,
     matches: continuousMatch ? completedGames.length : 0,

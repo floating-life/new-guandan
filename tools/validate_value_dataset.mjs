@@ -8,21 +8,30 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 const {
   HYBRID_VALUE_FEATURES, HYBRID_VALUE_SCHEMA, extractHybridValueFeatures,
 } = await import('../js/ai-hybrid.js');
 const { isLegalPlay, parseHandVariants, handSignature } = await import('../js/rules.js');
 
-const DATASET_SCHEMA = 'guandan-selfplay-trajectory-v2';
+const DATASET_SCHEMA_V2 = 'guandan-selfplay-trajectory-v2';
+const DATASET_SCHEMA_V3 = 'guandan-selfplay-trajectory-v3';
 const SEED_MANIFEST_SCHEMA = 'guandan-seed-manifest-v1';
+const LEARNING_SEED_REGISTRY_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'learning-seed-registry.json',
+);
 const input = process.argv[2];
 if (!input) throw new Error('请提供 JSONL 文件路径');
 const file = path.resolve(input);
 
 const KEYS = Object.freeze({
   header: ['schema', 'valueSchema', 'rounds', 'baseSeed', 'seedManifest', 'recordCount', 'generatedAt', 'fairness', 'labelScope'],
+  headerV3: ['schema', 'valueSchema', 'rounds', 'baseSeed', 'seedManifest', 'recordCount', 'generatedAt', 'fairness', 'labelScope', 'dealBlocks', 'games', 'levels', 'rotations', 'gamePlan', 'purpose'],
   record: ['schema', 'valueSchema', 'game', 'round', 'turn', 'trickNumber', 'seat', 'observation', 'candidates', 'chosenAction', 'labelScope', 'outcome'],
+  recordV3: ['schema', 'valueSchema', 'game', 'dealGroupId', 'derivedGameId', 'level', 'rotation', 'split', 'startSeat', 'sourceSeat', 'round', 'turn', 'trickNumber', 'seat', 'observation', 'candidates', 'chosenAction', 'labelScope', 'outcome'],
+  gamePlan: ['game', 'dealGroupId', 'derivedGameId', 'baseSeed', 'level', 'rotation', 'split'],
   observation: ['seat', 'hand', 'level', 'lastHand', 'lastSeat', 'handCounts', 'teams', 'finishOrder', 'playedCards', 'publicHistory', 'tributeContext', 'leadAfterOwnBomb'],
   ownCard: ['id', 'rank', 'suit', 'deckIndex'],
   publicCard: ['rank', 'suit', 'deckIndex'],
@@ -41,11 +50,16 @@ const RANKS = new Set([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17]);
 const SUITS = new Set(['S', 'H', 'D', 'C', 'J']);
 const errors = [];
 const games = new Set();
+const actingSeats = new Set();
+const derivedById = new Map();
 let header = null;
+let datasetSchema = DATASET_SCHEMA_V2;
+let learningV3 = false;
 let records = 0;
 let candidates = 0;
 let chosenCandidates = 0;
 let lineCount = 0;
+let learningRegistry = null;
 
 function errorAt(where, message) {
   if (errors.length < 200) errors.push(`${where}: ${message}`);
@@ -81,6 +95,22 @@ function validSeat(value) {
   return Number.isInteger(value) && value >= 0 && value < 4;
 }
 
+function loadLearningSeedRegistry() {
+  if (learningRegistry) return learningRegistry;
+  learningRegistry = JSON.parse(fs.readFileSync(LEARNING_SEED_REGISTRY_PATH, 'utf8'));
+  return learningRegistry;
+}
+
+function registeredLearningSplit(seed) {
+  const value = Number(seed) >>> 0;
+  if (value === 0) return null;
+  const registry = loadLearningSeedRegistry();
+  for (const range of registry.ranges || []) {
+    if (value >= range.baseSeed && value <= range.seedEnd) return range.split;
+  }
+  return null;
+}
+
 function validateSeedManifest(value, where, rounds, baseSeed) {
   if (value == null) return;
   if (!assertShape(value, ['schema', 'seeds'], where)) return;
@@ -97,6 +127,89 @@ function validateSeedManifest(value, where, rounds, baseSeed) {
   if (new Set(value.seeds).size !== value.seeds.length) {
     errorAt(`${where}.seeds`, 'must not contain duplicate seeds');
   }
+}
+
+function validateV3Header(row, where) {
+  if (!Number.isInteger(row.dealBlocks) || row.dealBlocks <= 0) {
+    errorAt(`${where}.dealBlocks`, 'expected positive integer');
+  }
+  if (!Number.isInteger(row.games) || row.games <= 0) {
+    errorAt(`${where}.games`, 'expected positive integer');
+  }
+  if (Number.isInteger(row.rounds) && Number.isInteger(row.games) && row.rounds !== row.games) {
+    errorAt(`${where}.rounds`, 'v3 rounds must equal derived game count');
+  }
+  if (row.purpose !== 'learning-development') {
+    errorAt(`${where}.purpose`, 'v3 datasets must be marked learning-development');
+  }
+  if (!Array.isArray(row.levels) || !row.levels.length
+    || row.levels.some((level) => !Number.isInteger(level) || level < 2 || level > 14)
+    || new Set(row.levels).size !== row.levels.length) {
+    errorAt(`${where}.levels`, 'expected unique ranks in 2..14');
+  }
+  if (!Array.isArray(row.rotations) || !row.rotations.length
+    || row.rotations.some((rotation) => !Number.isInteger(rotation) || rotation < 0 || rotation > 3)
+    || new Set(row.rotations).size !== row.rotations.length) {
+    errorAt(`${where}.rotations`, 'expected unique rotations in 0..3');
+  }
+  if (Number.isInteger(row.dealBlocks) && Number.isInteger(row.baseSeed)) {
+    validateSeedManifest(row.seedManifest, `${where}.seedManifest`, row.dealBlocks, row.baseSeed);
+  }
+  if (!Array.isArray(row.gamePlan) || row.gamePlan.length !== row.games) {
+    errorAt(`${where}.gamePlan`, `expected exactly ${row.games} derived games`);
+    return;
+  }
+  const planIds = new Set();
+  const groupIds = new Set();
+  const planLevels = new Set();
+  const planRotations = new Set();
+  row.gamePlan.forEach((item, index) => {
+    const at = `${where}.gamePlan[${index}]`;
+    if (!assertShape(item, KEYS.gamePlan, at)) return;
+    if (item.game !== index + 1) errorAt(`${at}.game`, 'must be contiguous from 1');
+    if (typeof item.dealGroupId !== 'string' || !item.dealGroupId) {
+      errorAt(`${at}.dealGroupId`, 'expected non-empty id');
+    }
+    if (typeof item.derivedGameId !== 'string' || !item.derivedGameId) {
+      errorAt(`${at}.derivedGameId`, 'expected non-empty id');
+    } else if (planIds.has(item.derivedGameId)) {
+      errorAt(`${at}.derivedGameId`, 'duplicate derivedGameId in plan');
+    } else planIds.add(item.derivedGameId);
+    if (!Number.isInteger(item.baseSeed) || item.baseSeed < 0 || item.baseSeed > 0xFFFFFFFF) {
+      errorAt(`${at}.baseSeed`, 'expected uint32');
+    }
+    if (!Number.isInteger(item.level) || item.level < 2 || item.level > 14) {
+      errorAt(`${at}.level`, 'invalid level rank');
+    }
+    if (!Number.isInteger(item.rotation) || item.rotation < 0 || item.rotation > 3) {
+      errorAt(`${at}.rotation`, 'invalid rotation');
+    }
+    const expectedSplit = registeredLearningSplit(item.baseSeed);
+    if (!expectedSplit) errorAt(`${at}.baseSeed`, 'is not registered for learning self-play');
+    else if (item.split !== expectedSplit) errorAt(`${at}.split`, 'does not match the learning seed registry');
+    groupIds.add(item.dealGroupId);
+    planLevels.add(item.level);
+    planRotations.add(item.rotation);
+  });
+  if (Number.isInteger(row.dealBlocks) && groupIds.size !== row.dealBlocks) {
+    errorAt(`${where}.dealBlocks`, `declares ${row.dealBlocks}, found ${groupIds.size} deal groups`);
+  }
+  for (const level of row.levels || []) {
+    if (!planLevels.has(level)) errorAt(`${where}.levels`, `missing level ${level}`);
+  }
+  for (const level of planLevels) {
+    if (!(row.levels || []).includes(level)) errorAt(`${where}.levels`, `undeclared level ${level}`);
+  }
+  for (const rotation of row.rotations || []) {
+    if (!planRotations.has(rotation)) errorAt(`${where}.rotations`, `missing rotation ${rotation}`);
+  }
+  for (const rotation of planRotations) {
+    if (!(row.rotations || []).includes(rotation)) errorAt(`${where}.rotations`, `undeclared rotation ${rotation}`);
+  }
+}
+
+function planItemFor(derivedGameId) {
+  return (header?.gamePlan || []).find((item) => item.derivedGameId === derivedGameId) || null;
 }
 
 function validateCard(card, where, { own = false } = {}) {
@@ -338,38 +451,84 @@ for await (const line of reader) {
   const where = `line${index + 1}`;
   if (index === 0) {
     header = row;
-    if (!assertShape(row, KEYS.header, where, { requireAll: false })) continue;
-    if (row.schema !== `${DATASET_SCHEMA}-header`) errorAt(`${where}.schema`, 'unexpected header schema');
+    learningV3 = row.schema === `${DATASET_SCHEMA_V3}-header`;
+    datasetSchema = learningV3 ? DATASET_SCHEMA_V3 : DATASET_SCHEMA_V2;
+    if (!assertShape(row, learningV3 ? KEYS.headerV3 : KEYS.header, where, { requireAll: learningV3 })) continue;
+    if (row.schema !== `${datasetSchema}-header`) errorAt(`${where}.schema`, 'unexpected header schema');
     if (row.valueSchema !== HYBRID_VALUE_SCHEMA) errorAt(`${where}.valueSchema`, 'unexpected value schema');
     if (row.fairness !== 'own_hand_plus_public_history_only') errorAt(`${where}.fairness`, 'unexpected fairness declaration');
     if (row.labelScope !== 'trajectory') errorAt(`${where}.labelScope`, 'unexpected label scope');
     if (!Number.isInteger(row.rounds) || row.rounds <= 0) errorAt(`${where}.rounds`, 'expected positive integer');
     if (!Number.isInteger(row.baseSeed) || row.baseSeed < 0 || row.baseSeed > 0xFFFFFFFF) errorAt(`${where}.baseSeed`, 'expected uint32');
-    if (Number.isInteger(row.rounds) && Number.isInteger(row.baseSeed)) {
+    if (!learningV3 && Number.isInteger(row.rounds) && Number.isInteger(row.baseSeed)) {
       validateSeedManifest(row.seedManifest, `${where}.seedManifest`, row.rounds, row.baseSeed);
     }
     if (!Number.isInteger(row.recordCount) || row.recordCount <= 0) errorAt(`${where}.recordCount`, 'expected positive integer');
     if (typeof row.generatedAt !== 'string' || !Number.isFinite(Date.parse(row.generatedAt))) {
       errorAt(`${where}.generatedAt`, 'expected ISO timestamp');
     }
+    if (learningV3) validateV3Header(row, where);
     continue;
   }
 
   records += 1;
-  if (!assertShape(row, KEYS.record, where)) continue;
-  if (row.schema !== DATASET_SCHEMA) errorAt(`${where}.schema`, 'unexpected record schema');
+  if (!assertShape(row, learningV3 ? KEYS.recordV3 : KEYS.record, where)) continue;
+  if (row.schema !== datasetSchema) errorAt(`${where}.schema`, 'unexpected record schema');
   if (row.valueSchema !== HYBRID_VALUE_SCHEMA) errorAt(`${where}.valueSchema`, 'unexpected value schema');
   if (row.labelScope !== 'trajectory') errorAt(`${where}.labelScope`, 'unexpected label scope');
   if (!Number.isInteger(row.game) || row.game <= 0) errorAt(`${where}.game`, 'invalid game id');
   else games.add(row.game);
+  if (learningV3) {
+    const plan = planItemFor(row.derivedGameId);
+    if (typeof row.dealGroupId !== 'string' || !row.dealGroupId) {
+      errorAt(`${where}.dealGroupId`, 'expected non-empty id');
+    }
+    if (typeof row.derivedGameId !== 'string' || !row.derivedGameId) {
+      errorAt(`${where}.derivedGameId`, 'expected non-empty id');
+    } else if (!plan) {
+      errorAt(`${where}.derivedGameId`, 'is not in the declared game plan');
+    } else {
+      if (plan.game !== row.game) errorAt(`${where}.game`, 'does not match gamePlan');
+      if (plan.dealGroupId !== row.dealGroupId) {
+        errorAt(`${where}.dealGroupId`, 'inconsistent dealGroupId for derived game');
+      }
+      if (plan.level !== row.level) errorAt(`${where}.level`, 'does not match gamePlan');
+      if (plan.rotation !== row.rotation) errorAt(`${where}.rotation`, 'does not match gamePlan');
+      if (plan.split !== row.split) errorAt(`${where}.split`, 'does not match gamePlan');
+      const seen = derivedById.get(row.derivedGameId);
+      if (seen && seen.game !== row.game) {
+        errorAt(`${where}.derivedGameId`, 'duplicate derivedGameId');
+      } else if (!seen) {
+        derivedById.set(row.derivedGameId, { game: row.game, dealGroupId: row.dealGroupId, split: row.split });
+      } else if (seen.dealGroupId !== row.dealGroupId || seen.split !== row.split) {
+        errorAt(`${where}.dealGroupId`, 'inconsistent dealGroupId for derived game');
+      }
+    }
+    if (!Number.isInteger(row.level) || row.level < 2 || row.level > 14) {
+      errorAt(`${where}.level`, 'invalid level rank');
+    }
+    if (!Number.isInteger(row.rotation) || row.rotation < 0 || row.rotation > 3) {
+      errorAt(`${where}.rotation`, 'invalid rotation');
+    }
+    if (!validSeat(row.startSeat)) errorAt(`${where}.startSeat`, 'invalid seat');
+    if (!validSeat(row.sourceSeat)) errorAt(`${where}.sourceSeat`, 'invalid seat');
+    else if (Number.isInteger(row.rotation) && validSeat(row.seat)
+      && row.sourceSeat !== (row.seat - row.rotation + 4) % 4) {
+      errorAt(`${where}.sourceSeat`, 'does not match seat and rotation');
+    }
+  }
   for (const key of ['round', 'turn', 'trickNumber']) {
     if (row[key] != null && (!Number.isInteger(row[key]) || row[key] < 0)) {
       errorAt(`${where}.${key}`, 'expected non-negative integer or null');
     }
   }
   if (!validSeat(row.seat)) errorAt(`${where}.seat`, 'invalid seat');
+  else actingSeats.add(row.seat);
   const ownById = validateObservation(row.observation, `${where}.observation`);
   if (row.seat !== row.observation?.seat) errorAt(where, 'record seat differs from observation seat');
+  if (learningV3 && Number.isInteger(row.level) && row.observation?.level !== row.level) {
+    errorAt(`${where}.observation.level`, 'does not match record level');
+  }
   if (!Array.isArray(row.candidates) || !row.candidates.length) {
     errorAt(`${where}.candidates`, 'no candidates');
     continue;
@@ -429,6 +588,27 @@ if (header) {
   if (Number(header.rounds) !== games.size) errorAt('line1.rounds', `declares ${header.rounds}, found ${games.size} game ids`);
   const expectedGames = Array.from({ length: Number(header.rounds) || 0 }, (_, index) => index + 1);
   if (expectedGames.some((game) => !games.has(game))) errorAt('line1.rounds', 'game ids are not contiguous from 1');
+  if (learningV3) {
+    if (Number(header.games) !== games.size) {
+      errorAt('line1.games', `declares ${header.games}, found ${games.size} game ids`);
+    }
+    for (const item of header.gamePlan || []) {
+      if (!derivedById.has(item.derivedGameId)) {
+        errorAt('line1.gamePlan', `missing records for ${item.derivedGameId}`);
+      }
+    }
+    const groupSplits = new Map();
+    for (const item of header.gamePlan || []) {
+      const seenSplit = groupSplits.get(item.dealGroupId);
+      if (seenSplit && seenSplit !== item.split) {
+        errorAt('line1.gamePlan', `inconsistent dealGroupId split for ${item.dealGroupId}`);
+      }
+      groupSplits.set(item.dealGroupId, item.split);
+    }
+    if ([0, 1, 2, 3].some((seat) => !actingSeats.has(seat))) {
+      errorAt('records', 'v3 dataset must contain acting seats 0,1,2,3');
+    }
+  }
 }
 
 if (errors.length) {

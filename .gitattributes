@@ -1,4 +1,4 @@
-# 评测闭包字节冻结：以下 22 个文件参与 guandan-evaluation-implementation-v2
+# 评测闭包字节冻结：以下 23 个文件参与 guandan-evaluation-implementation-v2
 # 指纹（js/ai.ab.simulation.js EVALUATION_IMPLEMENTATION_SOURCES），正式报告
 # 的逐文件/聚合 SHA-256 按工作树原始字节计算。
 # closure-eol 宏：
@@ -11,6 +11,7 @@
 # 新增或移除该清单成员时必须同步更新本文件。
 [attr]closure-eol -text whitespace=cr-at-eol
 js/ai-hybrid.js closure-eol
+js/ai-learning.js closure-eol
 js/ai-observation.js closure-eol
 js/ai-route.js closure-eol
 js/ai.ab.environment-telemetry.js closure-eol

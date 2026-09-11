@@ -34,6 +34,16 @@ import {
 } from './ai-route.js';
 import { chooseHybridFromConsultation } from './ai-hybrid.js';
 import { applySearchTimeBudget } from './ai.js';
+import { createPublicAIObservation } from './ai-observation.js';
+import {
+  LEARNING_DECISION_ENGINE,
+  configureOfflineLearningModel,
+} from './ai-learning.js';
+import { aiDecisionContext, createMatch, PHASE } from './game.js';
+import { normalizeLocalAiEngine } from './stats.js';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 let passed = 0;
 let failed = 0;
@@ -2983,11 +2993,39 @@ console.log('强制专家消融臂变体');
 console.log('ismcts-v3 根候选成对采样变体');
 {
   const v3 = resolvePolicyVariant('ismcts-v3');
+  const bombSlot = resolvePolicyVariant('ismcts-v3-bomb-slot');
   const v2 = resolvePolicyVariant('ismcts-v2');
   assert(v3.policyProfile === 'expert' && v3.decisionEngine === 'ismcts-v3'
     && v3.policyFeatures.p0 && v3.policyFeatures.endgame
     && JSON.stringify(v3.policyFeatures) === JSON.stringify(v2.policyFeatures),
   'ismcts-v3 与 v2 共享专家特征集，仅以独立决策引擎标识驱动成对 sweep');
+  assert(bombSlot.policyProfile === 'expert'
+      && bombSlot.decisionEngine === 'ismcts-v3-bomb-slot'
+      && JSON.stringify(bombSlot.policyFeatures) === JSON.stringify(v3.policyFeatures),
+  '炸弹槽候选保持 expert 特征，仅以精确离线变体标识驱动');
+  const bombSlotConfig = resolveHybridSearchConfig('ismcts-v3-bomb-slot', { deterministic: true });
+  assert(JSON.stringify(bombSlotConfig) === JSON.stringify(resolveHybridSearchConfig('ismcts-v3', {
+    deterministic: true,
+  })), '炸弹槽候选复用 v3 的搜索模式、预算与采样配置');
+  const observation = createPublicAIObservation(context([], {
+    decisionEngine: 'ismcts-v3-bomb-slot', handCounts: [0, 0, 0, 0],
+  }));
+  const unknownObservation = createPublicAIObservation(context([], {
+    decisionEngine: 'ismcts-v3-bomb-slot-typo', handCounts: [0, 0, 0, 0],
+  }));
+  assert(observation.decisionEngine === 'ismcts-v3-bomb-slot'
+      && unknownObservation.decisionEngine === 'expert',
+  '公共观察仅保留精确炸弹槽候选名，未知变体仍回落 expert');
+  assert(resolvePolicyVariant('expert').decisionEngine === 'expert'
+      && resolvePolicyVariant().decisionEngine === 'expert',
+  '默认 expert 不是炸弹槽离线臂');
+  assert(normalizeLocalAiEngine('ismcts-v3-bomb-slot') === 'expert'
+      && normalizeLocalAiEngine('ismcts-v3') === 'expert',
+  '设置白名单不含 ismcts-v3 与炸弹槽离线臂，写入后回落 expert');
+  const productHtml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.html'), 'utf8');
+  assert(!productHtml.includes('value="ismcts-v3-bomb-slot"')
+      && !productHtml.includes('value="ismcts-v3"'),
+  '产品选择器不暴露 ismcts-v3 或炸弹槽离线臂');
 }
 
 console.log('确定性搜索预算配置');
@@ -4387,6 +4425,226 @@ console.log('STRAT-5：共享 eligible-action 层');
       && yieldHybrid.decision?.hybrid?.searchTriggered === false
       && yieldHybrid.decision?.hybrid?.finalCandidateId === 'pass',
   'STRAT-4 只剩过牌时混合层不搜索，回退过牌而不是抢队友牌');
+}
+
+console.log('AI-LOCAL-002B：下载复盘守卫默认关闭');
+{
+  const external = JSON.parse(readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'tools', 'external-strategy-counterexamples.json'),
+    'utf8',
+  ));
+  const expert = resolvePolicyVariant('expert');
+  const guards = resolvePolicyVariant('with-downloaded-replay-guards');
+  assert(expert.policyFeatures.downloadedReplayGuards === false
+      && expert.policyFeatures.enemyReportLeadSafety === false
+      && expert.policyFeatures.partnerTrickControl === false,
+  '正式 expert 不打开下载复盘守卫，也不翻 STRAT-3/4');
+  assert(guards.policyFeatures.downloadedReplayGuards === true
+      && guards.policyFeatures.enemyReportLeadSafety === false
+      && guards.policyFeatures.partnerTrickControl === false,
+  '下载复盘守卫是独立开关，不把 STRAT-3/4 正式旗标一并打开');
+
+  function fixtureCtx(fixture, features) {
+    const observation = fixture.observation;
+    const hand = observation.hand.map((card) => C(card.rank, card.suit, card.deckIndex));
+    const latestPlay = [...observation.publicHistory].reverse().find((event) => event.action === 'play');
+    const lastCards = (latestPlay?.cards || []).map((card) => C(card.rank, card.suit, card.deckIndex));
+    const lastHand = lastCards.length ? parseHand(lastCards, observation.level) : null;
+    return {
+      ...observation,
+      hand,
+      lastHand,
+      policyFeatures: features,
+      mode: lastHand ? 'beat' : 'lead',
+    };
+  }
+
+  for (const fixture of external.fixtures.filter((item) => (
+    item.rule === 'AI-DATA-001-enemy-report-lead'
+    || item.rule === 'AI-DATA-001-partner-trick-control'
+  ))) {
+    const candidates = fixture.candidates.map((candidate) => (
+      candidate.action === 'pass'
+        ? { action: 'pass', cards: [], hand: null, signature: null }
+        : {
+          action: 'play',
+          cards: candidate.cards.map((card) => C(card.rank, card.suit, card.deckIndex)),
+          hand: parseHand(candidate.cards.map((card) => C(card.rank, card.suit, card.deckIndex)), fixture.observation.level),
+          signature: candidate.signature,
+        }
+    ));
+    const frozen = Object.freeze(candidates);
+    const off = filterEligibleStrategyActions(frozen, fixtureCtx(fixture, expert.policyFeatures));
+    assert(off.entries === frozen,
+      `${fixture.id} expert 默认不改候选集合`);
+    const onSource = candidates.slice();
+    const on = filterEligibleStrategyActions(onSource, fixtureCtx(fixture, guards.policyFeatures));
+    assert(on.entries !== onSource && on.entries.length > 0,
+      `${fixture.id} 打开下载复盘守卫后过滤候选`);
+    for (const blocked of fixture.expected.blockedActions) {
+      assert(!on.entries.some((entry) => (
+        entry.action === 'pass' ? blocked === 'pass'
+          : `play:${entry.cards.map((card) => `${card.rank}:${card.suit}:${card.deckIndex}`).sort().join(',')}` === blocked
+      )), `${fixture.id} 阻断 ${blocked}`);
+    }
+    if (fixture.expected.preferredAction === 'pass') {
+      assert(on.entries.some((entry) => entry.action === 'pass'), `${fixture.id} 接风保留过牌`);
+    }
+  }
+}
+
+console.log('AI-LOCAL-002C：下载残局守卫默认关闭');
+{
+  const external = JSON.parse(readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'tools', 'external-strategy-counterexamples.json'),
+    'utf8',
+  ));
+  const expert = resolvePolicyVariant('expert');
+  const guards = resolvePolicyVariant('with-downloaded-endgame-guards');
+  assert(expert.policyFeatures.downloadedEndgameGuards === false
+      && expert.policyFeatures.downloadedReplayGuards === false
+      && expert.policyFeatures.enemyReportLeadSafety === false
+      && expert.policyFeatures.partnerTrickControl === false,
+  '正式 expert 不打开下载残局守卫，也不翻 STRAT-3/4 或 002B 守卫');
+  assert(guards.policyFeatures.downloadedEndgameGuards === true
+      && guards.policyFeatures.downloadedReplayGuards === false
+      && guards.policyFeatures.enemyReportLeadSafety === false
+      && guards.policyFeatures.partnerTrickControl === false,
+  '残局守卫是独立开关，不把 STRAT-3/4 或报单/接风守卫一并打开');
+
+  function fixtureCtx(fixture, features) {
+    const observation = fixture.observation;
+    const hand = observation.hand.map((card) => C(card.rank, card.suit, card.deckIndex));
+    const latestPlay = [...observation.publicHistory].reverse().find((event) => event.action === 'play');
+    const lastCards = (latestPlay?.cards || []).map((card) => C(card.rank, card.suit, card.deckIndex));
+    const lastHand = lastCards.length ? parseHand(lastCards, observation.level) : null;
+    return {
+      ...observation,
+      hand,
+      lastHand,
+      policyFeatures: features,
+      mode: lastHand ? 'beat' : 'lead',
+    };
+  }
+
+  const endgameFixtures = external.fixtures.filter((item) => item.rule === 'AI-DATA-001-endgame-intercept');
+  assert(endgameFixtures.length >= 1, '外部夹具含残局拦截');
+  for (const fixture of endgameFixtures) {
+    const candidates = fixture.candidates.map((candidate) => (
+      candidate.action === 'pass'
+        ? { action: 'pass', cards: [], hand: null, signature: null }
+        : {
+          action: 'play',
+          cards: candidate.cards.map((card) => C(card.rank, card.suit, card.deckIndex)),
+          hand: parseHand(candidate.cards.map((card) => C(card.rank, card.suit, card.deckIndex)), fixture.observation.level),
+          signature: candidate.signature,
+        }
+    ));
+    const frozen = Object.freeze(candidates);
+    const off = filterEligibleStrategyActions(frozen, fixtureCtx(fixture, expert.policyFeatures));
+    assert(off.entries === frozen, `${fixture.id} expert 默认不改候选集合`);
+    const onSource = candidates.slice();
+    const on = filterEligibleStrategyActions(onSource, fixtureCtx(fixture, guards.policyFeatures));
+    assert(on.entries !== onSource && on.entries.length > 0,
+      `${fixture.id} 打开下载残局守卫后过滤候选`);
+    assert(!on.entries.some((entry) => entry.action === 'pass'),
+      `${fixture.id} 阻断过牌`);
+  }
+}
+
+console.log('LEARN-002：离线 learned-value-v1 选牌');
+{
+  const learningModel = {
+    schema: 'guandan-candidate-v1',
+    id: 'ai-test-learning-fixture',
+    layers: [{
+      weights: [Array.from({ length: 32 }, (_, index) => (
+        index === 3 ? 8 : index === 6 ? -100 : 0
+      ))],
+      bias: [0],
+      activation: 'linear',
+    }],
+  };
+  const hand = [C(3, 'S'), C(7, 'H'), C(10, 'D')];
+  const lastHand = parseHand([C(6, 'C', 1)], 2);
+  const baseCtx = context(hand, {
+    level: 2,
+    lastHand,
+    lastSeat: 1,
+    handCounts: [3, 5, 5, 5],
+    difficulty: 'master',
+    deterministic: true,
+    timeBudgetMs: 0,
+  });
+  const learning = resolvePolicyVariant('learned-value-v1');
+  assert(learning.decisionEngine === LEARNING_DECISION_ENGINE
+      && learning.policyProfile === 'expert',
+    'learned-value-v1 是独立实验引擎，策略权重仍是 expert');
+  assert(createPublicAIObservation({
+    ...baseCtx, decisionEngine: LEARNING_DECISION_ENGINE, handCounts: [3, 5, 5, 5],
+  }).decisionEngine === LEARNING_DECISION_ENGINE,
+  '公开观察白名单保留 learned-value-v1');
+  const productHtml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.html'), 'utf8');
+  assert(!productHtml.includes('value="learned-value-v1"')
+      && !productHtml.includes('learned-value-v1'),
+  '产品选择器不暴露 learned-value-v1');
+
+  configureOfflineLearningModel(learningModel);
+  try {
+    const expertPlay = chooseAIPlay({ ...baseCtx, decisionEngine: 'expert' });
+    const learnedPlay = chooseAIPlay({ ...baseCtx, decisionEngine: LEARNING_DECISION_ENGINE });
+    assert(learnedPlay?.action === 'play' && learnedPlay.modelCalls >= 2
+        && learnedPlay.fallback === false
+        && learnedPlay.hybrid == null,
+    '关闭搜索时学习路径仍能直接选牌并计数模型调用');
+    assert(String(learnedPlay.cards?.[0]?.id) !== String(expertPlay.cards?.[0]?.id),
+      '非恒定固定模型可以改变 expert 选择');
+    assert(expertPlay.modelCalls == null && expertPlay.fallback == null,
+      'expert 控制侧不受全局学习模型影响');
+
+    configureOfflineLearningModel({ broken: true });
+    const broken = chooseAIPlay({ ...baseCtx, decisionEngine: LEARNING_DECISION_ENGINE });
+    assert(broken.fallback === true
+        && String(broken.cards?.[0]?.id) === String(expertPlay.cards?.[0]?.id),
+    '损坏模型回退 expert 并计数 fallback');
+
+    const state = createMatch({
+      difficulty: 'master',
+      deterministicAI: true,
+      sealedTraining: false,
+      opponentModelMode: 'off',
+      aiDifficultyBySeat: ['master', 'master', 'master', 'master'],
+      aiDecisionEngineBySeat: [
+        LEARNING_DECISION_ENGINE, LEARNING_DECISION_ENGINE, 'expert', 'expert',
+      ],
+    });
+    state.phase = PHASE.PLAYING;
+    state.currentLevel = 2;
+    state.hands = [
+      hand,
+      [C(4, 'S'), C(8, 'H'), C(9, 'D')],
+      [C(5, 'S'), C(5, 'H'), C(5, 'D')],
+      [C(11, 'S'), C(12, 'H'), C(13, 'D')],
+    ];
+    state.handCounts = state.hands.map((seatHand) => seatHand.length);
+    state.lastHand = lastHand;
+    state.lastSeat = 3;
+    configureOfflineLearningModel(learningModel);
+    const seatZero = chooseAIPlay({
+      ...aiDecisionContext(state, 0), deterministic: true, timeBudgetMs: 0,
+    });
+    const computerSeat = chooseAIPlay({
+      ...aiDecisionContext(state, 1), deterministic: true, timeBudgetMs: 0,
+    });
+    assert(aiDecisionContext(state, 0).decisionEngine === LEARNING_DECISION_ENGINE
+        && seatZero.modelCalls >= 2,
+    '0 号同步路径经 game.aiDecisionContext 实际调用模型');
+    assert(aiDecisionContext(state, 1).decisionEngine === LEARNING_DECISION_ENGINE
+        && computerSeat.modelCalls >= 2,
+    '电脑座位经 game.aiDecisionContext 实际调用模型');
+  } finally {
+    configureOfflineLearningModel(null);
+  }
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

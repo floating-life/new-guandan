@@ -25,6 +25,7 @@ import {
   publicPartnerProtectionValue,
 } from './ai-route.js';
 import { chooseHybridFromConsultation } from './ai-hybrid.js';
+import { LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, isLearningDecisionEngine, chooseLearningPlay } from './ai-learning.js';
 import { opponentPlayAdjustment } from './opponent-model.js';
 
 export const AI_DIFFICULTY = {
@@ -54,6 +55,8 @@ const POLICY_FEATURE_KEYS = [
   'softOrdinaryPressure', 'highShedRunBlock', 'reserveHighControlLead',
   'partnerTrickControl',
   'enemyReportLeadSafety',
+  'downloadedReplayGuards',
+  'downloadedEndgameGuards',
   ...CONTROL_V2_FEATURE_KEYS,
 ];
 const EXPERT_POLICY_FEATURES = Object.freeze({
@@ -96,6 +99,11 @@ const EXPERT_POLICY_FEATURES = Object.freeze({
   partnerTrickControl: false,
   // STRAT-3：任一对手报单时，仅在存在安全替代路线时阻断低单领出。
   enemyReportLeadSafety: false,
+  // AI-LOCAL-002B：南邮公平轨迹反例驱动的报单/接风守卫。默认关闭，不翻
+  // STRAT-3/4 正式旗标；仅 with-downloaded-replay-guards 变体打开。
+  downloadedReplayGuards: false,
+  // AI-LOCAL-002C：残局公开手数≤5 且有普通接法时阻断过牌。默认关闭。
+  downloadedEndgameGuards: false,
 });
 const EXPERIMENTAL_P2_POLICY_FEATURES = Object.freeze({
   ...EXPERT_POLICY_FEATURES,
@@ -123,6 +131,8 @@ const BASELINE_POLICY_FEATURES = Object.freeze({
   reserveHighControlLead: false,
   partnerTrickControl: false,
   enemyReportLeadSafety: false,
+  downloadedReplayGuards: false,
+  downloadedEndgameGuards: false,
 });
 
 function withControlV2Features(features, enabled) {
@@ -160,7 +170,7 @@ const ISMCTS_V2_POLICY_VARIANT = Object.freeze({
 // 本地混合引擎标识全集（含消融臂）。各校验点统一引用，避免多点维护漏改。
 const HYBRID_DECISION_ENGINES = Object.freeze([
   'hybrid', 'pimc-v1', 'ismcts', 'root-pimc-v1', 'ismcts-v2', 'ismcts-v3',
-  'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe',
+  'ismcts-v3-bomb-slot', 'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe',
 ]);
 
 /**
@@ -173,7 +183,9 @@ export function resolveHybridSearchConfig(decisionEngine, {
   timeBudgetMs = 0,
 } = {}) {
   const raw = String(decisionEngine || '');
-  const baseDecisionEngine = raw.endsWith('-fxe') ? raw.slice(0, -'-fxe'.length) : raw;
+  const baseDecisionEngine = raw === 'ismcts-v3-bomb-slot'
+    ? 'ismcts-v3'
+    : raw.endsWith('-fxe') ? raw.slice(0, -'-fxe'.length) : raw;
   const extendedBudget = Number(timeBudgetMs) >= 500;
   return {
     candidateLimit: 6,
@@ -201,6 +213,16 @@ export function resolveHybridSearchConfig(decisionEngine, {
  * 只关闭被测模块，避免旧 baseline 同时关闭多项能力而污染归因。
  */
 export const AI_POLICY_VARIANTS = Object.freeze({
+  'learned-context-v1': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: LEARNING_CONTEXT_ENGINE,
+  }),
+  'learned-value-v1': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: LEARNING_DECISION_ENGINE,
+  }),
   expert: Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERT_POLICY_FEATURES,
@@ -224,6 +246,13 @@ export const AI_POLICY_VARIANTS = Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERT_POLICY_FEATURES,
     decisionEngine: 'ismcts-v3',
+  }),
+  // 仅供 ALGO-3 离线诊断：保留 v3 的预算与根候选，显式开启内节点最小炸弹槽。
+  // 不加入 UI 设置；正式晋级仍需独立覆盖、收益、灾难率与性能证据。
+  'ismcts-v3-bomb-slot': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: 'ismcts-v3-bomb-slot',
   }),
   // 消融臂（仅 A/B 评测，不进 UI 设置）：搜索与遥测照常，最终决策强制保持
   // 专家首选；与正常臂在同一确定性种子下的配对差值即“搜索改选”的净贡献。
@@ -370,6 +399,15 @@ export const AI_POLICY_VARIANTS = Object.freeze({
     policyProfile: 'expert',
     policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, partnerTrickControl: true }),
   }),
+  // 下载复盘守卫：复用 STRAT-3/4 共享过滤层，但不打开其正式旗标。
+  'with-downloaded-replay-guards': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, downloadedReplayGuards: true }),
+  }),
+  'with-downloaded-endgame-guards': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: Object.freeze({ ...EXPERT_POLICY_FEATURES, downloadedEndgameGuards: true }),
+  }),
   // 实验性锐化变体：仅在 head-to-head A/B 中使用，不改默认 expert 行为。
   // 默认 expert 的 P0/P1 阈值是 p0LeadGate=0.8 / p0StopGate=0.8 /
   // p1SpreadFloor=0.04；锐化变体用于验证模块只在风险差更明显时介入的灵敏度。
@@ -454,6 +492,7 @@ export function resolvePolicyVariant(name = 'expert') {
     policyFeatures: { ...variant.policyFeatures },
     policyThresholds: variant.policyThresholds ? { ...variant.policyThresholds } : null,
     decisionEngine: HYBRID_DECISION_ENGINES.includes(variant.decisionEngine)
+      || isLearningDecisionEngine(variant.decisionEngine)
       ? variant.decisionEngine : 'expert',
   };
 }
@@ -662,12 +701,15 @@ export function chooseAIPlay(ctx) {
       hybrid: consultation.hybrid || null,
     };
   }
-  return chooseAIPlayInternal(ctx, {
+  const expertDecision = chooseAIPlayInternal(ctx, {
     explain: false,
     deterministic: !!ctx?.deterministic,
     difficulty: selectedDifficulty,
     timeBudgetMs: Number(ctx?.timeBudgetMs) || 0,
   });
+  return isLearningDecisionEngine(ctx?.decisionEngine)
+    ? chooseLearningPlay(ctx, expertDecision)
+    : expertDecision;
 }
 
 /**
@@ -2750,6 +2792,7 @@ export function getAIConsultation(ctx, options = {}) {
       const hybrid = chooseHybridFromConsultation(ctx, hybridInput, {
         ...searchConfig,
         forceExpertChoice,
+        reserveBombSlot: ctx?.decisionEngine === 'ismcts-v3-bomb-slot',
         deadlineMs,
       });
       const decision = hybrid?.decision;

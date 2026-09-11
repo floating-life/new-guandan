@@ -305,7 +305,7 @@ assert.equal(evaluationImplementation?.schema, 'guandan-evaluation-implementatio
 const receiptSources = (evaluationImplementation?.sources || []).map((source) => source.file).sort();
 assert.deepEqual(receiptSources, collectEvaluationRuntimeClosure(runner),
   '评测回执源码清单必须精确覆盖 runner、game.js 及其 Worker/评价/存储闭包');
-assert.equal(receiptSources.length, 22, '当前评测依赖闭包必须包含运行环境遥测、实时复盘契约与密封训练捕获在内的 22 个源码文件');
+assert.equal(receiptSources.length, 23, '当前评测依赖闭包必须包含运行环境遥测、实时复盘契约、密封训练捕获与离线学习选牌在内的 23 个源码文件');
 for (const source of evaluationImplementation.sources) {
   assert.match(source.sha256, /^[a-f0-9]{64}$/,
     `评测依赖必须记录有效 SHA-256：${source.file}`);

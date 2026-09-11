@@ -100,6 +100,8 @@ $nodeTests = @(
   'js/ai.test.js',
   'js/ai.hybrid.test.js',
   'tools/test_strategy_counterexamples.mjs',
+  'tools/test_external_strategy_counterexamples.mjs',
+  'tools/test_audit_external_training_admission.mjs',
   'tools/test_strat6_ablation.mjs',
   'tools/test_strat6_summarize.mjs',
   'tools/test_expert_release_acceptance.mjs',
@@ -130,6 +132,12 @@ $nodeTests = @(
   'tools/test_summarize_ai_performance_baseline.mjs',
   'tools/test_analyze_statefix_performance.mjs',
   'tools/test_analyze_search_tail_attribution.mjs',
+  'tools/test_ai_local_baseline.mjs',
+  'tools/test_ai_local_003_coverage_plan.mjs',
+  'tools/test_selfplay_dataset.mjs',
+  'tools/test_learning_labels.mjs',
+  'tools/test_learning_model_parity.mjs',
+  'tools/test_local_learning_arena.mjs',
   'tools/test_blind_eval_tools.mjs',
   'tools/test_validate_release_evidence.mjs',
   'tools/test_validate_m2_release.mjs',
@@ -147,7 +155,8 @@ $pythonTests = @(
   'tools/test_import_njupt_data.py',
   'tools/test_guandan_env_contract.py',
   'tools/test_read_browser_replays.py',
-  'tools/download_njupt_archives.py --self-test'
+  'tools/download_njupt_archives.py --self-test',
+  'tools/test_train_learning_model.py'
 )
 foreach ($test in $pythonTests) {
   Invoke-Step "python $test" {

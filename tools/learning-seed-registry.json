@@ -1,0 +1,106 @@
+{
+  "schema": "guandan-learning-seed-registry-v1",
+  "ruleVersion": "guandan-rules-v1",
+  "purpose": "Informal LEARN local-research seed reservation. Not formal release evidence. Ranges are reserved until the owning LEARN task actually runs; they must not be reported as consumed formal seeds.",
+  "comparison": "expert",
+  "consumed": true,
+  "levels": "all",
+  "rotations": [0, 1, 2, 3],
+  "ranges": [
+    {
+      "id": "pipeline-smoke",
+      "role": "pipeline-smoke",
+      "split": "smoke",
+      "baseSeed": 3400000000,
+      "groupCount": 1,
+      "seedEnd": 3400000000,
+      "levels": "all",
+      "rotations": [0, 1, 2, 3],
+      "derivedGames": 52,
+      "trainingEligible": false,
+      "selfplay": true,
+      "status": "completed",
+      "completedGames": 52,
+      "notes": "52-game collector smoke and separate 4-game arena smoke completed. Pipeline smoke only; do not train."
+    },
+    {
+      "id": "own-train",
+      "role": "own-train",
+      "split": "train",
+      "baseSeed": 3100000000,
+      "groupCount": 16,
+      "seedEnd": 3100000015,
+      "levels": "all",
+      "rotations": [0, 1, 2, 3],
+      "derivedGames": 832,
+      "trainingEligible": true,
+      "selfplay": true,
+      "status": "completed",
+      "completedGames": 832,
+      "notes": "First 16 of 20 own self-play deal groups collected in LEARN-005; actual source and collector segments recorded in execution manifests."
+    },
+    {
+      "id": "own-validation",
+      "role": "own-validation",
+      "split": "validation",
+      "baseSeed": 3100000016,
+      "groupCount": 4,
+      "seedEnd": 3100000019,
+      "levels": "all",
+      "rotations": [0, 1, 2, 3],
+      "derivedGames": 208,
+      "trainingEligible": true,
+      "selfplay": true,
+      "status": "completed",
+      "completedGames": 208,
+      "notes": "Last 4 of 20 own self-play deal groups collected. Held out from fitting; collector-only failure reproduced and repaired without policy changes."
+    },
+    {
+      "id": "development-comparison",
+      "role": "development-comparison",
+      "split": "development",
+      "baseSeed": 3200000000,
+      "groupCount": 10,
+      "seedEnd": 3200000009,
+      "levels": "all",
+      "candidateTeams": [0, 1],
+      "derivedGames": 260,
+      "trainingEligible": false,
+      "selfplay": false,
+      "status": "completed",
+      "completedModels": 3,
+      "completedGamesPerModel": 260,
+      "notes": "Three declared models completed development on these seen seeds. All negative utility; no candidate qualified for independent confirmation."
+    },
+    {
+      "id": "independent-confirmation",
+      "role": "independent-confirmation",
+      "split": "confirmation",
+      "baseSeed": 3300000000,
+      "groupCount": 10,
+      "seedEnd": 3300000009,
+      "levels": "all",
+      "candidateTeams": [0, 1],
+      "derivedGames": 260,
+      "trainingEligible": false,
+      "selfplay": false,
+      "status": "reserved",
+      "notes": "Same scale as development. Frozen candidate only; do not feed back into this round of tuning."
+    }
+  ],
+  "reservedNonSelfplay": [
+    {
+      "id": "teacher-world-rng",
+      "role": "teacher-world-rng",
+      "baseSeed": 3500000000,
+      "status": "completed",
+      "notes": "Independent RNG stream sampled from public observations. Never recover hidden cards from the original deal seed."
+    }
+  ],
+  "forbiddenZeroAlias": [0],
+  "notes": [
+    "Do not reuse historical formal seeds, STRAT-6 formal/smoke ranges, or the stopped 20265401-20265480 fxe range.",
+    "Deal-group seeds are contiguous uint32 values baseSeed..seedEnd. Derived games reuse the group seed; they do not consume extra uint32 seeds.",
+    "Training deal groups must never appear in development or confirmation splits."
+  ]
+}
