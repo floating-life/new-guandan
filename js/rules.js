@@ -459,7 +459,10 @@ export function generateLegalPlays(hand, level, lastHand) {
 
   const add = (cards) => {
     if (!cards.length) return;
-    const physicalKey = cards.map((c) => String(c.id)).sort().join(',');
+    // 单张无需 sort；多张仍按 id 排序保证物理键稳定。
+    const physicalKey = cards.length === 1
+      ? String(cards[0].id)
+      : cards.map((c) => String(c.id)).sort().join(',');
     let variants = parsedByPhysicalCards.get(physicalKey);
     if (!variants) {
       variants = parseHandVariants(cards, level);
@@ -471,7 +474,12 @@ export function generateLegalPlays(hand, level, lastHand) {
       const key = `${physicalKey}::${signature}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      plays.push({ cards: cards.slice(), hand: parsed, signature });
+      // add([c]) 每次新建数组，单张可复用引用；多张仍拷贝以免共享可变数组。
+      plays.push({
+        cards: cards.length === 1 ? cards : cards.slice(),
+        hand: parsed,
+        signature,
+      });
     }
   };
 

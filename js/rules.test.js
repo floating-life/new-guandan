@@ -335,5 +335,21 @@ console.log('纯逢人配默认兼容与最小压牌');
   assert(legal.ok && legal.hand.mainRank === 6, '自动选择刚好压过对5的对6声明');
 }
 
+console.log('AI-LOCAL-003-OPT：generateLegalPlays 签名序金标');
+{
+  const hand = [C(3, 'S'), C(3, 'H'), C(5, 'D'), C(7, 'C'), C(9, 'H'), C(14, 'S')];
+  const lead = generateLegalPlays(hand, 2, null);
+  const last = parseHand([C(4, 'C')], 2);
+  const beat = generateLegalPlays(hand, 2, last);
+  const sigs = (plays) => plays.map((play) => play.signature).join('|');
+  const ids = (plays) => plays.map((play) => play.cards.map((card) => String(card.id)).join(',')).join(';');
+  assert(lead.length === 7 && sigs(lead) === 'single|1|3||||single|1|3||||single|1|5||||single|1|7||||single|1|9||||single|1|14||||pair|2|3|||',
+    '领出签名序列不得因分配加速改序');
+  assert(beat.length === 4 && sigs(beat) === 'single|1|5||||single|1|7||||single|1|9||||single|1|14|||',
+    '接单签名序列不得因分配加速改序');
+  assert(ids(lead) === ids(generateLegalPlays(hand, 2, null)),
+    '同一输入实体牌 id 序列稳定');
+}
+
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

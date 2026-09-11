@@ -1,0 +1,568 @@
+{
+  "schema": "guandan-external-strategy-counterexample-set-v1",
+  "ruleVersion": "guandan-rules-v1",
+  "trainingEligible": false,
+  "diagnosticOnly": true,
+  "sourceFingerprint": {
+    "files": [
+      {
+        "file": "js/cards.js",
+        "sha256": "c27bb5693fad1c21194422e8eb772ed3a20b0e784c521d5d71748280155f0820",
+        "bytes": 3660
+      },
+      {
+        "file": "js/rules.js",
+        "sha256": "be31def27ea002def6b3e6aeec49aad6bd30c08b1ad50c4990965420f561e19e",
+        "bytes": 33075
+      },
+      {
+        "file": "js/strategy-core.js",
+        "sha256": "79cb3596359e4ba50a13d27e1f8c23ed5f4a736be77c814ebbce6473b3b825db",
+        "bytes": 80807
+      }
+    ],
+    "sha256": "3796306c52a843b4662a46ae3781e9b12902c7da8aa20e79c0140aad4cc77fb7"
+  },
+  "inventory": {
+    "botzoneOfficialZip": {
+      "available": false,
+      "ok": false,
+      "archivesAvailable": 0,
+      "reason": "official monthly ZIP download empty or failed; do not treat Botzone as a complete archive source"
+    },
+    "botzonePublicPages": {
+      "matchRecords": 91,
+      "usedForFixtures": false,
+      "reason": "public-page structural matches exist but this TASK does not mine Botzone; ZIP is empty"
+    },
+    "njuptArchiveLines": 186,
+    "njuptFairTurns": 18980,
+    "botzoneFairTurns": 1429,
+    "usedProvider": "njupt-game-ai-competition",
+    "trajectoryPath": "训练数据/验证/external-trajectory-v2.jsonl",
+    "trainingEligible": false
+  },
+  "findings": [
+    "Botzone official monthly ZIP is empty (archivesAvailable=0); skipped as a fixture source.",
+    "NJUPT fair trajectories contain enemy-report low-single leads, partner-trick-control overplays, and short-enemy passes with a safe ordinary response."
+  ],
+  "fixtures": [
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "AI-DATA-001-enemy-report-lead:8bff39fe01c6:r9:i66",
+      "rule": "AI-DATA-001-enemy-report-lead",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": {
+        "sha256": "3796306c52a843b4662a46ae3781e9b12902c7da8aa20e79c0140aad4cc77fb7"
+      },
+      "observation": {
+        "level": 12,
+        "seat": 2,
+        "hand": [
+          {
+            "rank": 2,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 2,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 4,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 5,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 5,
+            "suit": "S",
+            "deckIndex": 1
+          },
+          {
+            "rank": 5,
+            "suit": "C",
+            "deckIndex": 1
+          },
+          {
+            "rank": 5,
+            "suit": "D",
+            "deckIndex": 1
+          },
+          {
+            "rank": 6,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 6,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 6,
+            "suit": "D",
+            "deckIndex": 1
+          },
+          {
+            "rank": 7,
+            "suit": "S",
+            "deckIndex": 1
+          },
+          {
+            "rank": 7,
+            "suit": "C",
+            "deckIndex": 1
+          },
+          {
+            "rank": 9,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 14,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 12,
+            "suit": "C",
+            "deckIndex": 1
+          }
+        ],
+        "lastHand": null,
+        "lastSeat": 0,
+        "teams": [
+          0,
+          1,
+          0,
+          1
+        ],
+        "finishOrder": [],
+        "handCounts": [
+          12,
+          4,
+          15,
+          1
+        ],
+        "publicHistory": []
+      },
+      "candidates": [
+        {
+          "action": "play",
+          "cards": [
+            {
+              "rank": 2,
+              "suit": "S",
+              "deckIndex": 0
+            }
+          ],
+          "signature": "single|1|2|||",
+          "tags": []
+        },
+        {
+          "action": "play",
+          "cards": [
+            {
+              "rank": 2,
+              "suit": "S",
+              "deckIndex": 0
+            },
+            {
+              "rank": 2,
+              "suit": "C",
+              "deckIndex": 0
+            }
+          ],
+          "signature": "pair|2|2|||",
+          "tags": []
+        }
+      ],
+      "expected": {
+        "invariants": [
+          "enemy_reporting",
+          "low_single_lead",
+          "safer_non_single_available"
+        ],
+        "preferredAction": null,
+        "blockedActions": [
+          "play:2:S:0"
+        ]
+      },
+      "source": {
+        "provider": "njupt-game-ai-competition",
+        "sourceGameId": "8bff39fe01c6d848c464ff9d93ac437d37a62eae3771496d094b2764dbb6c703",
+        "sourceRound": 9,
+        "recordIndex": 66,
+        "fairness": "own_hand_plus_public_history_only",
+        "trainingEligible": false
+      }
+    },
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "AI-DATA-001-partner-trick-control:aa9607ae8a8f:r7:i104",
+      "rule": "AI-DATA-001-partner-trick-control",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": {
+        "sha256": "3796306c52a843b4662a46ae3781e9b12902c7da8aa20e79c0140aad4cc77fb7"
+      },
+      "observation": {
+        "level": 8,
+        "seat": 2,
+        "hand": [
+          {
+            "rank": 3,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 3,
+            "suit": "S",
+            "deckIndex": 1
+          },
+          {
+            "rank": 3,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 4,
+            "suit": "C",
+            "deckIndex": 1
+          },
+          {
+            "rank": 6,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 6,
+            "suit": "C",
+            "deckIndex": 1
+          },
+          {
+            "rank": 10,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 12,
+            "suit": "H",
+            "deckIndex": 0
+          },
+          {
+            "rank": 8,
+            "suit": "C",
+            "deckIndex": 0
+          }
+        ],
+        "lastHand": {
+          "type": "single",
+          "mainRank": 7,
+          "size": 1,
+          "power": 7
+        },
+        "lastSeat": 0,
+        "teams": [
+          0,
+          1,
+          0,
+          1
+        ],
+        "finishOrder": [
+          3
+        ],
+        "handCounts": [
+          2,
+          3,
+          9,
+          0
+        ],
+        "publicHistory": [
+          {
+            "turn": 102,
+            "trickNumber": 14,
+            "seat": 0,
+            "action": "play",
+            "cards": [
+              {
+                "rank": 7,
+                "suit": "C",
+                "deckIndex": 1
+              }
+            ],
+            "hand": {
+              "type": "single",
+              "mainRank": 7,
+              "size": 1,
+              "power": 7
+            },
+            "countsBefore": [
+              3,
+              3,
+              9,
+              0
+            ],
+            "countsAfter": [
+              2,
+              3,
+              9,
+              0
+            ]
+          },
+          {
+            "turn": 103,
+            "trickNumber": 14,
+            "seat": 1,
+            "action": "pass",
+            "cards": [],
+            "hand": null,
+            "countsBefore": [
+              2,
+              3,
+              9,
+              0
+            ],
+            "countsAfter": [
+              2,
+              3,
+              9,
+              0
+            ]
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "action": "pass",
+          "cards": [],
+          "signature": null,
+          "tags": []
+        },
+        {
+          "action": "play",
+          "cards": [
+            {
+              "rank": 10,
+              "suit": "C",
+              "deckIndex": 0
+            }
+          ],
+          "signature": "single|1|10|||",
+          "tags": []
+        }
+      ],
+      "expected": {
+        "invariants": [
+          "partner_current_trick_winner",
+          "all_active_enemies_passed_or_finished",
+          "prefer_pass_with_tactical_constraint"
+        ],
+        "preferredAction": "pass",
+        "blockedActions": [
+          "play:10:C:0"
+        ]
+      },
+      "source": {
+        "provider": "njupt-game-ai-competition",
+        "sourceGameId": "aa9607ae8a8f944830229aebacdb5606349cc0287f79d00620b7c6bc18dd79a4",
+        "sourceRound": 7,
+        "recordIndex": 104,
+        "fairness": "own_hand_plus_public_history_only",
+        "trainingEligible": false
+      }
+    },
+    {
+      "schema": "guandan-strategy-counterexample-v1",
+      "id": "AI-DATA-001-endgame-intercept:9619f991db5d:r5:i65",
+      "rule": "AI-DATA-001-endgame-intercept",
+      "ruleVersion": "guandan-rules-v1",
+      "sourceFingerprint": {
+        "sha256": "3796306c52a843b4662a46ae3781e9b12902c7da8aa20e79c0140aad4cc77fb7"
+      },
+      "observation": {
+        "level": 14,
+        "seat": 0,
+        "hand": [
+          {
+            "rank": 2,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 3,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 3,
+            "suit": "D",
+            "deckIndex": 0
+          },
+          {
+            "rank": 4,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 4,
+            "suit": "D",
+            "deckIndex": 0
+          },
+          {
+            "rank": 5,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 5,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 6,
+            "suit": "S",
+            "deckIndex": 0
+          },
+          {
+            "rank": 6,
+            "suit": "H",
+            "deckIndex": 0
+          },
+          {
+            "rank": 6,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 9,
+            "suit": "C",
+            "deckIndex": 1
+          },
+          {
+            "rank": 10,
+            "suit": "H",
+            "deckIndex": 0
+          },
+          {
+            "rank": 10,
+            "suit": "C",
+            "deckIndex": 0
+          },
+          {
+            "rank": 11,
+            "suit": "H",
+            "deckIndex": 1
+          },
+          {
+            "rank": 13,
+            "suit": "H",
+            "deckIndex": 0
+          },
+          {
+            "rank": 2,
+            "suit": "C",
+            "deckIndex": 1
+          }
+        ],
+        "lastHand": {
+          "type": "single",
+          "mainRank": 4,
+          "size": 1,
+          "power": 4
+        },
+        "lastSeat": 3,
+        "teams": [
+          0,
+          1,
+          0,
+          1
+        ],
+        "finishOrder": [],
+        "handCounts": [
+          16,
+          7,
+          7,
+          4
+        ],
+        "publicHistory": [
+          {
+            "turn": 64,
+            "trickNumber": 9,
+            "seat": 3,
+            "action": "play",
+            "cards": [
+              {
+                "rank": 4,
+                "suit": "H",
+                "deckIndex": 1
+              }
+            ],
+            "hand": {
+              "type": "single",
+              "mainRank": 4,
+              "size": 1,
+              "power": 4
+            },
+            "countsBefore": [
+              16,
+              7,
+              7,
+              5
+            ],
+            "countsAfter": [
+              16,
+              7,
+              7,
+              4
+            ]
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "action": "pass",
+          "cards": [],
+          "signature": null,
+          "tags": []
+        },
+        {
+          "action": "play",
+          "cards": [
+            {
+              "rank": 5,
+              "suit": "S",
+              "deckIndex": 0
+            }
+          ],
+          "signature": "single|1|5|||",
+          "tags": []
+        }
+      ],
+      "expected": {
+        "invariants": [
+          "last_enemy_short_hand",
+          "safe_ordinary_response_available",
+          "block_pass"
+        ],
+        "preferredAction": "play",
+        "blockedActions": [
+          "pass"
+        ]
+      },
+      "source": {
+        "provider": "njupt-game-ai-competition",
+        "sourceGameId": "9619f991db5d237819070204eae84a9f2ab6c4c9c8999fc472ae271b6019d125",
+        "sourceRound": 5,
+        "recordIndex": 65,
+        "fairness": "own_hand_plus_public_history_only",
+        "trainingEligible": false
+      }
+    }
+  ]
+}

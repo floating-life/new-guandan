@@ -263,7 +263,8 @@ function passesAfterLatestPlay(ctx) {
  * lastSeat 或 partnerFinished 不足以触发，避免把尚未行动的对手误判为已让牌。
  */
 export function assessPartnerTrickControl(ctx = {}) {
-  const enabled = ctx?.policyFeatures?.partnerTrickControl === true;
+  const enabled = ctx?.policyFeatures?.partnerTrickControl === true
+    || ctx?.policyFeatures?.downloadedReplayGuards === true;
   const seat = Number(ctx.seat);
   const partner = (seat + 2) % 4;
   const teams = ctx.teams || [0, 1, 0, 1];
@@ -356,7 +357,8 @@ function isEnemyReportLeadExempt(entry, ctx) {
  * 锁牌路线时才阻断；没有替代动作时保留原行为，避免演变成“永不出小单”。
  */
 export function assessEnemyReportLead(play, ctx = {}, candidates = []) {
-  const enabled = ctx?.policyFeatures?.enemyReportLeadSafety === true
+  const enabled = (ctx?.policyFeatures?.enemyReportLeadSafety === true
+    || ctx?.policyFeatures?.downloadedReplayGuards === true)
     && (!ctx.mode || ctx.mode === 'lead');
   const hand = ctx.hand || ctx.handBefore || [];
   const active = activeEnemies(ctx);
@@ -468,14 +470,69 @@ export function filterPartnerTrickControlCandidates(entries, ctx = {}, options =
  * STRAT-5 唯一 eligible-action 层。expert、混合咨询、PIMC/ISMCTS 根候选和
  * 本家内节点共用；feature 关闭时返回同一数组引用。STRAT-3 先于 STRAT-4。
  */
+const SAFE_ENDGAME_ORDINARY_TYPES = new Set([
+  HandType.SINGLE, HandType.PAIR, HandType.TRIPLE, HandType.FULLHOUSE,
+  HandType.STRAIGHT, HandType.TRIPLE_PAIR, HandType.PLATE,
+]);
+const DOWNLOADED_ENDGAME_ENEMY_MAX = 5;
+
+export function isSafeEndgameOrdinary(play) {
+  return !!play?.hand && SAFE_ENDGAME_ORDINARY_TYPES.has(play.hand.type);
+}
+
+/**
+ * AI-LOCAL-002C：下载复盘残局拦截。对家不是本圈赢家、上家/下家公开手数
+ * ≤5 且存在不耗炸/同花顺的普通接法时，阻断过牌。默认关闭，不翻 STRAT-3/4。
+ */
+export function assessDownloadedEndgameIntercept(ctx = {}, candidates = []) {
+  const enabled = ctx?.policyFeatures?.downloadedEndgameGuards === true;
+  const lastSeat = Number(ctx.lastSeat);
+  const lastIsEnemy = ctx.lastHand
+    && Number.isInteger(lastSeat)
+    && lastSeat !== Number(ctx.seat)
+    && !(ctx.finishOrder || []).includes(lastSeat)
+    && ctx.teams?.[lastSeat] !== ctx.teams?.[ctx.seat];
+  const lastEnemyCount = lastIsEnemy ? Number(ctx.handCounts?.[lastSeat] ?? 99) : 99;
+  const shortEnemy = lastIsEnemy && lastEnemyCount > 0 && lastEnemyCount <= DOWNLOADED_ENDGAME_ENEMY_MAX;
+  const plays = (candidates || []).map((entry) => candidatePlay(entry) || entry).filter(Boolean);
+  const saferOrdinary = plays.filter((play) => play.action !== 'pass' && isSafeEndgameOrdinary(play));
+  const partnerYield = assessPartnerTrickControl(ctx).shouldYield;
+  const blocked = enabled && shortEnemy && saferOrdinary.length > 0 && !partnerYield;
+  return {
+    enabled,
+    lastEnemyCount,
+    shortEnemy,
+    saferOrdinaryCount: saferOrdinary.length,
+    blocked,
+    reason: blocked ? 'downloaded_endgame_intercept' : null,
+  };
+}
+
+export function filterDownloadedEndgameCandidates(entries, ctx = {}) {
+  if (!Array.isArray(entries)) {
+    return { entries: [], endgameIntercept: assessDownloadedEndgameIntercept(ctx) };
+  }
+  const endgameIntercept = assessDownloadedEndgameIntercept(ctx, entries);
+  if (!endgameIntercept.blocked) return { entries, endgameIntercept };
+  const filtered = entries.filter((entry) => !isPassEntry(entry));
+  return {
+    entries: filtered,
+    endgameIntercept,
+  };
+}
+
 export function filterEligibleStrategyActions(entries, ctx = {}, options = {}) {
-  const strat3 = ctx?.policyFeatures?.enemyReportLeadSafety === true;
-  const strat4 = ctx?.policyFeatures?.partnerTrickControl === true;
-  if (!strat3 && !strat4) {
+  const strat3 = ctx?.policyFeatures?.enemyReportLeadSafety === true
+    || ctx?.policyFeatures?.downloadedReplayGuards === true;
+  const strat4 = ctx?.policyFeatures?.partnerTrickControl === true
+    || ctx?.policyFeatures?.downloadedReplayGuards === true;
+  const endgame = ctx?.policyFeatures?.downloadedEndgameGuards === true;
+  if (!strat3 && !strat4 && !endgame) {
     return {
       entries,
       safety: assessEnemyReportLead(null, ctx),
       partnerTrickControl: assessPartnerTrickControl(ctx),
+      endgameIntercept: assessDownloadedEndgameIntercept(ctx, []),
       closed: false,
       reason: null,
     };
@@ -485,6 +542,7 @@ export function filterEligibleStrategyActions(entries, ctx = {}, options = {}) {
       entries: [],
       safety: assessEnemyReportLead(null, ctx),
       partnerTrickControl: assessPartnerTrickControl(ctx),
+      endgameIntercept: assessDownloadedEndgameIntercept(ctx, []),
       closed: true,
       reason: 'invalid_entries',
     };
@@ -501,6 +559,7 @@ export function filterEligibleStrategyActions(entries, ctx = {}, options = {}) {
         entries: current,
         safety,
         partnerTrickControl: assessPartnerTrickControl(ctx),
+        endgameIntercept: assessDownloadedEndgameIntercept(ctx, []),
         closed: true,
         reason: safety.reason,
       };
@@ -514,13 +573,21 @@ export function filterEligibleStrategyActions(entries, ctx = {}, options = {}) {
     current = filtered.entries;
   }
 
+  let endgameIntercept = assessDownloadedEndgameIntercept(ctx, []);
+  if (endgame) {
+    const filtered = filterDownloadedEndgameCandidates(current, ctx);
+    endgameIntercept = filtered.endgameIntercept;
+    current = filtered.entries;
+  }
+
   return {
     entries: current,
     safety,
     partnerTrickControl,
+    endgameIntercept,
     closed: current.length === 0,
     reason: current.length === 0
-      ? (safety.reason || partnerTrickControl.reason || 'eligible_actions_empty')
+      ? (safety.reason || partnerTrickControl.reason || endgameIntercept.reason || 'eligible_actions_empty')
       : null,
   };
 }

@@ -1,0 +1,110 @@
+{
+  "schema": "guandan-external-training-admission-audit-v1",
+  "generatedAt": "2026-09-04T00:39:28.720Z",
+  "diagnosticOnly": true,
+  "admitted": false,
+  "trainingEligible": false,
+  "neverSetsTrainingEligibleTrue": true,
+  "wouldAdmitIfPolicyAllowed": false,
+  "botzoneOfficialZip": {
+    "available": false,
+    "ok": false,
+    "archivesAvailable": 0
+  },
+  "surfaces": {
+    "readme": true,
+    "fairTrajectory": true,
+    "rawNjuptArchives": true,
+    "normalizedNjupt": true,
+    "botzonePublicPages": true,
+    "licenseArtifact": false,
+    "deletionLedger": false
+  },
+  "providers": {
+    "njupt-game-ai-competition": 18980,
+    "botzone": 1429
+  },
+  "trajectoryRows": 20409,
+  "replayStatus": {
+    "entries": 1392,
+    "passedReplay": 211
+  },
+  "gates": {
+    "license": {
+      "status": "fail",
+      "reason": "no license/permission artifact under 训练数据/许可.json or license.json",
+      "evidence": {
+        "hasLicense": false,
+        "readmePresent": true,
+        "readmeForbidsShareAndCommercial": true
+      }
+    },
+    "redistribution": {
+      "status": "fail",
+      "reason": "no redistribution grant; README forbids sharing without source permission",
+      "evidence": {
+        "hasLicense": false,
+        "readmePresent": true,
+        "readmeForbidsShareAndCommercial": true
+      }
+    },
+    "commercialUse": {
+      "status": "fail",
+      "reason": "no commercial-use grant; README forbids commercial training without permission",
+      "evidence": {
+        "hasLicense": false,
+        "readmePresent": true,
+        "readmeForbidsShareAndCommercial": true
+      }
+    },
+    "deletion": {
+      "status": "fail",
+      "reason": "no deletion/consent ledger",
+      "evidence": {
+        "hasDeletion": false,
+        "hasConsent": false
+      }
+    },
+    "actingSeat": {
+      "status": "pass",
+      "reason": "fair trajectory rows declare acting seat and own-hand fairness",
+      "evidence": {
+        "rows": 20409,
+        "fairnessFail": 0
+      }
+    },
+    "ruleVersion": {
+      "status": "pass",
+      "reason": "fair rows use project trajectory schema; some episodes passed project rule replay",
+      "evidence": {
+        "rows": 20409,
+        "schemaFail": 0,
+        "passedReplay": 211,
+        "statusEntries": 1392
+      }
+    },
+    "hiddenCards": {
+      "status": "pass",
+      "reason": "fair trajectory observations have no four-hand/undealt fields",
+      "evidence": {
+        "rows": 20409,
+        "hiddenFail": 0,
+        "rawArchivesContainFourHands": true
+      }
+    },
+    "trainingEligibleIsolation": {
+      "status": "pass",
+      "reason": "all fair rows and status entries remain trainingEligible=false",
+      "evidence": {
+        "rows": 20409,
+        "statusEntries": 1392
+      }
+    }
+  },
+  "findings": [
+    "Admission remains fail-closed. Replay success is not training eligibility.",
+    "Botzone official monthly ZIP is empty and is not an admitted archive.",
+    "Raw NJUPT/Botzone records stay isolated; only fair public-info trajectories were inspected.",
+    "训练数据/README.md forbids upload, redistribution, and commercial training without source permission."
+  ]
+}
