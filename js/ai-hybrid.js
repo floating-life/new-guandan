@@ -39,6 +39,62 @@ export const HYBRID_SEARCH_MODES = Object.freeze({
   ISMCTS_V3: 'ismcts-v3',
 });
 
+export const HYBRID_HOTPATH_LOCATE_PHASES = Object.freeze([
+  'sampleWorld', 'cloneRoot', 'createState', 'descend', 'rollout', 'backup', 'restore',
+]);
+
+let hybridHotPathLocateSession = false;
+
+export function setHybridHotPathLocate(enabled) {
+  hybridHotPathLocateSession = enabled === true;
+  return hybridHotPathLocateSession;
+}
+
+function wantHotPathLocate(options) {
+  return options?.locateHotPath === true || hybridHotPathLocateSession === true;
+}
+
+// 003-OPT first slice: reuse the legal-play list already generated for the
+// current ply when picking the expert rollout action.  Default on after
+// golden visits/applied match; explicit false restores the double generate
+// for A/B.  It must not change action keys, visits, or budgets.
+let hybridReuseGeneratedPlaysSession = true;
+
+export function setHybridReuseGeneratedPlays(enabled) {
+  hybridReuseGeneratedPlaysSession = enabled !== false;
+  return hybridReuseGeneratedPlaysSession;
+}
+
+function wantReuseGeneratedPlays(options) {
+  if (options?.reuseGeneratedPlays === false) return false;
+  if (options?.reuseGeneratedPlays === true) return true;
+  return hybridReuseGeneratedPlaysSession !== false;
+}
+
+export function summarizeHotPathLocate(phases, callSite = 'js/ai-hybrid.js:runISMCTSSearch') {
+  const resolved = {};
+  let totalMs = 0;
+  let dominantPhase = null;
+  let dominantMs = -1;
+  for (const phase of HYBRID_HOTPATH_LOCATE_PHASES) {
+    const ms = Number(phases?.[phase]) || 0;
+    resolved[phase] = ms;
+    totalMs += ms;
+    if (ms > dominantMs) {
+      dominantPhase = phase;
+      dominantMs = ms;
+    }
+  }
+  return {
+    enabled: true,
+    callSite,
+    phases: resolved,
+    totalMs,
+    dominantPhase: totalMs > 0 ? dominantPhase : null,
+    dominantShare: totalMs > 0 ? dominantMs / totalMs : 0,
+  };
+}
+
 // Availability-aware UCT (Cowling et al.) keeps the action's own visit count
 // in the denominator.  Availability is the number of determinizations in
 // which that action was legal, so it replaces—not supplements—the parent
@@ -868,10 +924,52 @@ function actionFromPlay(play) {
   };
 }
 
+// 离线/诊断候选臂共用的最小炸弹槽规则。它只操作有限候选的副本，既不读取
+// 暗牌也不改变原数组或其中的动作；调用方必须显式选择该实验臂。
+function reserveMinimumBombSlot(state, seat, baseline, legalActions, generatedPlays = null) {
+  const reserved = baseline.slice();
+  const bombs = legalActions.filter((action) => isBomb(action.hand)).sort((left, right) => (
+    rolloutStructureCost(left, state.hands[seat], state.level)
+    - rolloutStructureCost(right, state.hands[seat], state.level)
+    || left.hand.power - right.hand.power
+    || publicActionKey(left).localeCompare(publicActionKey(right))
+  ));
+  let replacedActionKey = null;
+  let reservedBombActionKey = null;
+  if (bombs.length && !reserved.some((action) => isBomb(action.hand))) {
+    const expert = Array.isArray(generatedPlays)
+      ? chooseRolloutPlay(state, seat, generatedPlays)
+      : chooseRolloutPlay(state, seat);
+    const protectedKeys = new Set([
+      expert ? publicActionKey(actionFromPlay(expert)) : null,
+      state.lastHand ? 'pass' : null,
+    ]);
+    const replaceIndex = reserved.map((action, index) => ({ action, index }))
+      .reverse()
+      .find(({ action }) => action.action === 'play'
+        && !isBomb(action.hand) && !protectedKeys.has(publicActionKey(action)))?.index;
+    if (replaceIndex != null) {
+      replacedActionKey = publicActionKey(reserved[replaceIndex]);
+      reserved[replaceIndex] = bombs[0];
+      reservedBombActionKey = publicActionKey(bombs[0]);
+    }
+  }
+  return {
+    actions: reserved,
+    bombs,
+    reservationApplied: reservedBombActionKey != null,
+    replacedActionKey,
+    reservedBombActionKey,
+  };
+}
+
 /** Pick a bounded, deterministic expert-oriented branch set for an inner node. */
 function selectOpenLoopActions(state, seat, maxBranch, options = null) {
-  const rawPlays = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
-    .map(actionFromPlay);
+  const generate = options?.legalPlayGenerator || generateLegalPlays;
+  const generated = Array.isArray(options?.generatedLegalPlays)
+    ? options.generatedLegalPlays
+    : generate(state.hands[seat], state.level, state.lastHand);
+  const rawPlays = generated.map(actionFromPlay);
   const observation = options?.observation;
   const deciding = observation && seat === observation.seat;
   const filterCtx = deciding ? {
@@ -902,7 +1000,10 @@ function selectOpenLoopActions(state, seat, maxBranch, options = null) {
   // 先加入专家 rollout 的首选，使扩展与默认安全策略一致；随后只补少量
   // 低结构成本的合法分支，防止信息集树把完整候选空间展开到不可交互。
   // STRAT-5：本家内节点不得把已被 STRAT-3/4 排除的送单/抢队友牌重新加入。
-  const expert = chooseRolloutPlay(state, seat);
+  const reuse = wantReuseGeneratedPlays(options);
+  const expert = reuse
+    ? chooseRolloutPlay(state, seat, generated)
+    : chooseRolloutPlay(state, seat, { legalPlayGenerator: generate });
   if (expert) {
     const expertAction = actionFromPlay(expert);
     const expertKey = publicActionKey(expertAction);
@@ -923,7 +1024,14 @@ function selectOpenLoopActions(state, seat, maxBranch, options = null) {
     if (actions.length >= maxBranch) break;
     add(action);
   }
-  return actions.slice(0, maxBranch);
+  const baseline = actions.slice(0, maxBranch);
+  // 仅供显式 offline/diagnostic ismcts-v3 实验臂使用；runISMCTSSearch 会在
+  // v3 内节点才传入该选项。默认、根候选和 v2 均保留完全相同的排序与预算。
+  return options?.reserveBombSlot === true
+    ? reserveMinimumBombSlot(
+      state, seat, baseline, plays, reuse ? generated : null,
+    ).actions
+    : baseline;
 }
 
 // 只读诊断：量化“专家首选 + pass + 低成本普通着法”在有限分支内是否挤掉
@@ -931,31 +1039,22 @@ function selectOpenLoopActions(state, seat, maxBranch, options = null) {
 // 预留炸弹槽，必须另行通过收益、灾难率和尾延迟门。
 export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5, options = null) {
   const branch = clamp(Math.floor(Number(maxBranch) || 5), 2, 10);
-  const legal = generateLegalPlays(state.hands[seat], state.level, state.lastHand)
-    .map(actionFromPlay);
-  const baseline = selectOpenLoopActions(state, seat, branch, options);
-  const bombs = legal.filter((action) => isBomb(action.hand)).sort((left, right) => (
-    rolloutStructureCost(left, state.hands[seat], state.level)
-    - rolloutStructureCost(right, state.hands[seat], state.level)
-    || left.hand.power - right.hand.power
-    || publicActionKey(left).localeCompare(publicActionKey(right))
-  ));
-  const reserved = baseline.slice();
-  let reservationApplied = false;
-  if (bombs.length && !reserved.some((action) => isBomb(action.hand))) {
-    const expert = chooseRolloutPlay(state, seat);
-    const protectedKeys = new Set([
-      expert ? publicActionKey(actionFromPlay(expert)) : null,
-      state.lastHand ? 'pass' : null,
-    ]);
-    const replaceIndex = reserved.map((action, index) => ({ action, index }))
-      .reverse()
-      .find(({ action }) => !protectedKeys.has(publicActionKey(action)))?.index;
-    if (replaceIndex != null) {
-      reserved[replaceIndex] = bombs[0];
-      reservationApplied = true;
-    }
-  }
+  const generate = options?.legalPlayGenerator || generateLegalPlays;
+  const generated = generate(state.hands[seat], state.level, state.lastHand);
+  const legal = generated.map(actionFromPlay);
+  // 基线必须始终表示未预留的有限分支；即使调用者传入实验臂选项，诊断
+  // 也只在其独立的 reserved 副本中演示替换，不能改写 002A 的比较口径。
+  const baseline = selectOpenLoopActions(state, seat, branch, {
+    observation: options?.observation,
+    legalPlayGenerator: generate,
+    reuseGeneratedPlays: options?.reuseGeneratedPlays,
+  });
+  const reservation = reserveMinimumBombSlot(
+    state, seat, baseline, legal,
+    wantReuseGeneratedPlays(options) ? generated : null,
+  );
+  const { bombs } = reservation;
+  const reserved = reservation.actions;
   const summary = (actions) => ({
     actionCount: actions.length,
     bombActions: actions.filter((action) => isBomb(action.hand)).length,
@@ -965,7 +1064,12 @@ export function inspectOpenLoopBombCoverage(state, seat, maxBranch = 5, options 
     legalBombActions: bombs.length,
     baseline: summary(baseline),
     reserved: summary(reserved),
-    reservationApplied,
+    reservationApplied: reservation.reservationApplied,
+    // 仅描述诊断性的替换关系；键是已出牌动作的公开表示，不含 card.id。
+    reservation: {
+      replacedActionKey: reservation.replacedActionKey,
+      reservedBombActionKey: reservation.reservedBombActionKey,
+    },
   };
 }
 
@@ -1171,6 +1275,16 @@ function runISMCTSSearch(observation, candidates, limits, options) {
   const forcedOutcomeForTest = options.includeTreeDigest === true
     && typeof options.testHooks?.forcedOutcome === 'function'
     ? options.testHooks.forcedOutcome : null;
+  const locateOn = wantHotPathLocate(options);
+  const locatePhases = locateOn ? {
+    sampleWorld: 0,
+    cloneRoot: 0,
+    createState: 0,
+    descend: 0,
+    rollout: 0,
+    backup: 0,
+    restore: 0,
+  } : null;
   const budgetExhausted = () => (
     limits.nodes.value >= limits.nodeBudget
     || (limits.deadlineMs != null && performanceNow() >= limits.deadlineMs)
@@ -1202,7 +1316,16 @@ function runISMCTSSearch(observation, candidates, limits, options) {
       const seat = state.currentSeat;
       const legalActions = depth === 0
         ? candidates
-        : selectOpenLoopActions(state, seat, branchLimit, { observation });
+        : selectOpenLoopActions(state, seat, branchLimit, {
+          observation,
+          // Explicit offline-only arm: never affects root candidates, v2, or
+          // absent/false options.  It changes no branch/node/rollout/wall-clock
+          // budget and is intentionally not wired into the production engine.
+          reserveBombSlot: searchMode === HYBRID_SEARCH_MODES.ISMCTS_V3
+            && options.reserveBombSlot === true,
+          reuseGeneratedPlays: options.reuseGeneratedPlays,
+          legalPlayGenerator: options.legalPlayGenerator,
+        });
       if (!legalActions.length) {
         invalidReason = 'tree_no_legal_action';
         break;
@@ -1297,11 +1420,13 @@ function runISMCTSSearch(observation, candidates, limits, options) {
         if (limits.nodes.value + estimatedSweepCost > limits.nodeBudget) break;
       }
       // 采样种子只来自公开观察和调用方公开种子，与 v2 同规则、按 sweep 计数。
+      let locateMark = locateOn ? performanceNow() : 0;
       const sampled = samplePublicInformationSets(observation, {
         sampleCount: 1,
         behaviorAttempts: options.behaviorAttempts,
         seed: seedBase + sweeps * 7919,
       });
+      if (locateOn) locatePhases.sampleWorld += performanceNow() - locateMark;
       const sweepIndex = sweeps;
       sweeps += 1;
       if (!sampled.ok || !sampled.samples[0]) {
@@ -1309,7 +1434,9 @@ function runISMCTSSearch(observation, candidates, limits, options) {
         sampleFailures[reason] = (sampleFailures[reason] || 0) + 1;
         continue;
       }
+      locateMark = locateOn ? performanceNow() : 0;
       const sweepSnapshot = cloneOpenLoopNode(root);
+      if (locateOn) locatePhases.cloneRoot += performanceNow() - locateMark;
       const completed = [];
       let interrupted = false;
       let sweepFailure = null;
@@ -1320,11 +1447,20 @@ function runISMCTSSearch(observation, candidates, limits, options) {
         }
         const candidate = candidates[(sweepIndex + offset) % candidates.length];
         const nodesBefore = limits.nodes.value;
+        locateMark = locateOn ? performanceNow() : 0;
         const state = createSimulationState(sampled.samples[0], observation);
+        if (locateOn) locatePhases.createState += performanceNow() - locateMark;
+        locateMark = locateOn ? performanceNow() : 0;
         const descent = descendTree(state, candidate);
-        let outcome = descent.invalidReason
-          ? { ok: false, utility: null, reason: descent.invalidReason }
-          : rolloutFromSimulationState(state, rootTeam, limits);
+        if (locateOn) locatePhases.descend += performanceNow() - locateMark;
+        let outcome;
+        if (descent.invalidReason) {
+          outcome = { ok: false, utility: null, reason: descent.invalidReason };
+        } else {
+          locateMark = locateOn ? performanceNow() : 0;
+          outcome = rolloutFromSimulationState(state, rootTeam, limits);
+          if (locateOn) locatePhases.rollout += performanceNow() - locateMark;
+        }
         if (!descent.invalidReason && forcedOutcomeForTest) {
           let injected = null;
           try {
@@ -1358,7 +1494,9 @@ function runISMCTSSearch(observation, candidates, limits, options) {
           ? digestOpenLoopNode(sweepSnapshot) : null;
         const mutatedDigest = options.includeTreeDigest === true
           ? digestOpenLoopNode(root) : null;
+        locateMark = locateOn ? performanceNow() : 0;
         restoreOpenLoopNode(root, sweepSnapshot);
+        if (locateOn) locatePhases.restore += performanceNow() - locateMark;
         treeNodes = countOpenLoopNodes(root);
         if (options.includeTreeDigest === true) rollbackDiagnostics.push({
           kind: 'interrupted', sweepIndex, snapshotDigest, mutatedDigest,
@@ -1372,7 +1510,9 @@ function runISMCTSSearch(observation, candidates, limits, options) {
           ? digestOpenLoopNode(sweepSnapshot) : null;
         const mutatedDigest = options.includeTreeDigest === true
           ? digestOpenLoopNode(root) : null;
+        locateMark = locateOn ? performanceNow() : 0;
         restoreOpenLoopNode(root, sweepSnapshot);
+        if (locateOn) locatePhases.restore += performanceNow() - locateMark;
         treeNodes = countOpenLoopNodes(root);
         if (options.includeTreeDigest === true) rollbackDiagnostics.push({
           kind: 'failed', sweepIndex, snapshotDigest, mutatedDigest,
@@ -1384,11 +1524,13 @@ function runISMCTSSearch(observation, candidates, limits, options) {
       pairedSweeps += 1;
       sampledWorlds += 1;
       iterations += completed.length;
+      locateMark = locateOn ? performanceNow() : 0;
       for (const item of completed) {
         backpropagate(item.descent, item.outcome);
         // 根层 availability 与 visits 恒等：只在 sweep 完整回传后 +1。
         root.actions.get(rootActionByCandidate.get(item.candidateId)).availability += 1;
       }
+      if (locateOn) locatePhases.backup += performanceNow() - locateMark;
     }
     return {
       searchMode,
@@ -1406,6 +1548,7 @@ function runISMCTSSearch(observation, candidates, limits, options) {
       ...(options.includeTreeDigest === true ? { rollbackDiagnostics } : {}),
       ...(options.includeTreeDigest === true ? { treeDigest: digestOpenLoopNode(root) } : {}),
       candidateResults: summarizeRootRecords(),
+      ...(locateOn ? { hotPathLocate: summarizeHotPathLocate(locatePhases) } : {}),
     };
   }
 
@@ -1743,6 +1886,49 @@ function runPairedRootPIMCSearch(observation, sampling, candidates, limits, opti
   };
 }
 
+/** Fixed-budget offline labels; deliberately separate from the online critical gate. */
+export function evaluateLearningTeacherCandidates(ctx, candidates, options = {}) {
+  const worlds = options.worlds ?? 4;
+  const maxPlies = options.maxPlies ?? 24;
+  const seed = options.seed ?? 3500000000;
+  if (!Number.isInteger(worlds) || worlds < 1 || worlds > 32) throw new Error('invalid teacher worlds');
+  if (!Number.isInteger(maxPlies) || maxPlies < 1 || maxPlies > 180) throw new Error('invalid teacher maxPlies');
+  if (!Number.isInteger(seed) || seed < 0 || seed > 0xFFFFFFFF) throw new Error('invalid teacher seed');
+  if (!Array.isArray(candidates) || candidates.length < 2 || candidates.length > 8) {
+    throw new Error('teacher needs 2..8 candidates');
+  }
+  const observation = createPublicAIObservation(ctx);
+  const key = c => c.action === 'pass' ? 'pass'
+    : `${c.cards.map(card => String(card.id)).sort().join(',')}|${c.signature || handSignature(c.hand)}`;
+  const legal = generateLegalPlays(observation.hand, observation.level, observation.lastHand)
+    .map(c => ({ ...c, action: 'play' }));
+  if (observation.lastHand) legal.push({ action: 'pass', cards: [], hand: null });
+  const byKey = new Map(legal.map(c => [key(c), c]));
+  const ids = new Set();
+  const normalized = candidates.map(c => {
+    if (!c || typeof c.id !== 'string' || !c.id || ids.has(c.id)
+      || !Array.isArray(c.cards) || (c.action === 'pass' && c.cards.length)) {
+      throw new Error('invalid or duplicate teacher candidate');
+    }
+    ids.add(c.id);
+    const actual = byKey.get(key(c));
+    if (!actual) throw new Error('illegal teacher candidate');
+    return { ...actual, id: c.id };
+  });
+  const sampling = samplePublicInformationSets(observation, { sampleCount: worlds, seed });
+  if (!sampling.ok) return { ok: false, labelKind: 'teacher_estimate',
+    reason: sampling.failure?.reason || 'sampling_failed', candidateResults: [] };
+  const limits = { maxPlies, nodeBudget: worlds * normalized.length * maxPlies + 1,
+    deadlineMs: null, nodes: { value: 0 }, rolloutDiagnostics: {} };
+  const search = runPairedRootPIMCSearch(observation, sampling, normalized, limits,
+    { iterationBudget: worlds * normalized.length });
+  const ok = search.pairedWorlds === worlds && search.candidateResults.every(c =>
+    c.completedSamples === worlds && Number.isFinite(c.utility) && Object.keys(c.failures).length === 0);
+  return { ok, labelKind: 'teacher_estimate', reason: ok ? 'completed' : 'incomplete_teacher',
+    worlds, maxPlies, pairedWorlds: search.pairedWorlds, nodes: limits.nodes.value,
+    candidateResults: search.candidateResults, rolloutDiagnostics: search.rolloutDiagnostics };
+}
+
 export function evaluateInformationSetCandidates(ctx, candidates, options = {}) {
   const observation = createPublicAIObservation(ctx);
   const searchMode = normalizeSearchMode(options.searchMode);
@@ -1820,7 +2006,9 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
   const search = searchMode === HYBRID_SEARCH_MODES.PAIRED_ROOT_PIMC
     ? runPairedRootPIMCSearch(observation, sampling, searchCandidates, limits, options)
     : [HYBRID_SEARCH_MODES.ISMCTS, HYBRID_SEARCH_MODES.ISMCTS_V3].includes(searchMode)
-      ? runISMCTSSearch(observation, searchCandidates, limits, { ...options, searchMode })
+      ? runISMCTSSearch(observation, searchCandidates, limits, {
+        ...options, searchMode, locateHotPath: wantHotPathLocate(options),
+      })
       : runPIMCSearch(observation, sampling, searchCandidates, limits);
   const { candidateResults } = search;
   const completeCandidates = candidateResults.filter((item) => item.completedSamples > 0).length;
@@ -1881,6 +2069,7 @@ export function evaluateInformationSetCandidates(ctx, candidates, options = {}) 
     critical,
     candidateResults,
     nodes: nodes.value,
+    ...(search.hotPathLocate ? { hotPathLocate: search.hotPathLocate } : {}),
   };
 }
 
@@ -2177,6 +2366,8 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     searchMode: options.searchMode,
     deadlineMs: options.deadlineMs,
     seed: options.seed,
+    reserveBombSlot: options.reserveBombSlot === true,
+    locateHotPath: wantHotPathLocate(options),
   });
   // 模型不是独立于搜索的全局启发式。只有当前关键局面的信息集搜索已获得
   // 足够公平证据时才允许参与；not_critical、采样失败或根置信不足均原样
@@ -2204,6 +2395,7 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
       searchAttempted: informationSet.searchAttempted === true,
       searchTriggered: informationSet.searchTriggered === true,
       fallbackKind: 'search_evidence_insufficient',
+      ...(informationSet.hotPathLocate ? { hotPathLocate: informationSet.hotPathLocate } : {}),
     });
   }
 
@@ -2297,6 +2489,7 @@ export function chooseHybridFromConsultation(ctx, consultation, options = {}) {
     nodes: informationSet.nodes || 0,
     searchAttempted: informationSet.searchAttempted === true,
     searchTriggered: informationSet.searchTriggered === true,
+    ...(informationSet.hotPathLocate ? { hotPathLocate: informationSet.hotPathLocate } : {}),
     rolloutDiagnostics: informationSet.rolloutDiagnostics || {},
     fallbackKind: forceExpert
       ? 'force_expert_choice'

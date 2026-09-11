@@ -1,0 +1,72 @@
+{
+  "schema": "guandan-ai-local-003-coverage-plan-v1",
+  "optimizationAllowed": false,
+  "implementationAuthorized": true,
+  "firstSliceAuthorized": true,
+  "firstSliceLanded": true,
+  "promotionEvidence": false,
+  "releaseEvidence": false,
+  "formalGateEligible": false,
+  "perf3Unlocked": false,
+  "locateDefaultOff": true,
+  "expertDefaultUnchanged": true,
+  "ismctsV3ProductSelector": false,
+  "hotPath": {
+    "callSite": "js/ai-hybrid.js:runISMCTSSearch",
+    "function": "rolloutFromSimulationState",
+    "innerLoop": "chooseRolloutPlay -> generateLegalPlays",
+    "dominantPhase": "rollout",
+    "locateGames8": {
+      "seat0Triggered": 14,
+      "share": {
+        "rollout": 0.64,
+        "sampleWorld": 0.25,
+        "descend": 0.10
+      }
+    },
+    "diagnosticGames128": {
+      "seeds": "20269003-20269130",
+      "seat0Triggered": 185,
+      "searchTriggeredP95Ms": 640,
+      "searchTriggeredP99Ms": 996,
+      "overallP95Ms": 184,
+      "cannotUseOverallP95": true
+    }
+  },
+  "searchTriggeredGates": {
+    "minTriggered": 100,
+    "coverageMin": 0.99,
+    "p95Ms": 500,
+    "p99Ms": 750,
+    "timeoutFallbackMax": 0.005
+  },
+  "frozenBudgets": {
+    "deterministicV3NodeBudget": 1800,
+    "deterministicIterationBudget": 72,
+    "defaultBranchLimit": 5,
+    "candidateLimit": 6
+  },
+  "forbidden": [
+    "reduceSearchTriggerRate",
+    "reduceNodeBudget",
+    "reduceIterationBudget",
+    "reduceMaxPlies",
+    "reduceBranchLimit",
+    "reduceTreeDepth",
+    "reduceCandidateLimit",
+    "relaxP95",
+    "relaxP99",
+    "useOverallP95AsSearchGate",
+    "heuristicEarlyRolloutCutoff",
+    "applyStrat3InRollout",
+    "openStrat3Or4",
+    "putDownloadedGuardsInExpertDefault",
+    "putIsmctsV3InProductSelector",
+    "consumeFormalSeeds",
+    "treatLocateOrLocalBaselineAsPromotion"
+  ],
+  "firstAllowedSliceWhenAuthorized": "equivalent-play micro-opt: reuse generateLegalPlays result in selectOpenLoopActions/chooseRolloutPlay; default on after golden visits/applied match; no budget or trigger change",
+  "firstSlice": "reuseGeneratedPlays default true; explicit false restores double generate for A/B",
+  "optionalLocate2": "default-off sub-timers inside rolloutFromSimulationState (choose vs apply vs deadline) if the generateLegalPlays hypothesis needs confirmation",
+  "planDocument": "tools/ai-local-003-coverage-plan.md"
+}

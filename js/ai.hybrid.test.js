@@ -13,6 +13,7 @@ import {
   availabilityAwareUctBonus,
   chooseHybridFromConsultation, chooseRolloutPlay, configureHybridValueModel,
   evaluateInformationSetCandidates,
+  setHybridHotPathLocate, setHybridReuseGeneratedPlays,
   evaluateHybridValueModel, extractHybridValueFeatures,
   inspectOpenLoopBombCoverage,
   samplePublicInformationSets, validateHybridValueModel,
@@ -102,16 +103,51 @@ console.log('开放环炸弹分支覆盖诊断');
     hands: [[...bomb, ...cards(10), ...cards(11), ...cards(12), ...cards(13), ...cards(14)], [], [], []],
     teams: [0, 1, 0, 1], level: 7, lastHand: parseHand(cards(9), 7), lastSeat: 1,
   };
-  const urgent = inspectOpenLoopBombCoverage(response, 0, 5);
-  assert(urgent.legalBombActions >= 1 && urgent.baseline.bombActions === 0
-    && urgent.reserved.bombActions === 1 && urgent.reservationApplied,
-  '紧急可接局面量化出默认有限分支遗漏炸弹，诊断性预留槽能保留最小炸弹');
+  const responseBefore = JSON.stringify(response);
+  const responseObservation = {
+    seat: 0, hand: response.hands[0], level: response.level,
+    lastHand: response.lastHand, lastSeat: response.lastSeat,
+    teams: response.teams, finishOrder: [], handCounts: [9, 0, 0, 0], publicHistory: [],
+  };
+  const observationBefore = JSON.stringify(responseObservation);
+  const urgent = inspectOpenLoopBombCoverage(response, 0, 5, { observation: responseObservation });
+  assert(urgent.legalBombActions === 2 && urgent.baseline.bombActions === 0
+    && urgent.reserved.bombActions === 1 && urgent.reservationApplied
+    && urgent.reservation.replacedActionKey === 'play:13:S:0|single|1|13|||'
+    && urgent.reservation.reservedBombActionKey === 'play:6:C:0,6:D:0,6:H:0,6:S:0|bomb|4|6|||',
+  '公开反例明确量化两种合法炸弹、基线漏炸与诊断槽恢复的最低成本四炸');
+  assert(JSON.stringify(urgent.baseline.actionKeys) === JSON.stringify([
+    'play:10:S:0|single|1|10|||', 'pass', 'play:11:S:0|single|1|11|||',
+    'play:12:S:0|single|1|12|||', 'play:13:S:0|single|1|13|||',
+  ]) && urgent.reserved.actionKeys.slice(0, 4).every((key, index) => (
+    key === urgent.baseline.actionKeys[index]
+  )), '诊断观察不改变既有基线 actionKeys 或候选顺序，仅在副本中替换末位普通分支');
+  assert(JSON.stringify(response) === responseBefore && JSON.stringify(responseObservation) === observationBefore
+    && response.hands.flat().every((card) => !JSON.stringify(urgent).includes(card.id)),
+  '诊断开关不修改状态或观察输入，输出不泄露实体 card.id');
+  const inspectArmed = inspectOpenLoopBombCoverage(response, 0, 5, {
+    observation: responseObservation, reserveBombSlot: true,
+  });
+  assert(JSON.stringify(inspectArmed.baseline) === JSON.stringify(urgent.baseline)
+      && inspectArmed.reservationApplied === urgent.reservationApplied
+      && inspectArmed.reservation.replacedActionKey === urgent.reservation.replacedActionKey,
+  '只读诊断即使传入 reserveBombSlot 也不改写基线或比较口径');
+
+  const hiddenWorldA = { ...response, hands: [response.hands[0], cards(2), cards(3), cards(4)] };
+  const hiddenWorldB = { ...response, hands: [response.hands[0], cards(5), cards(8), cards(9)] };
+  const hiddenA = inspectOpenLoopBombCoverage(hiddenWorldA, 0, 5, { observation: responseObservation });
+  const hiddenB = inspectOpenLoopBombCoverage(hiddenWorldB, 0, 5, { observation: responseObservation });
+  assert(JSON.stringify(hiddenA) === JSON.stringify(hiddenB)
+    && [...hiddenWorldA.hands.slice(1).flat(), ...hiddenWorldB.hands.slice(1).flat()]
+      .every((card) => !JSON.stringify(hiddenA).includes(card.id)),
+  '同一公开观察下替换对手暗牌不改变诊断，且返回不含对手实体 card.id');
 
   const finishing = inspectOpenLoopBombCoverage({
     hands: [bomb, [], [], []], teams: [0, 1, 0, 1], level: 7, lastHand: null, lastSeat: null,
   }, 0, 5);
   assert(finishing.legalBombActions === 1 && finishing.baseline.bombActions === 1
-    && !finishing.reservationApplied,
+    && !finishing.reservationApplied && finishing.reservation.replacedActionKey === null
+    && finishing.reservation.reservedBombActionKey === null,
   '收官整手炸弹本来就在专家首选中，诊断不会重复保留或改变其分支');
 
   const lead = inspectOpenLoopBombCoverage({
@@ -121,6 +157,31 @@ console.log('开放环炸弹分支覆盖诊断');
   assert(lead.legalBombActions >= 1 && lead.baseline.bombActions === 0
     && lead.reserved.bombActions === 1 && lead.reservationApplied,
   '无目的领炸局面同样记录覆盖差异，但正式默认排序仍不接入预留槽');
+
+  const noBomb = inspectOpenLoopBombCoverage({
+    hands: [[...cards(10), ...cards(11), ...cards(12), ...cards(13)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: parseHand(cards(9), 7), lastSeat: 1,
+  }, 0, 5);
+  assert(noBomb.legalBombActions === 0 && noBomb.baseline.bombActions === 0
+    && noBomb.reserved.bombActions === 0 && !noBomb.reservationApplied
+    && noBomb.reservation.replacedActionKey === null && noBomb.reservation.reservedBombActionKey === null,
+  '无合法炸弹时诊断不虚报预留或替换关系');
+
+  const protectedOnly = {
+    hands: [[...cards(6, 4), ...cards(10)], [], [], []],
+    teams: [0, 1, 0, 1], level: 7, lastHand: parseHand(cards(9), 7), lastSeat: 1,
+  };
+  const protectedOnlyBefore = JSON.stringify(protectedOnly);
+  const protectedResult = inspectOpenLoopBombCoverage(protectedOnly, 0, 2);
+  assert(protectedResult.legalBombActions === 1 && protectedResult.baseline.bombActions === 0
+    && protectedResult.baseline.actionKeys.length === 2
+    && protectedResult.baseline.actionKeys.includes('pass')
+    && protectedResult.reserved.actionKeys.join('|') === protectedResult.baseline.actionKeys.join('|')
+    && !protectedResult.reservationApplied
+    && protectedResult.reservation.replacedActionKey === null
+    && protectedResult.reservation.reservedBombActionKey === null
+    && JSON.stringify(protectedOnly) === protectedOnlyBefore,
+  '只有专家首选与过牌时没有可替换普通动作，诊断不预留炸弹且不修改输入');
 }
 
 console.log('公平观察白名单');
@@ -658,6 +719,83 @@ console.log('ISMCTS v3 失败 sweep 深层事务回滚');
   assert(result.candidateResults.every((item) => (
     item.visits === 0 && (item.availability || 0) === 0 && item.completedSamples === 0
   )), '失败 sweep 不得残留根 visits/availability 或 rollout');
+}
+
+console.log('ISMCTS v3 离线最小炸弹槽');
+{
+  const deck = createDeck();
+  const take = (rank, suit) => deck.find((card) => card.rank === rank && card.suit === suit);
+  const own = [take(6, 'C'), take(6, 'D'), take(6, 'H'), take(6, 'S'),
+    take(10, 'S'), take(11, 'S'), take(12, 'S'), take(2, 'S')];
+  // 三名对手仅可能拿到比根 2 小的单张；根 2 后固定三次 pass，下一轮本家
+  // 内节点恰好有“普通分支挤掉最小四炸”的公开反例。
+  const lowResponses = [take(3, 'C'), take(4, 'C'), take(5, 'C')];
+  const used = new Set([...own, ...lowResponses].map(physicalKey));
+  const playedCards = deck.filter((card) => !used.has(physicalKey(card)));
+  const rootCandidates = [take(2, 'S'), take(12, 'S')];
+  const candidates = rootCandidates.map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `offline_bomb_slot_root_${index}`, action: 'play', cards: [card],
+      hand, signature: handSignature(hand), localScore: 2 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [own.length, 1, 1, 1], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3', hands: [['hidden-state'], ['never-read']],
+  };
+  const baseOptions = {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 12,
+    minimumEffectiveVisits: 2, maxPlies: 24, nodeBudget: 1000,
+    branchLimit: 2, treeDepth: 5, includeTreeDigest: true, seed: 20260903,
+  };
+  const withoutFlag = evaluateInformationSetCandidates(context, candidates, baseOptions);
+  const explicitFalse = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, reserveBombSlot: false,
+  });
+  const withSlot = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, reserveBombSlot: true,
+  });
+  const forwarded = chooseHybridFromConsultation(context, {
+    action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, { ...baseOptions, reserveBombSlot: true });
+  assert(forwarded.decision?.hybrid?.searchMode === 'ismcts-v3'
+      && forwarded.decision?.hybrid?.searchAttempted === true,
+  '混合入口将离线炸弹槽开关转发到 v3 搜索路径而非仅注册名称');
+  const actionsAtDepth = (node, depth) => {
+    if (!node) return [];
+    if (depth === 0) return node.actions || [];
+    return (node.actions || []).flatMap((item) => actionsAtDepth(item.child, depth - 1));
+  };
+  const defaultKeys = actionsAtDepth(withoutFlag.treeDigest, 4).map((item) => item.key);
+  const reservedKeys = actionsAtDepth(withSlot.treeDigest, 4).map((item) => item.key);
+  assert(JSON.stringify(withoutFlag) === JSON.stringify(explicitFalse),
+    'reserveBombSlot 缺失与 false 的 v3 搜索统计和公开树摘要逐字节一致');
+  assert(defaultKeys.some((key) => key.startsWith('play:10:S:0|'))
+      && !defaultKeys.some((key) => key.startsWith('play:6:C:0,6:D:0,6:H:0,6:S:0|bomb|4|6|||'))
+      && reservedKeys.some((key) => key.startsWith('play:6:C:0,6:D:0,6:H:0,6:S:0|bomb|4|6|||'))
+      && reservedKeys.some((key) => key.startsWith('play:6:C:0,6:D:0,6:H:0|triple|3|6|||')),
+  '显式 v3 离线臂仅在内节点以最低成本四炸替换普通动作，并保留专家三张6首选');
+  const treeDigestText = JSON.stringify(withSlot.treeDigest);
+  assert(JSON.stringify(context.hands) === JSON.stringify([['hidden-state'], ['never-read']])
+      && treeDigestText.includes('6:C:0') && !treeDigestText.includes('"id"')
+      && !treeDigestText.includes('opponentHands') && !treeDigestText.includes('undealtCards'),
+  '离线臂不修改观察输入，树摘要只暴露公开 action key 且不含暗牌字段');
+
+  for (const searchMode of ['ismcts-v2', 'pimc-v1', 'paired-root-pimc-v1']) {
+    const control = evaluateInformationSetCandidates(context, candidates, {
+      ...baseOptions, searchMode,
+    });
+    const armed = evaluateInformationSetCandidates(context, candidates, {
+      ...baseOptions, searchMode, reserveBombSlot: true,
+    });
+    assert(JSON.stringify(control) === JSON.stringify(armed),
+      `${searchMode} 不接入 reserveBombSlot，根候选与搜索统计保持不变`);
+  }
 }
 
 console.log('ISMCTS v3 后置 rollout 失败的深树事务回滚');
@@ -1281,6 +1419,182 @@ console.log('STRAT-5：搜索入口共用 eligible-action 层');
   const staleControl = inspectOpenLoopBombCoverage(freshWorldState, 0, 5);
   assert(JSON.stringify(staleOff.baseline.actionKeys) === JSON.stringify(staleControl.baseline.actionKeys),
     'feature 关闭时过时根历史也不影响内节点扩展');
+}
+
+console.log('AI-LOCAL-003-LOCATE：searchTriggered 默认定向关闭，打开后只标调用点');
+{
+  const deck = createDeck();
+  const take = (rank, suit) => deck.find((card) => card.rank === rank && card.suit === suit);
+  const own = [take(2, 'S'), take(12, 'S'), take(3, 'H'), take(4, 'H'), take(5, 'H')];
+  const ownKeys = new Set(own.map(physicalKey));
+  const rest = deck.filter((card) => !ownKeys.has(physicalKey(card)));
+  const hiddenNeed = 8 + 8 + 8;
+  const playedCards = rest.slice(hiddenNeed);
+  const candidates = [take(2, 'S'), take(12, 'S')].map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `locate_root_${index}`, action: 'play', cards: [card],
+      hand, signature: handSignature(hand), localScore: 2 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [own.length, 8, 8, 8], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3',
+  };
+  const baseOptions = {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 12,
+    minimumEffectiveVisits: 2, maxPlies: 24, nodeBudget: 400,
+    branchLimit: 2, treeDepth: 4, seed: 20269003,
+  };
+  const off = evaluateInformationSetCandidates(context, candidates, baseOptions);
+  const explicitFalse = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, locateHotPath: false,
+  });
+  const on = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, locateHotPath: true,
+  });
+  assert(!('hotPathLocate' in off) && !('hotPathLocate' in explicitFalse),
+    'locateHotPath 默认/false 不得在搜索结果上露出定位载荷');
+  assert(off.searchTriggered === true && on.searchTriggered === true,
+    '定位切片必须打在 searchTriggered 回合上');
+  assert(off.applied === on.applied && off.reason === on.reason && off.iterations === on.iterations,
+    '打开定位不得改变 applied/reason/iterations');
+  const visitsOf = (result) => (result.candidateResults || [])
+    .map((item) => `${item.candidateId}:${item.visits}`).join('|');
+  assert(visitsOf(off) === visitsOf(on),
+    '打开定位不得改变根候选 visits');
+  assert(on.hotPathLocate?.enabled === true
+      && on.hotPathLocate.callSite === 'js/ai-hybrid.js:runISMCTSSearch'
+      && typeof on.hotPathLocate.dominantPhase === 'string'
+      && on.hotPathLocate.totalMs >= 0
+      && on.hotPathLocate.dominantShare >= 0,
+    '打开定位后必须给出 runISMCTSSearch 调用点与主导阶段');
+  const hybridOff = chooseHybridFromConsultation(context, {
+    action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, baseOptions);
+  const hybridOn = chooseHybridFromConsultation(context, {
+    action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, { ...baseOptions, locateHotPath: true });
+  assert(hybridOff.decision?.hybrid?.hotPathLocate == null,
+    '混合入口默认不得带定位载荷');
+  assert(hybridOn.decision?.hybrid?.hotPathLocate?.callSite === 'js/ai-hybrid.js:runISMCTSSearch',
+    '混合入口打开定位后转发调用点');
+  try {
+    setHybridHotPathLocate(true);
+    const session = chooseHybridFromConsultation(context, {
+      action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+      signature: candidates[0].signature, reason: '专家首选', candidates,
+      localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+    }, baseOptions);
+    assert(session.decision?.hybrid?.hotPathLocate?.enabled === true,
+      '诊断会话开关可在不改 options 时打开定位');
+  } finally {
+    setHybridHotPathLocate(false);
+  }
+  const restored = chooseHybridFromConsultation(context, {
+    action: 'play', cards: candidates[0].cards, hand: candidates[0].hand,
+    signature: candidates[0].signature, reason: '专家首选', candidates,
+    localCandidateId: candidates[0].id, cloudConstraint: 'soft_rerank',
+  }, baseOptions);
+  assert(restored.decision?.hybrid?.hotPathLocate == null,
+    '诊断会话开关关闭后定位载荷消失');
+}
+
+console.log('AI-LOCAL-003-OPT：复用已生成合法着法，默认等价且不改 visits/applied');
+{
+  const deck = createDeck();
+  const take = (rank, suit) => deck.find((card) => card.rank === rank && card.suit === suit);
+  const own = [take(2, 'S'), take(12, 'S'), take(3, 'H'), take(4, 'H'), take(5, 'H'), take(8, 'C')];
+  const ownKeys = new Set(own.map(physicalKey));
+  const rest = deck.filter((card) => !ownKeys.has(physicalKey(card)));
+  const innerState = {
+    hands: [
+      own.map((card) => ({ ...card })),
+      rest.slice(0, 8).map((card) => ({ ...card })),
+      rest.slice(8, 16).map((card) => ({ ...card })),
+      rest.slice(16, 24).map((card) => ({ ...card })),
+    ],
+    teams: [0, 1, 0, 1],
+    level: 7,
+    finishOrder: [],
+    lastHand: null,
+    lastSeat: null,
+    passed: new Set(),
+    currentSeat: 0,
+  };
+  const countCalls = (reuse) => {
+    let calls = 0;
+    inspectOpenLoopBombCoverage(innerState, 0, 5, {
+      reuseGeneratedPlays: reuse,
+      legalPlayGenerator: (hand, level, lastHand) => {
+        calls += 1;
+        return generateLegalPlays(hand, level, lastHand);
+      },
+    });
+    return calls;
+  };
+  const offCalls = countCalls(false);
+  const onCalls = countCalls(true);
+  assert(offCalls >= 3, `关闭复用时 select+choose 应各生成一次（实际 ${offCalls}）`);
+  assert(onCalls === offCalls - 1,
+    `打开复用后 chooseRolloutPlay 不得再生成合法着法（off=${offCalls}, on=${onCalls}）`);
+
+  const keysOf = (reuse) => inspectOpenLoopBombCoverage(innerState, 0, 5, {
+    reuseGeneratedPlays: reuse,
+  }).baseline.actionKeys.join('|');
+  assert(keysOf(false) === keysOf(true),
+    '复用已生成着法不得改变内节点分支键');
+
+  const playedCards = rest.slice(24);
+  const candidates = [take(2, 'S'), take(12, 'S')].map((card, index) => {
+    const hand = parseHand([card], 7);
+    return {
+      id: `reuse_root_${index}`, action: 'play', cards: [card],
+      hand, signature: handSignature(hand), localScore: 2 - index,
+    };
+  });
+  const context = {
+    seat: 0, hand: own, level: 7, lastHand: null, lastSeat: null,
+    handCounts: [own.length, 8, 8, 8], teams: [0, 1, 0, 1], finishOrder: [],
+    playedCards, publicHistory: [], difficulty: 'master', deterministic: true,
+    decisionEngine: 'ismcts-v3',
+  };
+  const baseOptions = {
+    searchMode: 'ismcts-v3', behaviorAttempts: 1, iterationBudget: 12,
+    minimumEffectiveVisits: 2, maxPlies: 24, nodeBudget: 400,
+    branchLimit: 2, treeDepth: 4, seed: 20269003,
+  };
+  const off = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, reuseGeneratedPlays: false,
+  });
+  const on = evaluateInformationSetCandidates(context, candidates, {
+    ...baseOptions, reuseGeneratedPlays: true,
+  });
+  const omitted = evaluateInformationSetCandidates(context, candidates, baseOptions);
+  const visitsOf = (result) => (result.candidateResults || [])
+    .map((item) => `${item.candidateId}:${item.visits}`).join('|');
+  assert(off.searchTriggered === true && on.searchTriggered === true,
+    '复用切片必须打在 searchTriggered 回合上');
+  assert(off.applied === on.applied && off.reason === on.reason && off.iterations === on.iterations,
+    '打开复用不得改变 applied/reason/iterations');
+  assert(visitsOf(off) === visitsOf(on),
+    '打开复用不得改变根候选 visits');
+  assert(omitted.applied === on.applied && visitsOf(omitted) === visitsOf(on),
+    '默认应复用已生成着法，且与显式打开金标一致');
+  try {
+    setHybridReuseGeneratedPlays(false);
+    const sessionOff = evaluateInformationSetCandidates(context, candidates, baseOptions);
+    assert(sessionOff.applied === off.applied && visitsOf(sessionOff) === visitsOf(off),
+      '会话关闭复用后仍与显式 false 金标一致');
+  } finally {
+    setHybridReuseGeneratedPlays(true);
+  }
 }
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);
