@@ -37,7 +37,16 @@ try {
       'root=Path(sys.argv[1])', 'labels=write_fixture(root)', 'paths=[]',
       "for architecture in ['linear','mlp']:",
       "    output=root/(architecture+'.json')", '    train_model(labels,output,architecture=architecture,epochs=15,seed=1)',
-      '    paths.append(str(output))', 'print(json.dumps(paths))',
+      '    paths.append(str(output))',
+      "v2_labels=root/'labels-v2.jsonl'",
+      "lines=labels.read_text().splitlines(); h=json.loads(lines[0]); h['featureEngine']='learned-context-v2'; lines[0]=json.dumps(h)",
+      "for i in range(1,len(lines)):",
+      "    r=json.loads(lines[i]); r['features']=r['features']+[0.1,0.2,0.3,0.4,0.5,0.6]; lines[i]=json.dumps(r)",
+      "v2_labels.write_text('\\n'.join(lines)+'\\n')",
+      "v2_out=root/'context-v2.json'",
+      "train_model(v2_labels,v2_out,architecture='mlp',epochs=15,seed=1)",
+      'paths.append(str(v2_out))',
+      'print(json.dumps(paths))',
     ].join('\n');
     const child = spawnSync('python', ['-B', '-c', program, temp], { cwd: root, encoding: 'utf8', timeout: 120000 });
     assert.equal(child.status, 0, child.stderr || child.stdout || 'Python fixture training failed');

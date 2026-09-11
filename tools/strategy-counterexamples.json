@@ -3,13 +3,13 @@
   "ruleVersion": "guandan-rules-v1",
   "sourceFingerprint": {
     "files": [
-      { "file": "js/ai.js", "sha256": "bca4041b80e178f8f58399fa8c7cdafc265fe2bcf1259962291db3b87b86a83c", "bytes": 118514 },
+      { "file": "js/ai.js", "sha256": "a3411fa2500d1f9592a8d2d595b1dd547274a1185521c0f3390de5e5c8688061", "bytes": 118709 },
       { "file": "js/cards.js", "sha256": "c27bb5693fad1c21194422e8eb772ed3a20b0e784c521d5d71748280155f0820", "bytes": 3660 },
       { "file": "js/evaluator.js", "sha256": "6344489a0d42b02fe19b44d0ca3aecb0c1951eeac9287bec65243be0cb58cef0", "bytes": 44362 },
       { "file": "js/rules.js", "sha256": "be31def27ea002def6b3e6aeec49aad6bd30c08b1ad50c4990965420f561e19e", "bytes": 33075 },
       { "file": "js/strategy-core.js", "sha256": "79cb3596359e4ba50a13d27e1f8c23ed5f4a736be77c814ebbce6473b3b825db", "bytes": 80807 }
     ],
-    "sha256": "27d4f3c02612932bbc59515ad1c1230ef553145667842cf81233ae8e48203b61"
+    "sha256": "8689dc1ac606552666ff6ab8e2c15eb6aec4e40d7c61b78a05d099943807dabe"
   },
   "fixtures": [
     {
@@ -17,7 +17,7 @@
       "id": "strat4-partner-wins-active-enemy-yielded",
       "rule": "STRAT-4",
       "ruleVersion": "guandan-rules-v1",
-      "sourceFingerprint": { "sha256": "27d4f3c02612932bbc59515ad1c1230ef553145667842cf81233ae8e48203b61" },
+      "sourceFingerprint": { "sha256": "8689dc1ac606552666ff6ab8e2c15eb6aec4e40d7c61b78a05d099943807dabe" },
       "observation": {
         "level": 2,
         "seat": 0,
@@ -52,7 +52,7 @@
       "id": "strat4-enemy-can-still-respond",
       "rule": "STRAT-4",
       "ruleVersion": "guandan-rules-v1",
-      "sourceFingerprint": { "sha256": "27d4f3c02612932bbc59515ad1c1230ef553145667842cf81233ae8e48203b61" },
+      "sourceFingerprint": { "sha256": "8689dc1ac606552666ff6ab8e2c15eb6aec4e40d7c61b78a05d099943807dabe" },
       "observation": {
         "level": 2,
         "seat": 0,
@@ -72,7 +72,7 @@
       "id": "strat4-partner-just-finished",
       "rule": "STRAT-4",
       "ruleVersion": "guandan-rules-v1",
-      "sourceFingerprint": { "sha256": "27d4f3c02612932bbc59515ad1c1230ef553145667842cf81233ae8e48203b61" },
+      "sourceFingerprint": { "sha256": "8689dc1ac606552666ff6ab8e2c15eb6aec4e40d7c61b78a05d099943807dabe" },
       "observation": {
         "level": 2,
         "seat": 0,
@@ -92,7 +92,7 @@
       "id": "strat4-no-history-is-not-proof",
       "rule": "STRAT-4",
       "ruleVersion": "guandan-rules-v1",
-      "sourceFingerprint": { "sha256": "27d4f3c02612932bbc59515ad1c1230ef553145667842cf81233ae8e48203b61" },
+      "sourceFingerprint": { "sha256": "8689dc1ac606552666ff6ab8e2c15eb6aec4e40d7c61b78a05d099943807dabe" },
       "observation": {
         "level": 2,
         "seat": 0,

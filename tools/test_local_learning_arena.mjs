@@ -111,6 +111,36 @@ assert.equal(createPublicAIObservation(richContext).decisionEngine, 'learned-con
 assert(chooseAIPlay(richContext).modelCalls > 0, 'context engine must reach model inference through the actual AI route');
 assert.equal(chooseLearningPlay(context, expertDecision).fallbackReason, 'feature_engine_mismatch');
 configureOfflineLearningModel(null);
+
+// Context v2 features must populate residual structure metrics and expand to 38 dimensions
+const v2Context = { ...context, decisionEngine: 'learned-context-v2' };
+const v2Candidates = buildLearningCandidates(v2Context, expertDecision);
+assert.deepEqual(v2Candidates.map(decisionKey), candidates.map(decisionKey));
+assert(v2Candidates.every(c => Number.isFinite(c.residualTricks) && Number.isFinite(c.residualLoose)));
+assert(v2Candidates.every(c => Number.isFinite(c.residualControls) && Number.isFinite(c.residualBombs)));
+assert(v2Candidates.every(c => Number.isFinite(c.trickDelta)));
+const v2Features = extractHybridValueFeatures(v2Context, v2Candidates[0], 'learned-context-v2');
+assert.equal(v2Features.length, 38);
+assert(Array.from(v2Features).every(Number.isFinite));
+
+const v2Model = {
+  schema: 'guandan-candidate-v1',
+  id: 'learning-v2-fixture',
+  metadata: { featureEngine: 'learned-context-v2' },
+  layers: [{
+    weights: [Array(38).fill(0)],
+    bias: [0],
+    activation: 'linear',
+  }],
+};
+configureOfflineLearningModel(changeModel);
+assert.equal(chooseLearningPlay(v2Context, expertDecision).fallbackReason, 'feature_engine_mismatch');
+configureOfflineLearningModel(v2Model);
+assert.equal(chooseLearningPlay(v2Context, expertDecision).fallback, false);
+assert.equal(resolvePolicyVariant('learned-context-v2').decisionEngine, 'learned-context-v2');
+assert.equal(createPublicAIObservation(v2Context).decisionEngine, 'learned-context-v2');
+assert(chooseAIPlay(v2Context).modelCalls > 0, 'context v2 engine must reach model inference through the actual AI route');
+configureOfflineLearningModel(null);
 assert(candidates.length <= LEARNING_CANDIDATE_LIMIT, '候选上限与标签接口共用 8 个');
 assert(candidates.some((item) => item.action === 'pass'), '跟牌时候选集保留过牌');
 
@@ -483,6 +513,40 @@ function assertThrowsParse(argv, pattern, message) {
     const mismatchReport = path.join(temporary, 'mismatch.json');
     const mismatch = spawnSync(process.execPath, args.map(a => a === '--candidate=learned-context-v1'
       ? '--candidate=learned-value-v1' : a === `--report=${reportPath}` ? `--report=${mismatchReport}` : a),
+    { cwd: root, encoding: 'utf8', timeout: 15000 });
+    assert.notEqual(mismatch.status, 0);
+    assert.match(mismatch.stderr, /featureEngine/);
+    assert.equal(fs.existsSync(mismatchReport), false);
+  } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+}
+
+{
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'guandan-context-v2-smoke-'));
+  try {
+    const model = path.join(temporary, 'context-v2.json'), reportPath = path.join(temporary, 'context-v2-report.json');
+    const v2ModelFixture = {
+      schema: 'guandan-candidate-v1',
+      id: 'learning-v2-arena-fixture',
+      metadata: { featureEngine: 'learned-context-v2' },
+      layers: [{
+        weights: [Array(38).fill(0)],
+        bias: [0],
+        activation: 'linear',
+      }],
+    };
+    fs.writeFileSync(model, JSON.stringify(v2ModelFixture));
+    const args = [arenaCli, '--candidate=learned-context-v2', '--comparison=expert', `--model=${model}`,
+      '--blocks=1', '--base-seed=3400000000', '--levels=2', `--report=${reportPath}`];
+    const run = spawnSync(process.execPath, args, { cwd: root, encoding: 'utf8', timeout: SMOKE_TIMEOUT_MS });
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    assert.equal(report.completion.gamesCompleted, 2);
+    assert.equal(report.config.valueModel.featureEngine, 'learned-context-v2');
+    assert(report.learning.modelCalls > 0);
+    assert.equal(report.learning.fallback, 0);
+    const mismatchReport = path.join(temporary, 'mismatch-v2.json');
+    const mismatch = spawnSync(process.execPath, args.map(a => a === '--candidate=learned-context-v2'
+      ? '--candidate=learned-context-v1' : a === `--report=${reportPath}` ? `--report=${mismatchReport}` : a),
     { cwd: root, encoding: 'utf8', timeout: 15000 });
     assert.notEqual(mismatch.status, 0);
     assert.match(mismatch.stderr, /featureEngine/);

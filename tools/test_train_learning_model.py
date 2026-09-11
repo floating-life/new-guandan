@@ -61,6 +61,27 @@ class LearningTrainingTests(unittest.TestCase):
             self.assertEqual(model['metadata']['featureEngine'], 'learned-context-v1')
             self.assertEqual(model['metadata']['featureEncoder'], header['featureEncoder'])
 
+    def test_context_v2_feature_engine_with_dynamic_dimensions(self):
+        self.assertIsNotNone(trainer)
+        with tempfile.TemporaryDirectory() as folder:
+            labels = write_fixture(folder)
+            rows = labels.read_text().splitlines()
+            header = json.loads(rows[0])
+            header['featureEngine'] = 'learned-context-v2'
+            # expand fixture rows from 32 to 38 dimensions
+            for i in range(1, len(rows)):
+                row = json.loads(rows[i])
+                row['features'] = row['features'] + [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+                rows[i] = json.dumps(row)
+            rows[0] = json.dumps(header)
+            labels.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+            output = Path(folder) / 'context-v2.json'
+            trainer.train_model(labels, output, epochs=2)
+            model = json.loads(output.read_text())
+            self.assertEqual(model['metadata']['featureEngine'], 'learned-context-v2')
+            self.assertEqual(len(model['layers'][0]['weights'][0]), 38)
+            self.assertTrue(model['id'].endswith('-context-v2'))
+
     def test_seeded_mlp_is_reproducible(self):
         self.assertIsNotNone(trainer)
         with tempfile.TemporaryDirectory() as folder:

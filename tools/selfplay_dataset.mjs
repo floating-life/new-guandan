@@ -442,6 +442,7 @@ async function main() {
     throw new Error('请提供输出文件，例如 node tools/selfplay_dataset.mjs 20 20260826 data/selfplay.jsonl');
   }
   const outputPath = path.resolve(rawOutput);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   const recordTempPath = `${outputPath}.records.tmp`;
   const outputTempPath = `${outputPath}.tmp`;
   const checkpointPath = `${outputPath}.checkpoint.json`;

@@ -9,7 +9,8 @@ import { buildLearningCandidates } from '../js/ai-learning.js';
 import { createPublicAIObservation } from '../js/ai-observation.js';
 import { generateLegalPlays } from '../js/rules.js';
 import { filterEligibleStrategyActions } from '../js/strategy-core.js';
-import { evaluateLearningTeacherCandidates, extractHybridValueFeatures } from '../js/ai-hybrid.js';
+import { evaluateLearningTeacherCandidates, extractHybridValueFeatures,
+  HYBRID_VALUE_FEATURES, HYBRID_VALUE_FEATURES_V2 } from '../js/ai-hybrid.js';
 
 const SOURCE_SCHEMA = 'guandan-selfplay-trajectory-v3';
 export const LABEL_SCHEMA = 'guandan-learning-labels-v1';
@@ -95,7 +96,9 @@ export async function selectLearningStates(dataset, { statesPerLevel = 200, prog
         const context = publicContext(row.observation);
         if (legalCoverage(context).eligible >= 2) {
           bucket.push({ stateId, priority, dealGroupId: p.dealGroupId, split: p.split,
-            level: p.level, seat: row.seat, context });
+            level: p.level, seat: row.seat, context,
+            outcome: row.outcome || null,
+            chosenCandidateId: row.chosenCandidateId || null });
           bucket.sort((a, b) => b.priority.localeCompare(a.priority));
           if (bucket.length > quota) bucket.shift();
         }
@@ -124,12 +127,15 @@ function fresh(paths) {
 }
 
 export async function generateLearningLabels({ dataset, output, statesPerLevel = 200,
-  worlds = 4, maxPlies = 24, worldSeed = 3500000000, progress = null }) {
+  worlds = 4, maxPlies = 24, worldSeed = 3500000000, featureEngine = 'learned-value-v1', progress = null }) {
   integer(worlds, 'worlds', 1, 32);
   integer(maxPlies, 'maxPlies', 1, 180);
   integer(worldSeed, 'worldSeed', 1, 0xFFFFFFFF);
   dataset = path.resolve(dataset); output = path.resolve(output);
   if (!output.endsWith('.jsonl')) throw new Error('label output must end in .jsonl');
+  const isV2 = featureEngine === 'learned-context-v2';
+  const expectedFeatureLength = isV2 ? HYBRID_VALUE_FEATURES_V2.length : HYBRID_VALUE_FEATURES.length;
+  const candidateEngine = isV2 ? 'learned-context-v2' : (featureEngine === 'learned-context-v1' ? 'learned-context-v1' : 'expert');
   const prefix = output.slice(0, -6);
   const selectionPath = `${prefix}-selection.json`, summaryPath = `${prefix}-summary.json`, temp = `${output}.tmp`;
   fresh([output, selectionPath, summaryPath, temp]);
@@ -141,6 +147,8 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
   const implementation = sourceFingerprint();
   const header = { schema: `${LABEL_SCHEMA}-header`, valueSchema: 'guandan-candidate-v1',
     labelKind: 'teacher_estimate', stateCount: selected.states.length,
+    featureEngine,
+    featureNames: isV2 ? HYBRID_VALUE_FEATURES_V2 : HYBRID_VALUE_FEATURES,
     dataset: { path: dataset, sha256: selected.datasetSha256, schema: SOURCE_SCHEMA,
       seedManifest: selected.header.seedManifest, groups: selected.groups },
     selection: { path: selectionPath, sha256: sha(selectionBytes) },
@@ -154,7 +162,7 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
   for (let index = 0; index < selected.states.length; index++) {
     const state = selected.states[index];
     const expert = chooseAIPlay(state.context);
-    const candidates = buildLearningCandidates(state.context, expert);
+    const candidates = buildLearningCandidates({ ...state.context, decisionEngine: candidateEngine }, expert);
     const counts = legalCoverage(state.context);
     const result = evaluateLearningTeacherCandidates(state.context, candidates,
       { worlds, maxPlies, seed: worldSeed });
@@ -162,8 +170,8 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
     const byId = new Map(result.candidateResults.map(r => [r.candidateId, r]));
     const batch = candidates.map(candidate => {
       const estimate = byId.get(candidate.id);
-      const features = Array.from(extractHybridValueFeatures(state.context, candidate));
-      if (!estimate || features.length !== 32 || features.some(v => !Number.isFinite(v))) throw new Error('invalid label features/estimate');
+      const features = Array.from(extractHybridValueFeatures(state.context, candidate, candidateEngine));
+      if (!estimate || features.length !== expectedFeatureLength || features.some(v => !Number.isFinite(v))) throw new Error('invalid label features/estimate');
       terminalSamples += estimate.terminalCount;
       truncatedSamples += estimate.truncatedCount;
       return { schema: LABEL_SCHEMA, labelKind: 'teacher_estimate', stateId: state.stateId,
@@ -172,7 +180,9 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
         completedSamples: estimate.completedSamples, terminalCount: estimate.terminalCount,
         truncatedCount: estimate.truncatedCount, legalCandidateCount: counts.legal,
         eligibleCandidateCount: counts.eligible, retainedCandidateCount: candidates.length,
-        cappedCandidateCount: counts.eligible - candidates.length };
+        cappedCandidateCount: counts.eligible - candidates.length,
+        actualOutcome: state.outcome?.teamUtility ?? null,
+        isChosenAction: state.chosenCandidateId ? candidate.id === state.chosenCandidateId : null };
     });
     fs.appendFileSync(temp, `${batch.map(row => JSON.stringify(row)).join('\n')}\n`);
     labels += batch.length;
@@ -181,8 +191,11 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
     if ((index + 1) % 100 === 0) progress?.({ stage: 'teacher', states: index + 1, planned: selected.states.length, labels });
   }
   fs.renameSync(temp, output);
+  const totalSamples = terminalSamples + truncatedSamples;
+  const terminalRate = totalSamples > 0 ? terminalSamples / totalSamples : 0;
   const summary = { ok: true, schema: 'guandan-learning-label-summary-v1', output,
     states: selected.states.length, labels, coverage, terminalSamples, truncatedSamples,
+    terminalRate, featureEngine,
     datasetSha256: selected.datasetSha256, selectionSha256: header.selection.sha256,
     teacher: header.teacher, labelKind: 'teacher_estimate', trainingIsNotPromotion: true };
   fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, { flag: 'wx' });
@@ -190,7 +203,7 @@ export async function generateLearningLabels({ dataset, output, statesPerLevel =
 }
 
 function parseArgs(argv) {
-  const known = new Set(['dataset', 'output', 'states-per-level', 'worlds', 'rollout-depth', 'world-seed', 'reuse-labels', 'base-runtime']);
+  const known = new Set(['dataset', 'output', 'states-per-level', 'worlds', 'rollout-depth', 'world-seed', 'reuse-labels', 'base-runtime', 'feature-engine']);
   const values = {};
   for (const arg of argv) {
     const match = /^--([^=]+)=(.+)$/.exec(arg);
@@ -200,15 +213,20 @@ function parseArgs(argv) {
   if (!values.dataset || !values.output) throw new Error('--dataset= and --output= are required');
   return { dataset: values.dataset, output: values.output,
     reuseLabels: values['reuse-labels'], baseRuntime: values['base-runtime'],
+    featureEngine: values['feature-engine'] ?? (values['reuse-labels'] ? 'learned-context-v1' : 'learned-value-v1'),
     statesPerLevel: Number(values['states-per-level'] ?? 200), worlds: Number(values.worlds ?? 4),
     maxPlies: Number(values['rollout-depth'] ?? 24), worldSeed: Number(values['world-seed'] ?? 3500000000) };
 }
 
 /** Change only features after reproducing the exact original candidate identities. */
-export async function reencodeLearningLabels({ dataset, labels, output, baseRuntime, progress = null }) {
+export async function reencodeLearningLabels({ dataset, labels, output, baseRuntime, featureEngine = 'learned-context-v1', targetEngine = null, progress = null }) {
   if (!baseRuntime || !labels) throw new Error('re-encoding requires original labels and frozen base runtime');
   output = path.resolve(output); labels = path.resolve(labels); baseRuntime = path.resolve(baseRuntime);
   if (!output.endsWith('.jsonl')) throw new Error('label output must end in .jsonl');
+  const resolvedEngine = targetEngine || featureEngine;
+  const isV2 = resolvedEngine === 'learned-context-v2';
+  const targetEngineName = isV2 ? 'learned-context-v2' : 'learned-context-v1';
+  const expectedFeatureLength = isV2 ? HYBRID_VALUE_FEATURES_V2.length : HYBRID_VALUE_FEATURES.length;
   const prefix = output.slice(0, -6), selectionPath = `${prefix}-selection.json`, summaryPath = `${prefix}-summary.json`;
   fresh([output, selectionPath, summaryPath]);
   const originalBytes = fs.readFileSync(labels);
@@ -249,7 +267,7 @@ export async function reencodeLearningLabels({ dataset, labels, output, baseRunt
     }
     const previous = oldLearning.buildLearningCandidates(ctx, oldExpert);
     const currentBase = buildLearningCandidates(ctx, newExpert);
-    const rich = buildLearningCandidates({ ...ctx, decisionEngine: 'learned-context-v1' }, newExpert);
+    const rich = buildLearningCandidates({ ...ctx, decisionEngine: targetEngineName }, newExpert);
     const identity = list => JSON.stringify(list.map(c => [c.id, cardKey(c)]));
     if (identity(previous) !== identity(currentBase) || identity(previous) !== identity(rich)) {
       throw new Error(`candidate identities changed at ${state.stateId}`);
@@ -263,15 +281,17 @@ export async function reencodeLearningLabels({ dataset, labels, output, baseRunt
         || row.features.length !== 32 || row.features.some((v, k) => v !== oldFeatures[k])) {
         throw new Error(`original feature identity mismatch at ${state.stateId}`);
       }
-      const features = Array.from(extractHybridValueFeatures(ctx, rich[i]));
-      if (features.some(v => !Number.isFinite(v))) throw new Error('nonfinite context features');
+      const features = Array.from(extractHybridValueFeatures(ctx, rich[i], targetEngineName));
+      if (features.length !== expectedFeatureLength || features.some(v => !Number.isFinite(v))) throw new Error('nonfinite context features');
       encoded.set(`${state.stateId}/${row.candidateId}`, { ...row, features });
     }
     if ((index + 1) % 100 === 0) progress?.({ stage: 'reencode', states: index + 1, planned: selected.states.length });
   }
   if (encoded.size !== original.length) throw new Error('re-encoding changed label coverage');
   const nextHeader = { ...header, selection: { path: selectionPath, sha256: sha(selectionBytes) },
-    featureEncoder: { engine: 'learned-context-v1', originalLabels: { path: labels, sha256: sha(originalBytes) },
+    featureEngine: targetEngineName,
+    featureNames: isV2 ? HYBRID_VALUE_FEATURES_V2 : HYBRID_VALUE_FEATURES,
+    featureEncoder: { engine: targetEngineName, originalLabels: { path: labels, sha256: sha(originalBytes) },
       originalRuntime: baseRuntime, candidatesVerified: true, teacherValuesReused: true, implementation: sourceFingerprint() } };
   fs.mkdirSync(path.dirname(output), { recursive: true });
   fs.writeFileSync(selectionPath, selectionBytes, { flag: 'wx' });
@@ -280,7 +300,7 @@ export async function reencodeLearningLabels({ dataset, labels, output, baseRunt
   fs.writeFileSync(output, text, { flag: 'wx' });
   const summary = { ok: true, output, states: selected.states.length, labels: original.length,
     teacherRolloutsRepeated: 0, candidateIdentitiesVerified: true, originalLabelsSha256: sha(originalBytes),
-    labelsSha256: sha(text), featureEngine: 'learned-context-v1' };
+    labelsSha256: sha(text), featureEngine: targetEngineName };
   fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, { flag: 'wx' });
   return summary;
 }

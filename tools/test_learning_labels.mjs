@@ -109,5 +109,42 @@ try {
   assert.deepEqual(encodedRows.slice(1).map(r => r.teacherValue), outputRows.slice(1).map(r => r.teacherValue));
   assert(encodedRows.slice(1).some(r => r.features[5] !== 0));
   assert.deepEqual(fs.readFileSync(output), original);
+
+  // learned-context-v2 re-encoding test
+  const v2EnrichedPath = path.join(temp, 'context-v2.jsonl');
+  const v2Enriched = await labels.reencodeLearningLabels({
+    dataset,
+    labels: output,
+    output: v2EnrichedPath,
+    targetEngine: 'learned-context-v2',
+    baseRuntime: snapshot,
+  });
+  assert.equal(v2Enriched.labels, made.labels);
+  const v2EncodedRows = fs.readFileSync(v2EnrichedPath, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(v2EncodedRows[0].featureEncoder.engine, 'learned-context-v2');
+  assert.equal(v2EncodedRows[0].featureNames.length, 38);
+  assert(v2EncodedRows.slice(1).every(r => r.features.length === 38));
+  assert.deepEqual(v2EncodedRows.slice(1).map(r => r.teacherValue), outputRows.slice(1).map(r => r.teacherValue));
+
+  // learned-context-v2 direct generation test
+  const v2DirectOutput = path.join(temp, 'direct-v2.jsonl');
+  const v2Direct = await labels.generateLearningLabels({
+    dataset,
+    output: v2DirectOutput,
+    statesPerLevel: 4,
+    worlds: 2,
+    maxPlies: 4,
+    worldSeed: 3500000000,
+    featureEngine: 'learned-context-v2',
+  });
+  assert.equal(v2Direct.states, 4);
+  assert.equal(v2Direct.featureEngine, 'learned-context-v2');
+  assert(Number.isFinite(v2Direct.terminalRate));
+  assert(Number.isInteger(v2Direct.terminalSamples));
+  const v2DirectRows = fs.readFileSync(v2DirectOutput, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(v2DirectRows[0].featureEngine, 'learned-context-v2');
+  assert.equal(v2DirectRows[0].featureNames.length, 38);
+  assert(v2DirectRows.slice(1).every(r => r.features.length === 38 && Number.isFinite(r.teacherValue)));
+
   console.log('learning selection and label pipeline: OK');
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }

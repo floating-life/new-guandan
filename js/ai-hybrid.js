@@ -113,6 +113,11 @@ export const HYBRID_VALUE_FEATURES = Object.freeze([
   'finishes_now', 'type_single', 'type_pair', 'type_triple', 'type_fullhouse',
   'type_straight', 'type_triple_pair', 'type_plate', 'main_rank',
 ]);
+export const HYBRID_VALUE_FEATURES_V2 = Object.freeze([
+  ...HYBRID_VALUE_FEATURES,
+  'residual_tricks', 'residual_loose', 'residual_loose_ratio',
+  'residual_controls', 'residual_bombs', 'trick_delta',
+]);
 
 const BOMB_TYPES = new Set([
   HandType.BOMB, HandType.FLUSH_STRAIGHT, HandType.JOKER_BOMB,
@@ -362,7 +367,7 @@ function candidateCards(candidate) {
   return Array.isArray(candidate?.cards) ? candidate.cards : [];
 }
 
-export function extractHybridValueFeatures(ctx, candidate) {
+export function extractHybridValueFeatures(ctx, candidate, featureEngine = null) {
   const observation = createPublicAIObservation(ctx);
   const cards = candidateCards(candidate);
   const hand = candidate?.hand || null;
@@ -376,7 +381,7 @@ export function extractHybridValueFeatures(ctx, candidate) {
     ? Math.min(...enemies.map((enemy) => observation.handCounts[enemy])) : 0;
   const remaining = Math.max(0, observation.hand.length - cards.length);
   const type = hand?.type;
-  return Float64Array.from([
+  const base = [
     normalizedCount(remaining),
     clamp((observation.playedCards?.length || 0) / 108, 0, 1),
     clamp(cards.length / 8, 0, 1),
@@ -409,7 +414,19 @@ export function extractHybridValueFeatures(ctx, candidate) {
     Number(type === HandType.TRIPLE_PAIR),
     Number(type === HandType.PLATE),
     clamp((Number(hand?.mainRank) || 0) / 17, 0, 1),
-  ]);
+  ];
+  const engine = featureEngine || observation.decisionEngine;
+  if (engine === 'learned-context-v2') {
+    base.push(
+      clamp(Number(candidate?.residualTricks ?? candidate?.projectedTricks ?? 0) / 10, 0, 2),
+      clamp(Number(candidate?.residualLoose ?? 0) / 10, 0, 2),
+      clamp(Number(candidate?.residualLoose ?? 0) / Math.max(1, remaining), 0, 1),
+      clamp(Number(candidate?.residualControls ?? 0) / 6, 0, 2),
+      clamp(Number(candidate?.residualBombs ?? 0) / 3, 0, 2),
+      clamp(Number(candidate?.trickDelta ?? 0) / 3, -1, 1),
+    );
+  }
+  return Float64Array.from(base);
 }
 
 function normalizeLayer(layer, inputSize) {
@@ -435,7 +452,10 @@ export function validateHybridValueModel(model) {
   if (!Array.isArray(model.layers) || !model.layers.length || model.layers.length > 4) {
     return { ok: false, reason: 'invalid_layers' };
   }
-  let inputSize = HYBRID_VALUE_FEATURES.length;
+  const featureEngine = model.metadata?.featureEngine;
+  const expectedSize = featureEngine === 'learned-context-v2'
+    ? HYBRID_VALUE_FEATURES_V2.length : HYBRID_VALUE_FEATURES.length;
+  let inputSize = expectedSize;
   let weightCount = 0;
   const layers = [];
   for (const layer of model.layers) {
@@ -505,7 +525,7 @@ export function evaluateHybridValueModel(model, features) {
     : validateHybridValueModel(model);
   if (!normalized.ok) return null;
   let values = Array.from(features || []);
-  if (values.length !== HYBRID_VALUE_FEATURES.length) return null;
+  if (values.length !== normalized.model.layers[0].inputSize) return null;
   for (const layer of normalized.model.layers) {
     const next = new Array(layer.outputSize).fill(0);
     for (let output = 0; output < layer.outputSize; output++) {

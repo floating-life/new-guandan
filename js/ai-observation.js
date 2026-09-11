@@ -144,7 +144,7 @@ export function createPublicAIObservation(ctx = {}) {
       ? ctx.opponentModelMode : 'adaptive',
     leadAfterOwnBomb: ctx.leadAfterOwnBomb === true,
     decisionEngine: ['hybrid', 'pimc-v1', 'ismcts', 'root-pimc-v1', 'ismcts-v2', 'ismcts-v3', 'learned-value-v1', 'learned-context-v1',
-      'ismcts-v3-bomb-slot', 'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe']
+      'learned-context-v2', 'ismcts-v3-bomb-slot', 'root-pimc-v1-fxe', 'ismcts-v2-fxe', 'ismcts-v3-fxe']
       .includes(ctx.decisionEngine)
       ? ctx.decisionEngine : 'expert',
   };

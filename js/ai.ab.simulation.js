@@ -60,7 +60,7 @@ const {
   configureHybridValueModel, validateHybridValueModel, HYBRID_ENGINE_VERSION,
 } = await import('./ai-hybrid.js');
 const {
-  configureOfflineLearningModel, LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, isLearningDecisionEngine,
+  configureOfflineLearningModel, LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, LEARNING_CONTEXT_V2_ENGINE, isLearningDecisionEngine,
 } = await import('./ai-learning.js');
 const {
   createSeedManifest, seedManifestOverlap, valueModelStatus,
@@ -238,7 +238,7 @@ const hybridScenarioLogPath = hybridScenarioLogFlag
   ? path.resolve(String(hybridScenarioLogFlag).slice('--hybrid-scenario-log='.length)) : null;
 const resumeCheckpoint = process.argv.includes('--resume');
 const HYBRID_VALUE_MODEL_ENGINES = new Set(['hybrid', 'ismcts']);
-const LEARNING_VALUE_MODEL_ENGINES = new Set([LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE]);
+const LEARNING_VALUE_MODEL_ENGINES = new Set([LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, LEARNING_CONTEXT_V2_ENGINE]);
 const LEARNING_PURPOSE = 'learning-development';
 let valueModelAudit = null;
 if (valueModelPath) {

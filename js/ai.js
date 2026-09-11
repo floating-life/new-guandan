@@ -25,7 +25,7 @@ import {
   publicPartnerProtectionValue,
 } from './ai-route.js';
 import { chooseHybridFromConsultation } from './ai-hybrid.js';
-import { LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, isLearningDecisionEngine, chooseLearningPlay } from './ai-learning.js';
+import { LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE, LEARNING_CONTEXT_V2_ENGINE, isLearningDecisionEngine, chooseLearningPlay } from './ai-learning.js';
 import { opponentPlayAdjustment } from './opponent-model.js';
 
 export const AI_DIFFICULTY = {
@@ -213,6 +213,11 @@ export function resolveHybridSearchConfig(decisionEngine, {
  * 只关闭被测模块，避免旧 baseline 同时关闭多项能力而污染归因。
  */
 export const AI_POLICY_VARIANTS = Object.freeze({
+  'learned-context-v2': Object.freeze({
+    policyProfile: 'expert',
+    policyFeatures: EXPERT_POLICY_FEATURES,
+    decisionEngine: LEARNING_CONTEXT_V2_ENGINE,
+  }),
   'learned-context-v1': Object.freeze({
     policyProfile: 'expert',
     policyFeatures: EXPERT_POLICY_FEATURES,

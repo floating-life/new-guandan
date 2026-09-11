@@ -2,9 +2,9 @@
  * 离线学习候选层。它不加载文件、不接触产品设置；调用者必须在本进程中
  * 显式配置模型，且所有输入先经过公共观察白名单。
  */
-import { generateLegalPlays, handSignature } from './rules.js';
+import { generateLegalPlays, handSignature, HandType } from './rules.js';
 import { filterEligibleStrategyActions, strategicCandidateScore, createStrategicMemo } from './strategy-core.js';
-import { removeCards } from './cards.js';
+import { removeCards, isWild, isJoker } from './cards.js';
 import { inferPublicThreats, createBeatModel, evaluatePublicResponseTree,
   estimateThreeStepRoute, publicCoordinationScore } from './ai-route.js';
 import {
@@ -15,7 +15,12 @@ import {
 
 export const LEARNING_DECISION_ENGINE = 'learned-value-v1';
 export const LEARNING_CONTEXT_ENGINE = 'learned-context-v1';
-export const isLearningDecisionEngine = engine => [LEARNING_DECISION_ENGINE, LEARNING_CONTEXT_ENGINE].includes(engine);
+export const LEARNING_CONTEXT_V2_ENGINE = 'learned-context-v2';
+export const isLearningDecisionEngine = engine => [
+  LEARNING_DECISION_ENGINE,
+  LEARNING_CONTEXT_ENGINE,
+  LEARNING_CONTEXT_V2_ENGINE,
+].includes(engine);
 export const LEARNING_CANDIDATE_LIMIT = 8;
 
 let offlineModel = null;
@@ -65,21 +70,35 @@ export function buildLearningCandidates(context = {}, expertDecision = null) {
     id: `learning_${index}`,
     localScore: Number(candidate.localScore) || 0,
   }));
-  if (context.decisionEngine !== LEARNING_CONTEXT_ENGINE) return result;
+  if (context.decisionEngine !== LEARNING_CONTEXT_ENGINE && context.decisionEngine !== LEARNING_CONTEXT_V2_ENGINE) return result;
+  const isV2 = context.decisionEngine === LEARNING_CONTEXT_V2_ENGINE;
   const planning = { ...context, strategyMemo: createStrategicMemo(hand, context.level),
     publicModel: inferPublicThreats(context) };
   const beatModel = createBeatModel(planning);
   const cache = new Map(); // Route cache belongs to this decision only.
+  const initialRoute = isV2 ? estimateThreeStepRoute(hand, context.level, planning, { depth: 1, beam: 3, cache }) : null;
   return result.map(candidate => {
     const remaining = removeCards(hand, candidate.cards);
     const route = estimateThreeStepRoute(remaining, context.level, planning, { depth: 1, beam: 3, cache });
     const pass = candidate.action === 'pass';
-    return { ...candidate,
+    const enriched = { ...candidate,
       localScore: pass ? publicCoordinationScore(candidate, planning, planning.publicModel).score
         : strategicCandidateScore(candidate, planning).total,
       projectedTricks: route.estimatedTricks,
       responseSearch: pass ? null : evaluatePublicResponseTree(candidate, planning, beatModel,
         { ownRemaining: remaining.length }) };
+    if (!isV2) return enriched;
+    const residualControls = remaining.filter(c => isJoker(c) || isWild(c, context.level) || c.rank === 14 || c.rank === context.level).length;
+    const legalPlays = generateLegalPlays(remaining, context.level, null);
+    const residualBombs = new Set(legalPlays.filter(p => [HandType.BOMB, HandType.FLUSH_STRAIGHT, HandType.JOKER_BOMB].includes(p.hand?.type)).map(p => p.cards.map(c => c.id).sort().join(','))).size;
+    return {
+      ...enriched,
+      residualTricks: route.tricks,
+      residualLoose: route.loose,
+      residualControls,
+      residualBombs,
+      trickDelta: (initialRoute?.tricks || 0) - route.tricks,
+    };
   });
 }
 
@@ -127,7 +146,7 @@ export function chooseLearningPlay(context = {}, expertDecision = null) {
   for (const candidate of candidates) {
     const score = evaluateHybridValueModel(
       offlineModel,
-      extractHybridValueFeatures(context, candidate),
+      extractHybridValueFeatures(context, candidate, requestedEngine),
     );
     modelCalls += 1;
     if (!Number.isFinite(score)) {

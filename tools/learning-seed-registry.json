@@ -56,6 +56,36 @@
       "notes": "Last 4 of 20 own self-play deal groups collected. Held out from fitting; collector-only failure reproduced and repaired without policy changes."
     },
     {
+      "id": "own-train-r2",
+      "role": "own-train-r2",
+      "split": "train",
+      "baseSeed": 3100000020,
+      "groupCount": 20,
+      "seedEnd": 3100000039,
+      "levels": "all",
+      "rotations": [0, 1, 2, 3],
+      "derivedGames": 1040,
+      "trainingEligible": true,
+      "selfplay": true,
+      "status": "registered",
+      "notes": "Second round training deal groups reserved in non-formal uint32 range (3100000020-3100000039, 20 groups)."
+    },
+    {
+      "id": "own-validation-r2",
+      "role": "own-validation-r2",
+      "split": "validation",
+      "baseSeed": 3100000040,
+      "groupCount": 5,
+      "seedEnd": 3100000044,
+      "levels": "all",
+      "rotations": [0, 1, 2, 3],
+      "derivedGames": 260,
+      "trainingEligible": true,
+      "selfplay": true,
+      "status": "registered",
+      "notes": "Second round validation deal groups reserved in non-formal uint32 range (3100000040-3100000044, 5 groups)."
+    },
+    {
       "id": "development-comparison",
       "role": "development-comparison",
       "split": "development",

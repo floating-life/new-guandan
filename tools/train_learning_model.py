@@ -85,6 +85,8 @@ def load_labels(label_path):
     if not isinstance(worlds, int) or isinstance(worlds, bool) or not 1 <= worlds <= 32 \
             or header.get('teacher', {}).get('learnedModelUsed') is not False:
         raise ValueError('invalid teacher contract')
+    feature_engine = header.get('featureEngine') or header.get('featureEncoder', {}).get('engine', 'learned-value-v1')
+    expected_dim = 38 if feature_engine == 'learned-context-v2' else 32
     keys, counts, retained = set(), Counter(), {}
     for row in rows:
         state = states.get(row.get('stateId'))
@@ -97,7 +99,7 @@ def load_labels(label_path):
             raise ValueError('duplicate/invalid candidate label')
         keys.add(key)
         features = row.get('features')
-        if not isinstance(features, list) or len(features) != 32 or not all(finite(v) for v in features):
+        if not isinstance(features, list) or len(features) != expected_dim or not all(finite(v) for v in features):
             raise ValueError('invalid label features')
         target = row.get('teacherValue')
         if not finite(target) or not -3 <= target <= 3:
@@ -144,8 +146,8 @@ def train_model(labels, output, architecture='mlp', epochs=100, seed=1, device='
     if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= 0xFFFFFFFF:
         raise ValueError('invalid training seed')
     data = load_labels(labels)
-    feature_engine = data['header'].get('featureEncoder', {}).get('engine', 'learned-value-v1')
-    if feature_engine not in {'learned-value-v1', 'learned-context-v1'}:
+    feature_engine = data['header'].get('featureEngine') or data['header'].get('featureEncoder', {}).get('engine', 'learned-value-v1')
+    if feature_engine not in {'learned-value-v1', 'learned-context-v1', 'learned-context-v2'}:
         raise ValueError('unknown feature engine')
     train_rows = [r for r in data['rows'] if r['split'] == 'train']
     val_rows = [r for r in data['rows'] if r['split'] == 'validation']
@@ -158,12 +160,13 @@ def train_model(labels, output, architecture='mlp', epochs=100, seed=1, device='
     y_train = torch.tensor([r['teacherValue'] for r in train_rows], dtype=torch.float64).reshape(-1, 1)
     x_val = torch.tensor([r['features'] for r in val_rows], dtype=torch.float64)
     y_val = torch.tensor([r['teacherValue'] for r in val_rows], dtype=torch.float64).reshape(-1, 1)
+    input_dim = x_train.shape[1]
     means = x_train.mean(dim=0)
     scales = x_train.std(dim=0, correction=0)
     scales = torch.where(scales < 1e-8, torch.ones_like(scales), scales)
     normalized_train, normalized_val = (x_train - means) / scales, (x_val - means) / scales
-    model = nn.Sequential(nn.Linear(32, 1)) if architecture == 'linear' else nn.Sequential(
-        nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1))
+    model = nn.Sequential(nn.Linear(input_dim, 1)) if architecture == 'linear' else nn.Sequential(
+        nn.Linear(input_dim, 64), nn.ReLU(), nn.Linear(64, 1))
     model = model.double()
     with torch.no_grad():
         model[-1].bias.fill_(float(y_train.mean()))
@@ -203,7 +206,7 @@ def train_model(labels, output, architecture='mlp', epochs=100, seed=1, device='
             bias = bias - weights @ means
         layers.append(dict(weights=weights.tolist(), bias=bias.tolist(),
                            activation='relu' if index < len(linear_layers) - 1 else 'linear'))
-    cases = [[0.0] * 32, [1.0] * 32, [-1.0] * 32, [(i % 3 - 1) * .5 for i in range(32)],
+    cases = [[0.0] * input_dim, [1.0] * input_dim, [-1.0] * input_dim, [(i % 3 - 1) * .5 for i in range(input_dim)],
              *[r['features'] for r in train_rows[:2]], *[r['features'] for r in val_rows[:2]]]
     with torch.no_grad():
         expected = model((torch.tensor(cases, dtype=torch.float64) - means) / scales).flatten().tolist()
@@ -213,7 +216,8 @@ def train_model(labels, output, architecture='mlp', epochs=100, seed=1, device='
     report = dict(architecture=architecture, epochs=epochs, selectedEpoch=best_epoch, seed=seed, device=device,
                   optimizer=dict(name='Adam', learningRate=.01, weightDecay=.001), metrics=metrics, split=split,
                   normalization=dict(fitOn='train-deal-groups-only', mean=means.tolist(), scale=scales.tolist()))
-    model_id = f'learning-{architecture}-{len(data["rows"])}-{seed}' + ('-context' if feature_engine == 'learned-context-v1' else '')
+    engine_suffix = '-context-v2' if feature_engine == 'learned-context-v2' else ('-context' if feature_engine == 'learned-context-v1' else '')
+    model_id = f'learning-{architecture}-{len(data["rows"])}-{seed}' + engine_suffix
     payload = dict(schema='guandan-candidate-v1', id=model_id, layers=layers,
                    metadata=dict(status='experimental_unvalidated', labelKind='teacher_estimate',
                                  featureEngine=feature_engine, featureEncoder=data['header'].get('featureEncoder'),
