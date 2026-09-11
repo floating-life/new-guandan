@@ -1,8 +1,176 @@
 # 掼蛋训练大师：近期待办
 
-> 更新：2026-09-03
+> 更新：2026-09-08。目标：**自有数据训练出能实际参加对战的更强 AI 候选**。
+> 设计依据：[整体项目路线图.md](./整体项目路线图.md) 一至六节；历史证据见本文末尾折叠快照。
+> 用户已批准本方向，并要求以后直接执行。父代理自主完成本地规划、实现、定向测试、修复和 CPU 离线学习实验，不逐 TASK 询问是否继续。
+> 实施状态：首轮 LEARN-001～006 的研发管线、实验及离线交付已完成；1,040 局采集、三份模型各 260 局比较均有实际结果。三模型全部弱于 expert，未使用独立确认集、未改默认；强度目标仍未完成。工件说明：`data/learn-v1/CANDIDATE.md`；执行记录：`data/learn-v1/execution/progress.md`。
+
+## 当前起点与执行边界
+
+- 基线：`main` / `2d2f54a`，原有 19 个已跟踪修改、12 个未跟踪文件；保护全部既有改动。当前 expert 默认（含 STRAT-2），无 `promoted` 模型，STRAT-3/4 与下载守卫默认关闭，`ismcts-v3` 不进 UI。
+- 新自有数据：20 个底牌组 × 13 级 × 4 轮转 = 1,040 局 / 102,182 条决策；旧 40 局全打 2 原件保留。已生成 2,600 局面 / 15,888 条教师标签，按 16/4 底牌组隔离训练/验证。AI-LOCAL-001 仍只作性能诊断。
+- **LEARN 本地研发已获授权，不依赖外部 DMC-2、独立 Python 规则环境、R2 搜索正收益、完整发布验证或真人盲评。** 正式 DMC 的原有准入单独保留；本地学习不会自动满足它。
+- 外部轨迹、真人密封数据和 annotation 仍按原来源隔离；本轮只用自有 `fair-selfplay`。候选输入只含行动者手牌和当时公开信息。
+- 新研发训练与比较使用下表非正式种子；不消费、复用历史正式种子，不继续失败的 `20265401–20265480` fxe，不把研发数据冒充未见发布证据。
+- 正式启用仍需路线图六节及当前验证器全部原门槛；本轮不改 expert 默认、不打开 STRAT-3/4、不变更发布状态、commit/push、外部系统或付费资源。
+- 普通技术选择、局部修复、任务衔接、输出命名和定向验证由父代理自行决定。真正缺少新授权或关键用户信息时说明具体原因；不把已有授权重新变成确认问题。
+
+## 近期任务顺序
+
+- [x] **LEARN-001：修复全级自对弈与底牌分组。** 52 局 smoke、完整数据校验通过；采集第 835 局的咨询短名单缺项已修复并从检查点续采，前 834 局哈希保持不变。
+- [x] **LEARN-002：接通离线模型选牌及快速同牌对照。** 各座位实际模型调用、expert 隔离、参数/原报告保护通过；独立 Antigravity 审查通过。
+- [x] **LEARN-003：生成多候选比较标签。** 每级训练 160、验证 40 个局面；教师值明确为估计，非实际反事实收益；独立审查通过。
+- [x] **LEARN-004：训练轻量模型并核对 Python/JS 推理。** CPU 100 epochs；线性及 32→64→1 ReLU 模型已产出，真实权重对齐误差 <1e-14；独立审查通过。
+- [x] **LEARN-005：完成首轮采集—标签—训练—开发对照。** 三模型各 260 局均失败；按条件跳过独立确认，不消耗确认种子。只关闭本轮实验执行项，不关闭强度目标。
+- [x] **LEARN-006：交付可复现的离线研究包与接入结论。** 代码/数据/模型/报告及复现命令已交付，候选均标 rejected；expert 保持默认，不把失败权重推入产品。
+- [ ] **强度结果单独记录：** 当前尚未证实新训练候选优于 expert；只有对应比较证据出现后更新，不随上方代码任务勾选自动完成。
+
+本轮 001～006 不再重做。下一轮从已有败局与标签分析继续：优先改进浅层教师目标和余牌结构表达，预先固定新的有限候选与确认集；不新增本轮第四模型、不重复采集现有 1,040 局、不覆盖旧结果。强度改进仍是当前目标。
+
+## 共同执行合同
+
+- 工作目录 `D:\coding\new guandan`；先读本文件当前区、路线图当前区及该 TASK 代码。本文折叠快照的旧排期不再是派工入口。
+- 每个 TASK 都先固定针对行为的验收，再实现；001～004 的新增文件、参数和命令已实现。执行前先检查已有产物/台账，避免重复采集或覆盖完成结果。
+- 代码任务由 Terra 承接，父代理负责共享文件整合；架构/证据冲突先由 Sol/high 审查。差异和定向测试完成后进行一次独立最终审查；仅在新变更或新问题出现时复审。
+- 本轮路线文档由父代理唯一写入，代码任务不得自行重写任务顺序；父代理在核对证据后同步两份文档。禁止回退用户既有代码、清理未跟踪文件、混入无关修改。
+- 本地计算先单进程/CPU；约每 30 分钟记录进展和可恢复状态，正常长任务可分段继续。异常/超时保存失败原因，不标完成；父代理诊断修复，受影响的下游暂不执行，独立任务可继续。
+- 输出目录固定为已忽略的 `data/learn-v1/`。写入前检查目标，存在已完成工件则复用核验或另登记 run ID，禁止覆盖历史原件。所有运行记录实际命令、退出码、源码/数据/模型摘要和未完成项。
+- 不为文档或小改动重复跑全套测试；优先 TASK 列出的定向检查。集成故障再扩大到 `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\verify.ps1`；FullData / ReleaseEvidence 不作为每次训练的前置。
+
+### 首轮非正式种子计划
+
+| 用途 | 基础种子范围 | 计划使用方式 |
+|---|---|---|
+| 管线 smoke | 3400000000 | 1 底牌组 × 13 级 × 4 座位轮转 = 52 局；不进入训练 |
+| 自有训练/验证 | 3100000000–3100000019 | 20 底牌组 × 13 级 × 4 轮转 = 1,040 局；前 16 组训练、后 4 组验证 |
+| 开发比较 | 3200000000–3200000009 | 10 底牌组 × 13 级 × 双腿 = 260 局 / 130 对，可用于调参 |
+| 独立确认 | 3300000000–3300000009 | 同上规模；冻结唯一候选后运行一次，不反馈本轮调参 |
+| 教师世界 RNG | 3500000000 起的独立流 | 由公开 observation 与独立 RNG 采样，禁止通过原始发牌 seed 恢复真实暗牌 |
+
+采集、smoke、教师 RNG 与开发比较范围已经使用，独立确认范围尚未使用；以 `tools/learning-seed-registry.json` 和运行台账为准。新一轮仍须检查旧正式/已见种子与 uint32 范围。同一底牌组所有派生局共用 split，不因重新编码而重新分组。
+
+## TASK LEARN-001：全 13 级、自有底牌组与覆盖校验
+
+- **来源条目：** 0908 审查“40 局全部 level=2”；路线图阶段 001。
+- **目标 / 非目标：** 修正采集每次 `createMatch/startMatch` 重置级别的问题；新增全级、循环座位轮转和底牌组元数据。不改游戏规则、不移植 Python 环境、不采外部数据。
+- **前置：** 当前规则与自对弈基线已核对；执行前固定计划种子与输出路径。
+- **精确 allowlist：** `tools/selfplay_dataset.mjs`、`tools/validate_value_dataset.mjs`；新增 `tools/test_selfplay_dataset.mjs`、`tools/learning-seed-registry.json`；本地产物 `data/learn-v1/selfplay-smoke.jsonl`、`selfplay.jsonl` 及各自同名 checkpoint/临时文件。两份活文档只由父代理同步。
+- **禁止触碰：** `js/game.js`、`js/rules.js`、AI 默认、外部数据、旧 v2 原件、正式种子/发布验证器。
+- **接口与步骤：** 保留现有 v2 命令；新增 `--learning-v3 --deal-blocks --levels=all --rotations=0,1,2,3`，开启时首个位置参数表示底牌组数。新 `guandan-selfplay-trajectory-v3` 记录 `dealGroupId`、级牌、轮转与派生局 ID；header 明确基础 seed、完整派生计划和局数。v2 校验不放宽。参考现有 A/B 在发牌后、首个决策前设置级牌与重排手牌的做法；轮转须同步手牌、先手及相关座位字段。
+- **验收命令：** `node tools/test_selfplay_dataset.mjs`；`node tools/selfplay_dataset.mjs 1 3400000000 data/learn-v1/selfplay-smoke.jsonl --learning-v3 --deal-blocks --levels=all --rotations=0,1,2,3`；`node tools/validate_value_dataset.mjs data/learn-v1/selfplay-smoke.jsonl`；`node tools/validate_value_dataset.mjs data/selfplay-20260901.jsonl`。
+- **成功条件：** 命令退出 0；smoke 完整 52 局，13 级 × 4 轮转无缺项/重复、四行动座位都有记录；牌张与动作合法、唯一 chosen、真实团队收益守恒。缺级、坏组、重复派生局、跨配置 resume 必须失败；旧 v2 仍通过。只写“采集代码完成”，完整训练集待 005 生成。
+- **失败升级：** Terra 定位启动时序/状态重置；有公共状态影响交 Sol/high 复核，不靠只修改 header 数字补覆盖。
+- **并行性：** 可与 002 并行，文件不相交。
+- **风险等级：** 中（训练数据及镜像语义）。
+- **下一模型最小上下文：** v3 schema、派生局计划、当前 diff、smoke 覆盖结果与退出码。
+
+## TASK LEARN-002：独立离线模型选牌与快速对照
+
+- **来源条目：** 默认 expert 不消费模型、现有模型仅搜索后重排；路线图阶段 002。
+- **目标 / 非目标：** 新增显式 `learned-value-v1` 实验路径，模型直接对候选排序；复用现有 A/B 镜像框架。无需已训练模型，先用固定合成模型验证；不新增 UI 选项、不复制造牌/推进规则、不建第二套正式发布体系。
+- **前置：** Sol/high 审查离线接入设计；001 不阻塞合成测试开发。
+- **精确 allowlist：** `js/ai.js`、`js/ai.test.js`、`js/ai-observation.js`、`js/ai.ab.simulation.js`、`tools/test_ai_ab_simulation.mjs`、`tools/strategy-counterexamples.json`；新增 `js/ai-learning.js`、`tools/local_learning_arena.mjs`、`tools/test_local_learning_arena.mjs`；本地产物 `data/learn-v1/arena-smoke.json` 及其运行临时文件。
+- **禁止触碰：** 网页设置/选择器、正式模型持久化、`js/value-model-gate.js`、`tools/validate_m2_release.mjs`、原特性默认值。既有反例只同步必要源码指纹，不改其预期。
+- **接口与步骤：** 新模块提供 `buildLearningCandidates(context)`、`configureOfflineLearningModel(model)`、`chooseLearningPlay(context, expertDecision)`；复用 `generateLegalPlays`、`filterEligibleStrategyActions`、`extractHybridValueFeatures`、`validateHybridValueModel`、`evaluateHybridValueModel`。候选上限与保留规则按路线图四节；输出普通 play/pass 结构及 modelCalls/changed/fallback 元数据。模型只由离线 runner 显式配置。扩展 variant resolver 及 A/B 的模型候选白名单，控制侧仍 expert；登记新增源码依赖，旧 checkpoint 不伪装可恢复。新 arena 包装原 A/B CLI，不直接 import 会自动开赛的脚本。
+- **验收命令：** `node tools/test_local_learning_arena.mjs`；`node js/ai.test.js`；`node tools/test_ai_ab_simulation.mjs`；`node js/value-model-gate.test.js`。
+- **成功条件：** 新测试可在临时目录自动生成固定模型并完成一组跨级/双腿 smoke；公开观察白名单保留 `learned-value-v1`，经 `game.aiDecisionContext` 的电脑座位与 0 号同步路径都实际调用模型；证明关闭搜索时仍能选牌、非恒定夹具可改选、非法/损坏模型回退 expert 且计数；expert 控制侧不受全局模型影响；相同 expert 的镜像对照等价，模型候选合法。研发输出标记 `purpose=learning-development`，不产生 promoted 回执。
+- **失败升级：** 共享候选或座位隔离出现冲突由父代理串行处理、Sol/high 审查；不通过打开正式模型加载开关解决。
+- **并行性：** 与 001 独立；本 TASK 的共享 AI/评测文件只有一名写者。
+- **风险等级：** 高（新决策路径及评测对照）。
+- **下一模型最小上下文：** 三个新增 API 的实际结构、候选规则、A/B CLI 接入和定向测试结果。
+
+## TASK LEARN-003：多候选比较标签
+
+- **来源条目：** chosen-only 终局回归不能证明候选排序有效；路线图阶段 003。
+- **目标 / 非目标：** 从自有 v3 数据产生公开信息下的同状态候选比较标签；不读取真实敌方手牌，不将估计收益写成实际终局真值，不重做独立游戏环境。
+- **前置：** 001 数据合同、002 候选构造接口完成；可先用 smoke 数据测试。
+- **精确 allowlist：** 新增 `tools/learning_labels.mjs`、`tools/test_learning_labels.mjs`；离线教师入口及定向回归仅限 `js/ai-hybrid.js`、`js/ai.hybrid.test.js`；本地产物 `data/learn-v1/labels.jsonl`、`labels-summary.json`、`labels-selection.json`。
+- **禁止触碰：** AI 默认、正式搜索预算/排序、外部数据训练标签、发布工具、模型加载门。
+- **接口与步骤：** 复用 002 的 `buildLearningCandidates` 与现有公共信息采样/rollout 实现；新增仅供离线标签器调用的 `evaluateLearningTeacherCandidates(ctx, candidates, options)`，在非关键状态也按固定预算估值，原 `evaluateInformationSetCandidates` 的 critical gate 和正式预算保持不变。首轮先按 001 的 16/4 底牌组固定 split，再每级抽训练 160、验证 40 个状态（每个底牌组每级 10 个），输出 selection manifest；不足时报告失败，不跨 split 补齐。最多 8 候选、4 个共用世界、每次 rollout 至多 24 动作；冻结现有 `chooseRolloutPlay` 教师及截断估值实现，不加载学习模型，不把它称为完整 expert 对局策略。输出 `guandan-learning-labels-v1`，包含 stateId/dealGroupId/split、32 维特征、候选 ID、teacherValue、`labelKind=teacher_estimate`、有效世界数、截断/覆盖及 selection manifest 摘要。实际终局结果另存为 trajectory 标签，不复制给未选动作。
+- **验收命令：** `node tools/test_learning_labels.mjs`；`node js/ai.hybrid.test.js`。005 才执行完整标签采集命令。
+- **成功条件：** 同状态候选共用世界池与随机流，候选顺序置换结果一致；合成终局可复算；非关键状态可由离线入口得到标签，而原正式入口仍返回 not_critical；输入只含行动者手牌与当时公开信息。每级 train/validation 为 160/40 状态，`(dealGroupId,stateId,candidateId)` 唯一；不足样本/失败 rollout 显式报告且不伪造满额标签，分组及 selection manifest 可追溯到 001。
+- **失败升级：** 优先修复标签语义或缩小预先声明的实验配置并建立新 run；不得静默只保留有利候选或使用真实暗牌补估值。
+- **并行性：** 依赖 001/002；修改 hybrid 时单一写入者。
+- **风险等级：** 高（标签有效性与公共信息边界）。
+- **下一模型最小上下文：** 标签 schema、教师配置、有效候选/世界覆盖与回归证据。
+
+## TASK LEARN-004：轻量非线性训练与 JS 数值对齐
+
+- **来源条目：** 现有 33 参数线性实验尚无动作排序训练闭环；路线图阶段 004。
+- **目标 / 非目标：** 用 003 标签训练线性对照和 `32→64→1` ReLU 模型；复用 JSON 推理，不等待 ONNX，不做远程 DMC。
+- **前置：** 003 标签合同；只读检查当前 Python/PyTorch 可用性（0908 已实查 CPU PyTorch 可导入，执行时再按实际环境判断）。
+- **精确 allowlist：** 新增 `tools/train_learning_model.py`、`tools/test_train_learning_model.py`、`tools/test_learning_model_parity.mjs`；`training/README.md` 仅同步本地实验与正式 DMC 的区别；本地产物 `data/learn-v1/linear.json`、`mlp.json`、`training-summary.json`、`parity.json`。
+- **禁止触碰：** 旧线性训练器/旧数据和模型、正式 DMC preflight、正式模型门槛、全局 Python 安装与付费服务。
+- **接口与步骤：** 新 CLI 接受 `--labels`、`--output`、`--architecture=linear|mlp`、`--epochs=100`、`--seed=1`、`--device=cpu`。训练/验证依照 001 manifest 按完整 dealGroupId 分组；只用训练组拟合标准化；学习 teacherValue 并同时报告留出同状态排序指标。将标准化折入首层权重，输出现有 `guandan-candidate-v1`，metadata 保留数据、教师、种子和分组来源，状态 experimental。
+- **验收命令：** `python -B -m unittest discover -s tools -p test_train_learning_model.py`；`node tools/test_learning_model_parity.mjs`。测试自己构造小数据及固定模型，不依赖完整训练集。
+- **成功条件：** 固定输入可复现；训练/验证底牌组交集为零；归一化不读取验证组；固定边界向量与真实候选 Python/JS 预测差 ≤1e-5；产物被 `validateHybridValueModel` 接受，训练误差不作为变强结论。
+- **失败升级：** 优先修数值/分组/导出一致性；不先换大网络、GPU或增加更多样本掩盖错误。
+- **并行性：** 003 合同固定后可用合成标签开发，不与标签生成共享写文件。
+- **风险等级：** 中（学习和推理一致性）。
+- **下一模型最小上下文：** 模型/数据合同、固定 split、训练指标与 JS 对齐证据。
+
+## TASK LEARN-005：第一轮完整学习实验
+
+- **来源条目：** 用户要求训练成果实际转化为对战能力；路线图阶段 005。
+- **目标 / 非目标：** 交付一轮可复算学习与对战结果。实验管线完成和是否变强分别记录，不保证模型必胜、不进行正式发布评测。
+- **前置：** 001～004 定向验证与独立审查完成；固定当前 expert 源码对照、种子清单和两个首轮模型配置（linear、32→64→1 MLP）。
+- **精确 allowlist：** `tools/learning-seed-registry.json` 的使用状态；`data/learn-v1/` 中上述新产物及 `dev-linear.json`、`dev-mlp.json`、`selected.json`、`confirm.json`、`run.json`。代码修复回到对应 TASK；活文档由父代理更新。
+- **禁止触碰：** 旧实验原件、外部数据、正式种子、默认策略、发布状态；不得见确认集结果后继续调本轮模型。
+- **验收命令（前述 TASK 实现后运行）：**
+  `node tools/selfplay_dataset.mjs 20 3100000000 data/learn-v1/selfplay.jsonl --learning-v3 --deal-blocks --levels=all --rotations=0,1,2,3`；
+  `node tools/validate_value_dataset.mjs data/learn-v1/selfplay.jsonl`；
+  `node tools/learning_labels.mjs --dataset=data/learn-v1/selfplay.jsonl --output=data/learn-v1/labels.jsonl --states-per-level=200 --worlds=4 --rollout-depth=24 --world-seed=3500000000`；
+  `python tools/train_learning_model.py --labels=data/learn-v1/labels.jsonl --output=data/learn-v1/linear.json --architecture=linear --epochs=100 --seed=1 --device=cpu`；
+  `python tools/train_learning_model.py --labels=data/learn-v1/labels.jsonl --output=data/learn-v1/mlp.json --architecture=mlp --epochs=100 --seed=1 --device=cpu`；
+  `node tools/local_learning_arena.mjs --candidate=learned-value-v1 --comparison=expert --model=data/learn-v1/linear.json --blocks=10 --base-seed=3200000000 --levels=all --report=data/learn-v1/dev-linear.json`；
+  `node tools/local_learning_arena.mjs --candidate=learned-value-v1 --comparison=expert --model=data/learn-v1/mlp.json --blocks=10 --base-seed=3200000000 --levels=all --report=data/learn-v1/dev-mlp.json`。
+- **选择与确认步骤：** 开发集按配对团队效用选择候选，先排除失败/非法动作/明显灾难回归；若无合格候选则记录失败并回到 003/004，不消费确认种子。将选中模型原字节复制到新 `data/learn-v1/selected.json` 并记录选择依据，再执行 `node tools/local_learning_arena.mjs --candidate=learned-value-v1 --comparison=expert --model=data/learn-v1/selected.json --blocks=10 --base-seed=3300000000 --levels=all --report=data/learn-v1/confirm.json`。
+- **成功条件：** 实际运行退出码与全部计划计数吻合；1,040 训练局、底牌组分离、开发/确认各 260 局计数可复核；模型实际参与选牌，报告改选/回退和分级收益。CI 跨 0 就写未证实；确认失败时不标强度目标完成、不翻默认。出现完整失败结果也可关闭本轮实验执行项，强度结果项继续未完成。
+- **失败升级：** 不完整运行保留 checkpoint 续跑同配置；模型效果差按败因回到对应任务，下一轮登记新确认集，不能挑掉输局重报。
+- **并行性：** 训练/比较首轮串行，固定同一机器配置，避免互相争用 CPU 污染时延。
+- **风险等级：** 中（本地资源与实验解释）。
+- **下一模型最小上下文：** run.json、模型/源码/数据摘要、分组/种子、退出码、败因与未完成项。
+
+## TASK LEARN-006：离线候选交付及产品接入结论
+
+- **来源条目：** 训练成果必须实际可用；路线图阶段 006。
+- **目标 / 非目标：** 交付可一条命令复现的离线模型对战包及明确收益结论，不把不可用权重当完成。默认/UI/发布改变不由研发胜率自动触发。
+- **前置：** 005 有完整比较结果；没有有效学习候选时交付失败分析并继续学习，不伪造强度交付。
+- **精确 allowlist：** 本地 `data/learn-v1/CANDIDATE.md`、`data/learn-v1/package.json`；父代理更新 `todo.md`、`整体项目路线图.md`。
+- **禁止触碰：** 产品默认与 UI、模型晋级回执、CI/发布阈值、外部账户或部署。
+- **接口与验收命令：** 包内列出实际模型路径、源码/数据/模型摘要、002 的完整 arena 命令、目标难度、已测行为与回退方式；复核 `node tools/validate_value_model.mjs data/learn-v1/selected.json` 与 005 已完成报告。没有新变化不重复整场比赛。
+- **成功条件：** 离线候选可由实际命令加载并参赛；说明当前是“研发候选 / 未证实 / 确认集有收益”哪一类。产品接入另列尚缺证据与最小代码任务，不能以“模型还在实验目录”无限期搁置。正式启用必须按路线图六节完成原门槛及所需授权。
+- **失败升级：** 加载不通回到 002/004，收益不足回到 003/005；不要增加无关安全路线。
+- **并行性：** 父代理串行交付。
+- **风险等级：** 低（离线工件交付；正式发布单独审查）。
+- **下一模型最小上下文：** CANDIDATE.md、完整报告、明确的下一处收益/接入缺口。
+
+## 当前完成记录
+
+- [x] **0908 方向审查与重排：** 确认全打 2 数据、线性模型、离线推理断点和旧依赖耦合；两份文档采用 LEARN 主线，用户授权普通本地研发自主连续推进。
+- [x] **LEARN 实施与首次训练：** 数据、标签、CPU 训练及真实模型推理已运行；原模型、原数据和失败结果均保留。
+- [ ] **实际强度收益：** 线性 1/260 头游、效用 -2.985；基础 MLP 8/260、效用 -2.708；上下文 MLP 24/260、效用 -2.469。三者均淘汰，最终配对 CI 全负；原始完整结果保存于 `run.json` 和三份 dev 报告。
+
+### 本轮第三候选（LEARN-005C；最多三个模型）
+
+确认了基础特征无法区分队友与对手持牌权。第三候选在相同候选身份/顺序上补齐已有公共估计器的特征，旧 `learned-value-v1` 保持原义，模型元数据与引擎版本不匹配即拒绝。通过冻结旧源码重现候选和旧特征，只重编码输入，原 15,888 个教师值完全复用。设计与过牌处理修正已获 Antigravity 只读认可；定向测试通过。
+
+实际命令：`node tools/learning_labels.mjs --dataset=data/learn-v1/selfplay.jsonl --output=data/learn-v1/labels-context.jsonl --reuse-labels=data/learn-v1/labels.jsonl --base-runtime=data/learn-v1/execution/base-learning-runtime`；`python -B tools/train_learning_model.py --labels=data/learn-v1/labels-context.jsonl --output=data/learn-v1/context-mlp.json --architecture=mlp --epochs=100 --seed=1 --device=cpu`；`node tools/local_learning_arena.mjs --candidate=learned-context-v1 --comparison=expert --model=data/learn-v1/context-mlp.json --blocks=10 --base-seed=3200000000 --levels=all --report=data/learn-v1/dev-context.json --checkpoint=data/learn-v1/dev-context.checkpoint.json`。
+
+本轮不增加第四模型、不切换默认、不用坏结果补成正收益。若第三候选仍失败，下一轮优先改进教师目标及动作区分能力，而不是重新排安全治理任务。
+
+## 历史台账（不再用于当前排期）
+
+下方保留 0905 及以前的原文快照，包括既有未提交文档修改。**其中旧“当前停止线 / 最高优先级 / 下一允许写入 / DMC 外部准入前置”仅为历史；当前执行按上方共同合同和 LEARN TASK。历史完成数、CI 和审查结论不代表当前代码验证。**
+
+<details>
+<summary>展开历史原文快照（旧排期已被上述 LEARN 路线替代）</summary>
+
+### 0905 及以前的待办快照
+
+> 更新：2026-09-05
 > 规划总纲：[整体项目路线图.md](./整体项目路线图.md)；历史证据：[PROJECT_EXECUTION_PLAN.md](./PROJECT_EXECUTION_PLAN.md)。
-> 当前结论：**expert 保持默认（含 0903 晋级翻转为 true 的 STRAT-2）；没有 `promoted` 模型；`EXPERT_POLICY_FEATURES` 的 STRAT-3/4 开关仍为 `false`。** 最新 v3 正常臂收益 CI 为正但性能门失败。EVID-9b 冻结提交 `585f099` 远端 CI 已通过。STRAT-5/RT 残余与 STRAT-6/REL 已随 `c7e4c9b` 入库；0903 独立审计发现提交 blob 因 `core.autocrlf` EOL 归一导致字节级冻结未达成，已以 `.gitattributes` closure-eol（22 个闭包文件 `-text`）修复，提交 blob 22/22 逐文件与聚合 `94cccadd…` 完全复现（0903 字节冻结提交），并在该提交树上复跑统一验证 **48 checks** 通过。STRAT-6 正式三臂（实现 SHA `94cccadd…`、种子 `20268111–20268150`）：STRAT-2 数字门通过且经字节冻结修复与用户授权后**翻转进入正式大师默认**（`d552238`，baseline 保持 false）；STRAT-3 CI/灾难未过门；STRAT-4 与 expert 完全等价（CI `[0,0]`，消融对该规则无证据力）。REL-1 是脚本化三副而非真人手打；REL-2 已做 IAB 笔记本+手机视口实测（非真机触控/GPU、普通难度、非 PERF 门）。ALGO-2 仅为代码门，不构成性能/强度/发布证据。
+> 当前结论（0905 审核）：**派工最高优先级仍是本机对战 AI + 已下载数据反例。** HEAD `2d2f54a`，0904/0905 代码门均未提交。expert 默认（含 STRAT-2），无 `promoted` 模型，STRAT-3/4 仍 `false`，`trainingEligible=false`，`admitted=false`。本机 `verify.ps1` **54 checks** 非正式门。下一步按清单：**003-OPT-R** → 第一刀剩余的 `generateLegalPlays` 等价分配加速（仍不减覆盖）。用户对局「出完大牌剩小牌干瞪眼」记为 002 策略残差，不由 003 搜索加速修复，不打开 STRAT-3/4。
 
 ## 当前停止线
 
@@ -16,14 +184,40 @@
 - [x] R0 证据假绿缺口关闭前，不启动新的 80 区组正式长跑或消费新的正式种子；EVID-9b 已在冻结提交上经远端 CI 闭环。
 - [x] SEC-1～3 已完成：不在聊天、日志或文档中展示抽取到的令牌值；EVID-9b 仅提交已验证候选快照。
 
-## P0-A：浏览器导出安全处置与产品诚实性
+## 0904 最高优先级（派工必须先看这里）
+
+派工顺序固定为：**本机对战 AI 变强 → 用已下载数据改进该 AI → 其它停止线允许的缺口。** 与本段冲突的 TASK 不得派。Grok 父会话优先自己做定向实现；Antigravity 只做跨家族只读审查。不得为烧额度去跑 `-FullData`、正式长跑或重复审查同一 diff。
+
+硬边界（停止线不回退）：不把 `trainingEligible=false` 并入训练器；不启动正式 DMC/DanZero 训练；不消费新正式种子；不打开 STRAT-3/4；不把 `ismcts-v3` 送进产品选择器；不暴露 active-match 暗牌。
+
+### 最急可派工（按序）
+
+1. [x] **AI-LOCAL-001 代码门（0904）。** 本机 expert vs `ismcts-v3` 诊断已接入统一入口。上限 128；`--games=128` seed `20269003–20269130`（非保留），256 局完成、25309 决策守恒、`diagnosticOnly=true`。expert 零 `searchTriggered`。`ismcts-v3` 全座触发 775 次，seat-0 可测触发 **185** 次：总体 P95/P99 **184/497ms**，searchTriggered 子集 P50/P95/P99 **315/640/996ms**（非正式门；不得用总体 P95 稀释）。随后 003-LOCATE 将调用点标到 `runISMCTSSearch`/`rollout`。Antigravity **PASS-WITH-NOTES**（含 GAMES-128），不是 Sol PASS，不是发布证据。
+2. [x] **AI-LOCAL-002A-R：Antigravity 只读审查炸弹槽离线臂（0904）。** PASS；不是 Sol PASS；默认 v3 排序未改、未进 UI。
+3. [x] **AI-DATA-001 代码门（0904）：已下载对局 → 公开信息反例。** Botzone **官方月度 ZIP 为空**（`download-summary.json` `archivesAvailable=0`），本 TASK 不把 Botzone 当夹具源。公开回放页另有 91 局结构记录，未用于本夹具。南邮公平轨迹 `external-trajectory-v2.jsonl`（18980 回合，全程 `trainingEligible=false`）挖出报单送低单与接风被抢两类 STRAT-1 口径夹具，写入独立 `tools/external-strategy-counterexamples.json`。禁止训练、禁止改 expert 默认。Antigravity 跨家族审查 PASS-WITH-NOTES，不是 Sol PASS。
+4. [x] **AI-LOCAL-002B 代码门（0904）：下载复盘守卫。** 新增 `downloadedReplayGuards`（默认 false）与 `with-downloaded-replay-guards` 变体，复用 STRAT-3/4 共享过滤层但不打开其正式旗标。南邮夹具在 expert 默认下不改候选；打开守卫后阻断报单低单与抢接风。Antigravity 跨家族审查 PASS，不是 Sol PASS。不得把该开关写进 expert 默认。
+5. [x] **AI-DATA-002 代码门（0904）：外部数据准入审计（仍不是训练）。** 对已下载档案做许可、再分发/商业使用、删除、acting-seat、规则版本、暗牌边界清单。报告 `tools/external-training-admission-audit.json`（`guandan-external-training-admission-audit-v1`）：`admitted=false`，`trainingEligible=false`。失败门：license / redistribution / commercialUse / deletion。通过门：actingSeat / ruleVersion / hiddenCards / trainingEligibleIsolation（公平轨迹 20409 回合：南邮 18980 + Botzone 1429；status 1392 条中 211 条项目规则重放通过）。Botzone 官方 ZIP `archivesAvailable=0`。拒绝 `--admit`。未改 `trainingEligible`，未启动 DMC-1/DMC-3。Antigravity 跨家族审查 **PASS**，不是 Sol PASS，不是训练准入。
+6. [x] **AI-LOCAL-004 代码门（0904）：本地难度与等待体验。** 同一 `aiSpeed` 下桌面等待按难度缩放（普通短、困难居中、大师长）；快档只缩短等待。大师快档搜索预算仍 ≥ 250ms。对手报单领出：普通与大师公开着法可区分。未改 `js/ai.js` / expert 默认 / STRAT-3/4。Antigravity 跨家族审查 PASS-WITH-NOTES，不是 Sol PASS。
+7. [ ] **AI-LOCAL-003：本地搜索热路径。** 减覆盖/减预算仍阻断。0905 第一刀收口：内节点复用合法着法（003-OPT-R **PASS**）+ `generateLegalPlays` 单张免 sort/slice（003-OPT-R2 **PASS**）。未改 1800/72 或 500/750。PERF-3 未解锁。不是 Sol PASS。searchTriggered 子集仍可能高于门；不得据此宣称搜索门通过。第二刀 sampleWorld 未授权。
+
+### 当前执行重排：本地对战 AI + 下载数据主线
+
+- [x] **AI-LOCAL-001：建立本机强度与性能基线。** 代码门 0904 关闭；128 局诊断已加跑（见上），仍非正式门。seat-0 searchTriggered n=185；调用点由 003-LOCATE 标到 rollout，不得用总体 P95 当搜索门。
+- [x] **AI-LOCAL-002：高价值候选与残局改进。** 002A 离线炸弹槽、002B 报单/接风守卫、002C 残局过牌守卫代码门已收口。002C 新增 `downloadedEndgameGuards`（默认 false）与 `with-downloaded-endgame-guards` 变体：对手公开手数≤5 且有普通接法时阻断过牌。不打开 STRAT-3/4，不把守卫写入 expert 默认。Antigravity 跨家族审查 PASS-WITH-NOTES，不是 Sol PASS。
+- [x] **AI-DATA-001：** 代码门 0904 关闭（Botzone ZIP 空，只用南邮公平轨迹）；Antigravity PASS-WITH-NOTES。
+- [x] **AI-DATA-002：** 0904 代码门关闭（fail-closed 审计，`admitted=false`）。已下载数据继续只服务对战 AI 反例，不进训练栈。Antigravity 跨家族审查 PASS，不是 Sol PASS。
+- [ ] **AI-LOCAL-003：按实际 profile 优化本地搜索。** 第一刀已收口并经 Antigravity **PASS**（003-LOCATE-R、003-PLAN-R、003-OPT-R、003-OPT-R2）。`optimizationAllowed=false`，PERF-3 仍锁。不得减覆盖或放宽 500/750ms。清单内下一允许写入：002 策略残差（出完大牌剩小牌），default-off，不打开 STRAT-3/4。
+- [x] **AI-LOCAL-004：本地难度与交互体验。** 0904 代码门关闭（等待随难度可区分，大师快档不残缺）。Antigravity PASS-WITH-NOTES，不是 Sol PASS。默认仍离线。
+- [x] **方向约束：** `R1A-SEC-DESIGN-002` 设计仅存档；R1A 密封持久化/审批/tombstone/防重放和 `OPP-1A-OBS-002` 仍不进入当前执行队列。**DMC 正式训练与 DMC-3 仍不启动**；允许进入队列的只有已下载数据的反例挖掘（AI-DATA-001）与准入审计（AI-DATA-002）。安全只保留本地运行必需的暗牌隔离、凭据不泄露和牌局不损坏。
+
+## 已完成的最低限度安全基线（不阻塞本地 AI）
 
 - [x] **SEC-1：撤销/轮换可能受影响的第三方控制台会话。** 用户已确认对应第三方平台的相关会话或令牌已撤销/轮换；本任务未尝试恢复、输出或记录令牌值。
 - [x] **SEC-2：处置本地与同步副本。** 已删除工作区 `tools/extracted/` 的 6 个原始导出文件（含原始批次、回放、设置、统计与分析产物），并复核目录不存在；`.gitignore` 已覆盖 `/tools/extracted/`。用户已确认 WPSDrive 同步历史版本和回收站也已按策略清除；不保留原始导出副本。
 - [x] **SEC-3：最小化浏览器抽取器。** `read_browser_replays.py` 现要求显式 `--profile-dir`、`--origin` 与输出目录，只接受 `http://localhost` / `http://127.0.0.1` 的精确 origin 加固定 `guandan_replays_v1` 键；LevelDB log 只解析 put 项，不再因批次含 `guandan` 而写出原始 batch。输出日志只含数量和 SHA-256。合成 write-batch 回归证明第三方 origin、相邻键和值不会进入文件；测试未读取原始导出。
 - [x] **UI-0：移除虚假的 DMC 选择项。** 已从 `index.html`、设置白名单、提示与复盘标签移除 `dmc-v1`；遗留设置经 `normalizeLocalAiEngine` 迁移为 expert，并由 stats/UI 回归证明不会以 DMC 标签伪装 expert 执行。
 
-## P0-B：证据门加固（EVID-9b 已闭环；真实发布证据仍未形成）
+## 延后：证据门加固（已有门不回退；不阻塞本地 AI）
 
 - [x] **EVID-1：修正 ReleaseEvidence 退出语义。** `validate_release_evidence.mjs` 现在只有在 `promotion.promoted=true` 时才允许 `releaseEvidenceReady=true` 和退出 0；已覆盖模型哈希一致但 CI 下界≤0 的拒绝负例、主 A/B 绑定旧文件哈希的合成拒绝负例，以及完整正例。当前真实命令仍因旧主报告哈希不匹配返回 1，符合停止线。
 - [x] **EVID-2：修正遥测覆盖率分母。** `collectDecisionTelemetry` 现在对每个 AI 决策生成记录；缺少 `variant` 或 `localDecision` 时保留 `latencyMs=null` 并计入未测量。搜索/回退采用显式 `searchAttempted / searchTriggered / fallbackKind`；普通 expert 回合也明确记录“未搜索/无回退”，本地超时和决策错误保留真实 fallback 类型。`tools/test_ai_ab_simulation.mjs` 的生产者负例证明漏记仍须入账：搜索子集即使 100% 覆盖，缺一座策略/本地耗时也会拉低测量覆盖率，缺搜索或回退字段则令 `integrityComplete=false`；性能门从原始计数重算覆盖率并拒绝矛盾回执。
@@ -144,11 +338,11 @@
 - [x] **REL-2：隐私与回滚台账（静态+运行时抽查）+ 真人手打/手机视口卡顿实测（0903）。** 静态台账同 REL-1 报告；0903 运行时抽查本源 localStorage 仅含游戏数据五键、无 API Key（证实 `apiKeyNotInLocalStorage`）。真人手打实测（Chromium 内嵌浏览器 + 视口模拟 390×844，普通难度/专家引擎/本地 AI，`data/expert-release-interaction-measured.json`，SHA-256 `7f85829b512d235d343f74a4d95de950fedc0fd94c0151fce15fa19c7f6d6f79`）：笔记本轮 89.1 FPS、帧间隙 P95=12ms、2 次 367–871ms 主线程停顿；手机视口轮 89 FPS、P95=12ms、2 次 367–871ms 停顿；内存峰值 48MB；用户未报告可感知卡顿。**边界**：内嵌 Chromium+视口模拟，非真机触控/真机 GPU/日常浏览器全环境；难度为普通档；两次 ~0.5-0.9s 停顿根因未做火焰图定位；首轮（用户自开环境）无指标数据。台账已知Limits如实记录，不构成 PERF 性能门证据。
 - [x] **REL-3：文档与复盘标签收敛。** README 只保留当前摘要并链接总纲；对手画像为公开行动 v3（含 v1/v2 迁移）；v3 仅离线评测。复盘将 `ismcts-v3` 显示为 ISMCTS v3/成对 sweep，产品选择器仍无该选项。`ai.js` Probe 历史注释已指向证据台账；`ai-hybrid.js` 改为“四个”可验证搜索模式。
 
-## P4：后续路线（当前不启动长训）
+## P4：后续路线（当前不启动长训；准入审计已提到 0904 最高优先级）
 
 - [x] **DMC-0：加固 guandan-env / preflight 硬门。** `_is_finite_number` 现拒绝 `NaN`、`Infinity` 和布尔值；手牌按每座 `0..108`、总数 `≤108`、严格整数校验，转换回执计数和 seed manifest 均要求范围、类型和唯一性，dataset/receipt 的 SHA-256 均要求 64 位小写十六进制。`dmc_preflight.py` 对非对象 JSON、坏摘要/seed/许可记录输出结构化非零结果，`verify_conformance.py` 不再因畸形 receipt 抛异常；统一验证也编译 `training/*.py`。`tools/test_guandan_env_contract.py` 覆盖上述负例及 CLI 畸形输入，完整统一验证 36/36 通过。边界：仍缺独立 Python 规则环境与 10 万条零差异，未获训练准入。
-- [ ] **DMC-1：独立 Python 规则环境与 10 万条 JS↔Python 差分。** 转换、合法动作、状态推进和终局收益要求零差异。
-- [ ] **DMC-2：外部数据准入。** 在 `trainingEligible=false` 下完成许可、再分发、商业使用、删除、acting-seat、规则版本和暗牌边界审计；未通过不得训练。
+- [ ] **DMC-1：独立 Python 规则环境与 10 万条 JS↔Python 差分。** 转换、合法动作、状态推进和终局收益要求零差异。AI-DATA-001 不依赖本项；正式训练仍依赖本项。
+- [ ] **DMC-2：外部数据准入。** AI-DATA-002 已输出 fail-closed 审计（许可/再分发/商业使用/删除未过，`admitted=false`）。在 `trainingEligible=false` 下仍不得训练；已下载南邮/Botzone 标准化记录不得因规则重放成功就改标签。未通过不得启动 DMC-1/DMC-3。
 - [ ] **DMC-2b：本机真人复盘准入。** 只接受 RT-5/6 通过且用户逐批批准的密封候选；绑定同意记录、事件链/实现摘要、规则重放回执和按完整 match 的隔离清单。智能体 annotation、评价分和未选择候选不得直接充当监督真值；不满足时继续 `trainingEligible=false`。
 - [ ] **DMC-3：PyTorch DMC / ONNX / Worker 安全加载。** 仅在 R2 正向基线和 DMC-1 完成后启动；模型包绑定数据、种子、schema、环境和评测回执。
 - [ ] **OPP-1：对手画像留出门。** 增加漂移检测、冷启动降权、个性化采样权重与独立长期留出；只允许公开行动特征，失败时回退 `observe/off`。
@@ -159,3 +353,5 @@
 - A/B 已显式设置 `opponentModelMode=off`，当前状态隔离 smoke 通过；旧两轮 fxe 因控制臂不等价均作废。
 - statefix 10 区组探针性能通过；statefix 80 区组正常臂完整且正 CI，但因完整性能失败不得晋级。
 - 默认验证在 0831 审核时为 31 项通过；0901 冻结候选的独立统一入口为 **38 checks**、`-FullData` **42 checks**，`git ls-files -u` 与工作区/staged 差异检查均为零；精确提交 `585f099` 的远端 CI 已通过。0902 迁移收尾：仓库迁至 `D:\coding\new guandan`，恢复了被目标外改动删除的 `tools/test_ai_ab_simulation.mjs`（闭包 20→21 配套），RT-1/RT-2/RT-3 工作单元与远端 STRAT/TEL-1/ALGO-2 线合并后，统一入口在当前合并树上通过 **42 checks**（本轮未运行 `-FullData`）。随后 RT-4 将统一入口复验为 **43 checks**；本轮 RT-5 再复验为 **45 checks**，RT-6 再复验为 **46 checks**，评测闭包 21→22。0902 本轮 STRAT-5 与 RT 残余修复后统一入口仍为 **46 checks**（新增断言计入既有步骤，未增加 verify 步骤数）。随后 STRAT-6/REL 工具测试计入后为 **48 checks**。SEC-1～3 均已完成。严格价值模型发布校验当前按预期返回 1，专家默认未改变。
+
+</details>

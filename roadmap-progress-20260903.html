@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>掼蛋训练大师 · 外部评审与项目进度图 · 2026-09-03</title>
+<title>掼蛋训练大师 · 外部评审与项目进度图 · 2026-09-03 最新</title>
 <style>
   .viz-root {
     color-scheme: light;
@@ -143,11 +143,13 @@
   <header>
     <button class="theme-toggle" id="themeToggle">切换深色</button>
     <h1>掼蛋训练大师 · 外部评审与项目进度图</h1>
-    <p class="subtitle">评审日 2026-09-03 · 独立只读核查工作树、git 提交历史、远端 CI (33730484058，50 checks 全绿)、todo.md 与整体路线图</p>
+    <p class="subtitle">评审日 2026-09-03 17:50 · 独立只读核查工作树、git 提交历史、远端 CI (33731552324，50 checks 全绿)、todo.md、整体路线图与 AGENTS.md 控制面</p>
     <div class="success-box">
-      <strong>重大里程碑推进：</strong> 0902 的分叉状态已在 <code>e305437</code> 完全闭合！当前处于单一主线演进。
+      <strong>今日全量闭环里程碑：</strong> 0902 的分叉状态在 <code>e305437</code> 完全闭合！
       STRAT-2（大三张保留）经过字节冻结修复（<code>1d66d75</code>）、数字门复验通过后已正式<strong>翻转进入 expert 默认</strong>（<code>d552238</code>）。
-      S1（<code>c142734</code>）与 S2（<code>4d51af0</code>）及台账（<code>5b6404d</code>）已全量推送至 <code>origin/main</code>，远端 CI run <code>33730484058</code> <strong>50 checks 全绿通过</strong>（3m54s）。
+      S1（<code>c142734</code>）、S2（<code>4d51af0</code>）、台账（<code>5b6404d</code>/<code>843ad8f</code>）与进度图（<code>2d2f54a</code>）已全量推至 <code>origin/main</code>。
+      远端 CI run <code>33731552324</code> <strong>50 checks 全绿通过</strong>（4m24s）。
+      最新 <code>AGENTS.md</code> 确立了 Grok 父会话编排与 Antigravity 跨家族独立只读审查规范。
     </div>
 
     <div class="takeaway">
@@ -174,8 +176,8 @@
   </section>
 
   <section>
-    <h2>0902–0903 Git 提交演进与闭环图</h2>
-    <p class="panel-note">展示从 0902 祖先分叉、合并收敛，到字节冻结、STRAT-2 翻转、REL-2 实测、S1 CI 远端通过及 S2 本地归因的完整证据链条。</p>
+    <h2>0902–0903 Git 提交演进与全量闭环脉络图</h2>
+    <p class="panel-note">展示从 0902 祖先分叉、合并收敛，到字节冻结、STRAT-2 翻转、REL-2 实测、S1/S2 闭环及进度图入库的全量闭环链条。</p>
     <div class="chart-card"><svg id="gitTreeChart" width="1020" height="260" role="img" aria-label="Git 提交演进图"></svg></div>
   </section>
 
@@ -193,7 +195,7 @@
         <ul>
           <li><strong>分叉闭环与字节级冻结：</strong> 0902 分叉成功在 <code>e305437</code> 解决；<code>1d66d75</code> 用 <code>.gitattributes</code> 修复了 CRLF 归一漏洞，精确复现 <code>94cccadd…</code> 闭包指纹。</li>
           <li><strong>STRAT-2 合规晋级：</strong> 40 区组镜像消融 CI <code>[0.047, 0.188]</code> 满足正效用，双上 255/220 优于对照，在 <code>d552238</code> 诚实翻转进入 expert 默认。</li>
-          <li><strong>RT-1～RT-6 与 S1 安全收口：</strong> 完整实现 3 层契约、回环采集与消费者；S1（<code>c142734</code>）修复了已终止破坏行误截断的漏洞，实现严格 fail-closed，远端 CI 49 项全绿。</li>
+          <li><strong>RT-1～RT-6 与 S1 安全收口：</strong> 完整实现 3 层契约、回环采集与消费者；S1（<code>c142734</code>）修复了已终止破坏行误截断漏洞，实现严格 fail-closed，远端 CI 50 项全绿。</li>
           <li><strong>S2 搜索尾延迟实证归因：</strong> 排除“后期搜索树更大”假说（nodes/turn 1533.7 vs 1532.2），锁定 61–80 区组 1.92× 耗时阶跃。</li>
         </ul>
       </div>
@@ -201,10 +203,10 @@
         <h3>必须恪守的红线与残余风险</h3>
         <ul>
           <li><span class="sev sev-p0">P0</span> <strong>搜索性能门仍阻断：</strong> 历史正常臂 P95/P99 <code>619/1022ms</code> 仍超 <code>500/750ms</code>。S2 归因虽完成但机制不可测，<strong>严禁实施 PERF-3 优化</strong>或借正 CI 晋级。</li>
-          <li><span class="sev sev-p1">P1</span> <strong>本地 HEAD 领先远端 2 提交：</strong> 本地位于 <code>5b6404d</code>（含 S2 及 CI 台账），远端为 <code>c142734</code>。S2 尚未触发 50-check 远端 CI。</li>
+          <li><span class="sev sev-p1">P1</span> <strong>远端 CI 50 checks 全绿闭环：</strong> 提交 S2 <code>4d51af0</code>、台账 <code>843ad8f</code> 与进度图 <code>2d2f54a</code> 均已合入 <code>origin/main</code>，远端 run <code>33731552324</code> 退出 0。</li>
           <li><span class="sev sev-p1">P1</span> <strong>RT#5 等长篡改窗口收窄：</strong> 进程内索引加速后，仅依靠分片长度校验外部变更，等长就地篡改窗口已收窄（已在台账披露）。</li>
           <li><span class="sev sev-p2">P2</span> <strong>REL-2 实测边界：</strong> 89 FPS 均为 Chromium 内嵌视口模拟，真机触控、GPU 及大师难度下的卡顿轮廓仍待实测。</li>
-          <li><span class="sev sev-p2">P2</span> <strong>训练准入继续闭锁：</strong> 真人轨迹与密封数据保持 <code>trainingEligible=false</code>，DMC-1 独立规则差分环境未建。</li>
+          <li><span class="sev sev-p2">P2</span> <strong>控制面规范确立：</strong> <code>AGENTS.md</code> 补充了降级控制面约定，Grok 父会话作为单一编排/写入者，Antigravity 专职跨家族独立只读审查。</li>
         </ul>
       </div>
     </div>
@@ -240,8 +242,8 @@
 
   var TILES = [
     { label: '项目硬性任务进度', value: '38 / 51', note: '完成率 74.5%（0902 基线仅 26/51，+12项净增）' },
-    { label: '当前代码基线', value: '单一主线', note: 'HEAD 5b6404d · 与 origin/main 同步对齐' },
-    { label: '统一验证门禁', value: '50 checks', note: '远端 CI run 33730484058 全绿通过 (3m54s)' },
+    { label: '当前代码基线', value: '单一主线', note: 'HEAD 2d2f54a · 与 origin/main 完全对齐' },
+    { label: '统一验证门禁', value: '50 checks', note: '远端 CI run 33731552324 全绿通过 (4m24s)' },
     { label: '默认对局引擎', value: 'expert (含STRAT-2)', note: 'STRAT-2 翻转为 true · STRAT-3/4 仍关闭 · 无 promoted 模型' },
     { label: '历史 v3 搜索性能', value: '门阻断 (619/1022ms)', note: 'S2 锁定 61–80 区组 1.92× 延迟 · PERF-3 优化严禁实施' }
   ];
@@ -312,7 +314,7 @@
         { s: 'done', label: 'RT-3/4 采集消费', sub: '61/61 & 28/28' },
         { s: 'done', label: 'RT-5 密封候选', sub: '副末隔离转换' },
         { s: 'done', label: 'S1/S2 审查收口', sub: 'c142734/4d51af0' },
-        { s: 'done', label: '远端 CI 全通', sub: 'run 33730484058 (50c)' },
+        { s: 'done', label: '远端 CI 全通', sub: 'run 33731552324 (50c)' },
         { s: 'warn', label: '训练准入闭锁', sub: 'trainingEligible=false' }
       ]
     },
@@ -333,9 +335,10 @@
   var FINDINGS = [
     { sev: 'P0', item: '搜索性能门未过，严禁发布 M2', detail: '历史 v3 正常臂 P95/P99 达 619/1022ms，远超 500/750ms 硬门。无 promoted 模型，ReleaseEvidence 依设计退出 1。' },
     { sev: 'P0', item: 'PERF-3 机制未锁定，禁猜优化', detail: 'S2 虽证明 61-80 区组耗时翻倍（1.92×），但 resume/GC/负载机制在 v2 上不可测，严禁借此改动搜索预算或排序。' },
-    { sev: 'P1', item: '50 项验证已在远端 CI 全量闭环', detail: '本地提交 S2 (4d51af0) 与 CI 记录 (5b6404d) 均已推至 origin/main，远端 CI run 33730484058 50 checks 退出 0。' },
+    { sev: 'P1', item: '50 项验证已在远端 CI 全量闭环', detail: '提交 S2 (4d51af0)、台账 (843ad8f) 与进度图 (2d2f54a) 均已推至 origin/main，远端 CI run 33731552324 50 checks 退出 0。' },
     { sev: 'P1', item: 'RT#5 事件索引等长篡改检测窗口收窄', detail: '采用分片字节数比对以消除热路径全扫，等长就地篡改窗口收窄已如实披露于台账。' },
     { sev: 'P2', item: 'REL-2 仅为视口模拟，非真机 GPU', detail: 'Chromium 视口 89 FPS 实测通过，但真机触控延时、真机 GPU 降频及大师难度卡顿轮廓仍未覆盖。' },
+    { sev: 'P2', item: '控制面规范确立与单一写者原则', detail: 'AGENTS.md 确立 Grok 父会话作为单一编排/写入者，Antigravity 专职跨家族独立只读审查，严禁多写者冲突。' },
     { sev: 'P2', item: 'STRAT-2 分层残余风险已知披露', detail: '级牌 8 -0.125、下家 -0.154/上家 -0.385、队伍不对称已确认属于 40 对小样本噪声，翻转已披露但需持续关注。' }
   ];
 
@@ -453,14 +456,14 @@
   function gitNode(x, y, s, label, sha, detail) {
     var st = STATUS[s];
     var g = el('g', {});
-    var r = (s === 'goal' || s === 'done') ? 10 : 8;
+    var r = (s === 'goal' || s === 'done') ? 9 : 7.5;
     g.appendChild(el('circle', { cx: x, cy: y, r: r, fill: st.color }));
-    g.appendChild(txt({ x: x, y: y + 3.5, 'text-anchor': 'middle', 'font-size': '9.5',
+    g.appendChild(txt({ x: x, y: y + 3.3, 'text-anchor': 'middle', 'font-size': '8.5',
                         'font-weight': '700', fill: st.textInk }, st.icon));
-    g.appendChild(txt({ x: x, y: y + 24, 'text-anchor': 'middle', 'font-size': '11',
+    g.appendChild(txt({ x: x, y: y + 22, 'text-anchor': 'middle', 'font-size': '10',
                         fill: 'var(--text-primary)', 'font-weight': '600' }, label));
     if (sha) {
-      g.appendChild(txt({ x: x, y: y + 38, 'text-anchor': 'middle', 'font-size': '10',
+      g.appendChild(txt({ x: x, y: y + 35, 'text-anchor': 'middle', 'font-size': '9',
                           fill: 'var(--series-1)', 'font-family': 'monospace' }, sha));
     }
     bindTip(g, [label + ' (' + sha + ')', detail]);
@@ -468,28 +471,26 @@
   }
 
   // Draw timeline branches
-  // Branch line 0902 local
-  gitChart.appendChild(el('line', { x1: 50, y1: 70, x2: 150, y2: 40, stroke: 'var(--series-2)', 'stroke-width': 2 }));
-  // Branch line 0902 origin
-  gitChart.appendChild(el('line', { x1: 50, y1: 70, x2: 150, y2: 100, stroke: 'var(--series-2)', 'stroke-width': 2 }));
-  // Merge line into e305437
-  gitChart.appendChild(el('line', { x1: 150, y1: 40, x2: 240, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
-  gitChart.appendChild(el('line', { x1: 150, y1: 100, x2: 240, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
-  // Main sequence
-  gitChart.appendChild(el('line', { x1: 240, y1: 70, x2: 970, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2.5 }));
+  gitChart.appendChild(el('line', { x1: 35, y1: 70, x2: 105, y2: 38, stroke: 'var(--series-2)', 'stroke-width': 2 }));
+  gitChart.appendChild(el('line', { x1: 35, y1: 70, x2: 105, y2: 102, stroke: 'var(--series-2)', 'stroke-width': 2 }));
+  gitChart.appendChild(el('line', { x1: 105, y1: 38, x2: 180, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
+  gitChart.appendChild(el('line', { x1: 105, y1: 102, x2: 180, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2 }));
+  gitChart.appendChild(el('line', { x1: 180, y1: 70, x2: 980, y2: 70, stroke: 'var(--series-1)', 'stroke-width': 2.5 }));
 
-  gitNode(50,  70,  'done', '共同祖先', '01287f3', '0902 分叉前历史共同基线');
-  gitNode(150, 40,  'done', '0902 本地', '8fc2387', 'STRAT-1～4 及 RT-1/2 本地实现');
-  gitNode(150, 100, 'done', '0902 远端', '54c2d04', 'EVID-9b 冻结提交与 TEL-1/PERF-2b');
-  gitNode(240, 70,  'done', '分叉合并', 'e305437', '整合远端证据门与本地 STRAT/RT 工作');
-  gitNode(340, 70,  'done', 'RT-3～6', '1331550', '采集器、消费者、密封转换与滑动续期');
-  gitNode(440, 70,  'done', '消融/封版', 'c7e4c9b', 'STRAT-5共用层、STRAT-6三臂正式跑、REL三副');
-  gitNode(540, 70,  'done', '字节冻结', '1d66d75', '.gitattributes 宏修复 EOL，22/22 blob 严格复现 94cccadd');
-  gitNode(640, 70,  'done', 'STRAT-2翻转', 'd552238', '大三张保留正式进入 expert 默认（baseline 保持关）');
-  gitNode(730, 70,  'done', 'REL-2 实测', '50519cb', '真人/手机视口 89 FPS、12ms 帧间隔实测落盘');
-  gitNode(820, 70,  'done', 'S1 审查收口', 'c142734', '已推远端 · 远端 CI run 33729452215 通过 (49 checks)');
-  gitNode(910, 70,  'active','S2 归因', '4d51af0', '本地提交 · 锁定 61-80 区组 1.92× 耗时 · 排除树膨胀');
-  gitNode(970, 70,  'active','CI 台账', '5b6404d', '本地 HEAD · 记录 S1 远端 CI 通过');
+  gitNode(35,  70,  'done', '共同祖先', '01287f3', '0902 分叉前历史共同基线');
+  gitNode(105, 38,  'done', '0902 本地', '8fc2387', 'STRAT-1～4 及 RT-1/2 本地实现');
+  gitNode(105, 102, 'done', '0902 远端', '54c2d04', 'EVID-9b 冻结提交与 TEL-1/PERF-2b');
+  gitNode(180, 70,  'done', '分叉合并', 'e305437', '整合远端证据门与本地 STRAT/RT 工作');
+  gitNode(250, 70,  'done', 'RT-3～6', '1331550', '采集器、消费者、密封转换与滑动续期');
+  gitNode(325, 70,  'done', '消融/封版', 'c7e4c9b', 'STRAT-5共用层、STRAT-6三臂正式跑、REL三副');
+  gitNode(400, 70,  'done', '字节冻结', '1d66d75', '.gitattributes 宏修复 EOL，22/22 blob 严格复现 94cccadd');
+  gitNode(475, 70,  'done', 'STRAT-2翻转', 'd552238', '大三张保留正式进入 expert 默认（baseline 保持关）');
+  gitNode(550, 70,  'done', 'REL-2 实测', '50519cb', '真人/手机视口 89 FPS、12ms 帧间隔实测落盘');
+  gitNode(625, 70,  'done', 'S1 审查收口', 'c142734', '已推远端 · 远端 CI run 33729452215 通过 (49 checks)');
+  gitNode(705, 70,  'done', 'S2 尾延迟', '4d51af0', '锁定 61-80 区组 1.92× 耗时 · 排除树膨胀');
+  gitNode(785, 70,  'done', 'S1/S2 台账', '843ad8f', '远端 CI run 33730484058 (50 checks) 通过');
+  gitNode(875, 70,  'done', '进度图入库', '2d2f54a', '远端 CI run 33731552324 (50 checks) 全绿');
+  gitNode(960, 70,  'goal', '最新基线', 'HEAD/origin', '单一主线完全对齐 · 50 checks 全绿');
 
   // Critical Path Chains
   var chainsHost = document.getElementById('chains');

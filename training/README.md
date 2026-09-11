@@ -1,4 +1,14 @@
-# 现代 DMC 训练系统（预训练门禁阶段）
+# 本地学习实验与后续 DMC 训练
+
+## LEARN 本机 CPU 实验（0908）
+
+当前优先使用现有 JS 规则引擎生成 v3 自有数据，经 `tools/learning_labels.mjs` 产生公共信息教师标签，再用 `tools/train_learning_model.py` 训练线性对照或 32→64→1 ReLU 模型。模型沿用现有 JSON 格式，通过显式离线 `learned-value-v1` 路径参加 A/B 对战；不等待 Python 规则移植、ONNX 或外部数据准入。
+
+按完整底牌组隔离 train/validation，训练组拟合归一化；模型 metadata 保存原生 PyTorch 预测，`node tools/test_learning_model_parity.mjs` 核对 JS 输出误差 ≤1e-5。0908 已实查本机 Python3.14.7 / PyTorch2.14.0+cpu 可用；执行环境变化时重新确认。
+
+这是本地研发实验，不表示已完成以下正式 DMC 准入，也不自动改变 expert 默认或正式模型加载状态。
+
+## 后续正式 DMC
 
 浏览器项目仍是掼蛋规则与产品行为的真源。本目录只容纳现代 Python/PyTorch 训练代码和模型包规范，不复制或嵌入旧 DanZero 的 TensorFlow 运行环境。
 
@@ -7,7 +17,7 @@
 - 已定义 `guandan-env-v1` 的可交换状态、动作、奖励和转换记录契约。
 - `verify_conformance.py` 只会在 100,000 条以上转换、零差异且存在独立 Python 规则适配器回执时输出 `conformanceReady=true`。
 - `dmc_preflight.py` 在没有该回执、公平自对弈数据清单、许可记录和完整评测回执时拒绝启动训练。
-- 本机尚未安装 PyTorch 或 ONNX，也没有完成 Python 规则适配器；因此本目录**不能训练或导出任何可部署模型**。
+- 尚未完成独立 Python 规则适配器和正式 DMC 训练器，ONNX / ONNX Runtime 未安装；本目录不能据此宣称已有可部署 DMC 模型。本机 CPU PyTorch 已可用于上面的 LEARN 实验。
 
 ## 训练前顺序
 
