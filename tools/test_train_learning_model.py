@@ -47,6 +47,10 @@ def write_fixture(directory, validation_shift=0.0):
 
 
 class LearningTrainingTests(unittest.TestCase):
+    def setUp(self):
+        if trainer is None:
+            self.skipTest('PyTorch (torch) is not installed in this environment')
+
     def test_context_feature_engine_is_bound_to_model(self):
         self.assertIsNotNone(trainer)
         with tempfile.TemporaryDirectory() as folder:

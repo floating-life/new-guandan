@@ -30,6 +30,11 @@ try {
     if (!arg.startsWith('--model=') && !arg.startsWith('--output=')) throw new Error(`unknown argument ${arg}`);
   }
   if (!modelPaths.length) {
+    const torchCheck = spawnSync('python', ['-B', '-c', 'import torch'], { cwd: root, encoding: 'utf8' });
+    if (torchCheck.status !== 0) {
+      console.log('learning model parity test: SKIPPED (PyTorch not available in this environment)');
+      process.exit(0);
+    }
     temp = fs.mkdtempSync(path.join(os.tmpdir(), 'learning-parity-'));
     const program = [
       'import sys,json', 'from pathlib import Path', "sys.path.insert(0, str(Path('tools').resolve()))",
