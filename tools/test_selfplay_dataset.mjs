@@ -163,8 +163,15 @@ try {
 
   assert.deepEqual(rotateSeatArray(['a', 'b', 'c', 'd'], 0), ['a', 'b', 'c', 'd']);
   assert.deepEqual(rotateSeatArray(['a', 'b', 'c', 'd'], 1), ['d', 'a', 'b', 'c']);
+  assert.deepEqual(rotateSeatArray(['a', 'b', 'c', 'd'], -1), ['b', 'c', 'd', 'a']);
+  assert.deepEqual(rotateSeatArray(['a', 'b', 'c', 'd'], -5), ['b', 'c', 'd', 'a']);
+  assert.deepEqual(rotateSeatArray([], 1), []);
   assert.equal(rotateSeatIndex(2, 1), 3);
   assert.equal(rotateSeatIndex(3, 1), 0);
+  assert.equal(rotateSeatIndex(0, -1), 3);
+  assert.equal(rotateSeatIndex(0, -4), 0);
+  assert.equal(rotateSeatIndex(0, -5), 3);
+  assert.equal(rotateSeatIndex(1, -2), 3);
 
   const missingDealBlocks = run([
     'tools/selfplay_dataset.mjs', '1', '3400000000', path.join(tempRoot, 'no-blocks.jsonl'),
@@ -222,6 +229,36 @@ try {
 
   const valid = run(['tools/validate_value_dataset.mjs', output], { timeout: 60000 });
   assertStatus(valid, 0, 'single-game v3 validation');
+
+  // Live contract covering all 4 rotation boundaries: 0 (identity), 1, 2 (opposite), 3 (reverse shift).
+  const allRotationsOutput = path.join(tempRoot, 'all-rotations.jsonl');
+  const allRotationsResult = run([
+    'tools/selfplay_dataset.mjs', '1', '3400000000', allRotationsOutput,
+    '--learning-v3', '--deal-blocks', '--levels=8', '--rotations=all',
+  ], { timeout: 180000 });
+  assertStatus(allRotationsResult, 0, 'v3 generation with all rotations (0..3)');
+  assertStatus(run(['tools/validate_value_dataset.mjs', allRotationsOutput]), 0, 'all-rotations validation');
+
+  // Verify CLI stdout return shape
+  const stdoutText = allRotationsResult.stdout || '';
+  const parsedStdout = JSON.parse(stdoutText.slice(stdoutText.indexOf('{')));
+  assert.equal(parsedStdout.ok, true, 'return shape ok must be true');
+  assert.equal(parsedStdout.games, 4, 'return shape games must equal totalGames');
+  assert.equal(parsedStdout.rounds, 4, 'return shape rounds must equal totalGames');
+  assert.equal(parsedStdout.dealBlocks, 1, 'return shape dealBlocks must match deal-blocks count');
+  assert.equal(parsedStdout.recordCount, parsedStdout.records, 'recordCount and records aliases must match');
+  assert(parsedStdout.recordCount > 0, 'generated records must be positive');
+
+  const allRows = fs.readFileSync(allRotationsOutput, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  const allHeader = allRows.shift();
+  assert.equal(allHeader.games, 4);
+  assert.deepEqual(allHeader.rotations, [0, 1, 2, 3]);
+  assert.equal(allHeader.gamePlan.length, 4);
+  const foundRotations = new Set(allRows.map((r) => r.rotation));
+  assert.deepEqual([...foundRotations].sort((a, b) => a - b), [0, 1, 2, 3], 'all 4 rotations must be present in rows');
+  for (const row of allRows) {
+    assert.equal(row.sourceSeat, ((row.seat - row.rotation) % 4 + 4) % 4);
+  }
 
   const duplicatePath = path.join(tempRoot, 'duplicate.jsonl');
   const duplicate = JSON.parse(JSON.stringify(rows[0]));

@@ -71,11 +71,12 @@ export function resolveLearningSplit(seed) {
 }
 
 export function rotateSeatIndex(index, rotation) {
-  return (Number(index) + Number(rotation) + 4) % 4;
+  return ((Number(index) + Number(rotation)) % 4 + 4) % 4;
 }
 
 export function rotateSeatArray(values, rotation) {
-  const rot = ((Number(rotation) % 4) + 4) % 4;
+  if (!Array.isArray(values) || !values.length) return [];
+  const rot = ((Number(rotation) % values.length) + values.length) % values.length;
   if (!rot) return values.slice();
   return Array.from({ length: values.length }, (_, index) => values[(index - rot + values.length) % values.length]);
 }
@@ -136,8 +137,8 @@ function parsePlanValues(rawArgs, flag, minimum, maximum, fallback) {
   const raw = rawArgs.find((arg) => arg.startsWith(`${flag}=`));
   if (!raw) return fallback.slice();
   const value = raw.slice(flag.length + 1);
-  const values = value === 'all' && flag === '--levels'
-    ? LEARNING_ALL_LEVELS.slice()
+  const values = value === 'all'
+    ? (flag === '--levels' ? LEARNING_ALL_LEVELS.slice() : LEARNING_ALL_ROTATIONS.slice())
     : value.split(',').map((item) => Number(item));
   if (!values.length || values.some((item) => !Number.isInteger(item) || item < minimum || item > maximum)
     || new Set(values).size !== values.length) {
@@ -176,7 +177,10 @@ function applyLearningDeal(match, plan) {
   match.levelOwner = 0;
   match.hands = match.hands.map((hand) => sortHand(hand, plan.level));
   match.handCounts = match.hands.map((hand) => hand.length);
-  if (!plan.rotation) return;
+  if (Array.isArray(match.roundInitialHands) && match.roundInitialHands.length === 4) {
+    match.roundInitialHands = match.roundInitialHands.map((hand) => sortHand(hand, plan.level));
+  }
+  if (!plan.rotation) return match;
   match.hands = rotateSeatArray(match.hands, plan.rotation);
   match.handCounts = rotateSeatArray(match.handCounts, plan.rotation);
   if (Array.isArray(match.roundInitialHands) && match.roundInitialHands.length === 4) {
@@ -185,6 +189,7 @@ function applyLearningDeal(match, plan) {
   match.firstPlayer = rotateSeatIndex(match.firstPlayer, plan.rotation);
   match.currentSeat = rotateSeatIndex(match.currentSeat, plan.rotation);
   if (Number.isInteger(match.dealer)) match.dealer = rotateSeatIndex(match.dealer, plan.rotation);
+  return match;
 }
 
 function seededRandom(seed) {
@@ -332,7 +337,7 @@ function recordDecision(context, decision) {
       rotation: currentPlan.rotation,
       split: currentPlan.split,
       startSeat: currentStartSeat,
-      sourceSeat: (observation.seat - currentPlan.rotation + 4) % 4,
+      sourceSeat: ((observation.seat - currentPlan.rotation) % 4 + 4) % 4,
     } : {}),
     round: Number(context.round) || 1,
     turn: Number(context.turn) || null,
@@ -409,11 +414,21 @@ async function main() {
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
   const realRandom = Math.random;
+  let timerSeq = 0;
+  const activeTimers = new Set();
   globalThis.setTimeout = (fn) => {
-    queueMicrotask(fn);
-    return 1;
+    const id = ++timerSeq;
+    activeTimers.add(id);
+    queueMicrotask(() => {
+      if (!activeTimers.has(id)) return;
+      activeTimers.delete(id);
+      fn();
+    });
+    return id;
   };
-  globalThis.clearTimeout = () => {};
+  globalThis.clearTimeout = (id) => {
+    activeTimers.delete(id);
+  };
 
   const rawArgs = process.argv.slice(2);
   const resume = rawArgs.includes('--resume');
@@ -518,19 +533,42 @@ async function main() {
       ...(plan ? { sealedTraining: false } : {}),
     });
     state.opponentModel = emptyOpponentProfile();
+    let roundTimer = null;
     const completed = new Promise((resolve) => { resolveRound = resolve; });
+    const roundTimeoutMs = 60000;
+    const timeoutPromise = new Promise((_, reject) => {
+      roundTimer = realSetTimeout(() => {
+        reject(new Error(
+          `self-play round ${index} timed out after ${roundTimeoutMs}ms ` +
+          `(game=${plan?.derivedGameId || index}, phase=${state?.phase}, ` +
+          `currentSeat=${state?.currentSeat}, finishOrder=[${state?.finishOrder?.join(',') || ''}])`
+        ));
+      }, roundTimeoutMs);
+    });
     startMatch(state);
     if (plan) {
       const originalFirst = state.firstPlayer;
       applyLearningDeal(state, plan);
       currentStartSeat = state.firstPlayer;
       // startMatch queues AI only when the original first player is not seat 0.
-      // After a seat rotation that moves the lead off seat 0, re-enter the
-      // official autoplay path before the first decision.
-      if (originalFirst === 0 && state.currentSeat !== 0) resumeMatch(state);
+      // Explicitly handle all 4 lead transitions after seat rotation:
+      if (originalFirst === 0 && state.currentSeat !== 0) {
+        resumeMatch(state);
+      } else if (originalFirst !== 0 && state.currentSeat === 0) {
+        state.aiThinking = false;
+        pump();
+      } else if (originalFirst !== 0 && state.currentSeat !== 0 && originalFirst !== state.currentSeat) {
+        state.aiThinking = false;
+        resumeMatch(state);
+      }
     }
     pump();
-    const finalState = await completed;
+    let finalState;
+    try {
+      finalState = await Promise.race([completed, timeoutPromise]);
+    } finally {
+      if (roundTimer) realClearTimeout(roundTimer);
+    }
     const order = finalState.finishOrder.slice();
     for (const record of currentRecords) {
       record.game = index;
@@ -617,11 +655,21 @@ async function main() {
     for (const generatedPath of [recordTempPath, checkpointPath, checkpointTempPath]) {
       fs.rmSync(generatedPath, { force: true });
     }
-    console.log(JSON.stringify({
-      ok: true, output: outputPath, rounds: totalGames, dealBlocks: learningV3 ? rounds : null,
-      records: recordCount, schema: DATASET_SCHEMA, valueSchema: HYBRID_VALUE_SCHEMA,
-    }, null, 2));
+    const result = {
+      ok: true,
+      output: outputPath,
+      rounds: totalGames,
+      games: totalGames,
+      dealBlocks: learningV3 ? rounds : null,
+      records: recordCount,
+      recordCount,
+      schema: DATASET_SCHEMA,
+      valueSchema: HYBRID_VALUE_SCHEMA,
+    };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
   } finally {
+    activeTimers.clear();
     globalThis.clearInterval(heartbeat);
     setUpdateCallback(null);
     setAIDecisionObserver(null);
@@ -630,6 +678,8 @@ async function main() {
     Math.random = realRandom;
   }
 }
+
+export { main };
 
 if (executedAsCli()) {
   await main();
