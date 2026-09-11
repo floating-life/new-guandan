@@ -66,6 +66,26 @@ const AI_SPEED_MS = {
   fast: [120, 80],
 };
 
+const AI_DESKTOP_DELAY_SCALE = {
+  easy: 0.5,
+  normal: 0.7,
+  hard: 1,
+  master: 1.4,
+};
+
+// 桌面等待跟难度走，让普通/困难/大师在同一速度档也可感知不同。
+// 快档只缩短这段动画等待，不改搜索预算（见 resolveAISearchBudget）。
+export function resolveAIDesktopDelay(settings = {}) {
+  const speed = settings?.aiSpeed || 'normal';
+  const difficulty = settings?.difficulty || 'normal';
+  const [speedBase, speedSpread] = AI_SPEED_MS[speed] || AI_SPEED_MS.normal;
+  const scale = AI_DESKTOP_DELAY_SCALE[difficulty] ?? AI_DESKTOP_DELAY_SCALE.normal;
+  return {
+    base: Math.round(speedBase * scale),
+    spread: Math.round(speedSpread * scale),
+  };
+}
+
 // 真实对局按 AI 速度给本地搜索一个思考预算（限时加深）；deterministic 对局
 // 返回 0，让 A/B 镜像赛与单测保持逐字节可复现。
 export function resolveAISearchBudget(settings = {}) {
@@ -1823,13 +1843,12 @@ function maybeAutoPlay(state) {
   }
 
   notify(state);
-  // AI 延迟
+  // AI 延迟：按难度缩放桌面等待；快档只缩短这段等待，不削弱大师搜索。
   if (_aiTimer) clearTimeout(_aiTimer);
-  const speed = state.settings?.aiSpeed || 'normal';
-  const [base, spread] = AI_SPEED_MS[speed] || AI_SPEED_MS.normal;
+  const delay = resolveAIDesktopDelay(state.settings || {});
   _aiTimer = setTimeout(() => {
     runAI(state);
-  }, base + Math.random() * spread);
+  }, delay.base + Math.random() * delay.spread);
 }
 
 async function runAI(state) {

@@ -22,6 +22,9 @@ assert(html.includes('id="declarationChips"') && ui.includes('renderDeclarationC
 assert(html.includes('id="endHands"') && ui.includes('renderEndHands'), '每副结束自动亮出未出完AI手牌');
 assert(html.includes('<option value="master">大师</option>'), '难度选择提供大师模式');
 assert(html.includes('大师模式') && html.includes('不读取其他玩家未公开手牌'), '规则说明公开大师模式与公平信息边界');
+assert(html.includes('快档只缩短桌面等待') && html.includes('不削弱搜索'),
+  '规则说明大师快档只缩短等待、不把搜索降成残缺');
+assert(html.includes('普通档等待更短'), '规则说明普通与大师等待可感知不同');
 assert(html.includes('id="selLocalEngine"') && html.includes('value="pimc-v1"')
   && html.includes('value="root-pimc-v1"') && html.includes('value="ismcts-v2"')
   && html.includes('成对根 PIMC（实验）'), '提供专家、PIMC、成对根 PIMC 与 ISMCTS v2 引擎开关');

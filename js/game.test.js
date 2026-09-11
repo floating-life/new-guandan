@@ -5,7 +5,7 @@ import {
   createMatch, startRound, getReturnCandidates, humanPickReturnCard, humanPass,
   humanSelectSet, humanPlay, markAssistance, persistMatch, restoreMatch,
   getPublicTributeContext, resetLLMFallback, markLLMFallback, applySettings,
-  aiDecisionContext, resolveAISearchBudget, PHASE,
+  aiDecisionContext, resolveAISearchBudget, resolveAIDesktopDelay, PHASE,
 } from './game.js';
 import { chooseAIPlay } from './ai.js';
 import { clearStats, loadSettings } from './stats.js';
@@ -40,6 +40,53 @@ console.log('大师强度不随快动画降级');
   assert(resolveAISearchBudget({
     difficulty: 'master', aiSpeed: 'slow', deterministicAI: true,
   }) === 0, '确定性镜像赛继续禁用墙钟预算，保持可复现');
+}
+
+console.log('普通与大师的桌面等待可感知区分，快档只缩短等待');
+{
+  const normalFast = resolveAIDesktopDelay({ difficulty: 'normal', aiSpeed: 'fast' });
+  const masterFast = resolveAIDesktopDelay({ difficulty: 'master', aiSpeed: 'fast' });
+  const hardFast = resolveAIDesktopDelay({ difficulty: 'hard', aiSpeed: 'fast' });
+  const masterSlow = resolveAIDesktopDelay({ difficulty: 'master', aiSpeed: 'slow' });
+  const masterNormal = resolveAIDesktopDelay({ difficulty: 'master', aiSpeed: 'normal' });
+  assert(Number.isInteger(normalFast.base) && Number.isInteger(masterFast.base),
+    '桌面等待返回整数基准');
+  assert(normalFast.base < masterFast.base,
+    '同一快档下普通桌面等待短于大师');
+  assert(hardFast.base > normalFast.base && hardFast.base <= masterFast.base,
+    '困难档等待介于普通与大师之间');
+  assert(masterFast.base < masterNormal.base && masterNormal.base < masterSlow.base,
+    '大师快档仍短于中档和慢档，快只缩短桌面等待');
+  assert(masterFast.spread >= 0 && normalFast.spread >= 0, '等待抖动不为负');
+}
+
+console.log('普通与大师在对手报单领出上可感知不同');
+{
+  const hand = [
+    C(3), C(5), C(7), C(8), C(9), C(10), C(11), C(12), C(13), C(14), C(14, 'H'), C(2),
+  ];
+  const base = {
+    seat: 1,
+    hand,
+    level: 7,
+    lastHand: null,
+    lastSeat: 0,
+    handCounts: [12, 12, 1, 12],
+    teams: [0, 1, 0, 1],
+    finishOrder: [],
+    playedCards: [],
+    publicHistory: [],
+    deterministic: true,
+    policyProfile: 'expert',
+  };
+  const normal = chooseAIPlay({ ...base, difficulty: 'normal' });
+  const master = chooseAIPlay({ ...base, difficulty: 'master' });
+  const normalSig = `${normal?.action}|${normal?.hand?.type}|${normal?.hand?.mainRank}`;
+  const masterSig = `${master?.action}|${master?.hand?.type}|${master?.hand?.mainRank}`;
+  assert(normal?.action === 'play' && master?.action === 'play',
+    '对手报单时普通与大师都给出合法领出');
+  assert(normalSig !== masterSig,
+    '对手报单时普通与大师（专家策略）选出不同公开信息着法');
 }
 
 console.log('严格还贡限制');
