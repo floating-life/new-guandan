@@ -74,6 +74,8 @@ The runtime AI is designed around a hard information boundary: it may reason fro
 
 ## Verification / 验证
 
+Codex 云端开发的环境配置、初始化与首次验收见 [云端接入说明](./docs/codex-cloud.md)。
+
 Unified verification entry point:
 
 ```powershell

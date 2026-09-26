@@ -975,19 +975,39 @@ def main() -> int:
 
             with tempfile.TemporaryDirectory() as temporary:
                 config_path = Path(temporary) / "llm-config.json"
-                lan_server._persist_llm_config(
-                    "https://api.example.com/v1", "test-model", "secret-never-in-plain-text", config_path
-                )
-                raw_config = config_path.read_text(encoding="utf-8")
-                restored = lan_server._read_persisted_llm_config(config_path)
-                assert "secret-never-in-plain-text" not in raw_config
-                assert restored == {
-                    "apiUrl": "https://api.example.com/v1",
-                    "model": "test-model",
-                    "apiKey": "secret-never-in-plain-text",
-                }
-                passed += 1
-                print("  [OK] API Key 仅以 Windows DPAPI 密文持久化且可恢复")
+                if os.name == "nt":
+                    lan_server._persist_llm_config(
+                        "https://api.example.com/v1", "test-model", "secret-never-in-plain-text", config_path
+                    )
+                    raw_config = config_path.read_text(encoding="utf-8")
+                    restored = lan_server._read_persisted_llm_config(config_path)
+                    assert "secret-never-in-plain-text" not in raw_config
+                    assert restored == {
+                        "apiUrl": "https://api.example.com/v1",
+                        "model": "test-model",
+                        "apiKey": "secret-never-in-plain-text",
+                    }
+                    passed += 1
+                    print("  [OK] API Key 仅以 Windows DPAPI 密文持久化且可恢复")
+                else:
+                    try:
+                        lan_server._persist_llm_config(
+                            "https://api.example.com/v1", "test-model", "secret-never-in-plain-text", config_path
+                        )
+                        raise AssertionError("非 Windows 平台不得降级为明文密钥持久化")
+                    except RuntimeError as exc:
+                        assert "Windows DPAPI" in str(exc)
+                    assert not config_path.exists()
+                    assert list(Path(temporary).iterdir()) == []
+                    # A copied Windows config must not be accepted as a usable key.
+                    config_path.write_text(json.dumps({
+                        "version": 1, "apiUrl": "https://api.example.com/v1",
+                        "model": "test-model", "protectedApiKey": "not-a-real-dpapi-blob",
+                    }), encoding="utf-8")
+                    assert lan_server._read_persisted_llm_config(config_path) == {}
+                    config_path.unlink()
+                    passed += 1
+                    print("  [OK] 非 Windows 平台拒绝密钥落盘及 DPAPI 解密，无明文回退")
 
                 lan_server._ENV_LLM_API_URL = "https://other.example.net/v1"
                 lan_server._ENV_LLM_API_KEY = ""
@@ -999,7 +1019,21 @@ def main() -> int:
                 assert lan_server.LLM_API_KEY == ""
                 assert lan_server.LLM_API_URL == "https://other.example.net/v1"
                 passed += 1
-                print("  [OK] 环境变量切换服务商时不会把已存密钥发往新地址")
+                print("  [OK] 环境变量切换服务商时不会使用已存或不可解密的密钥")
+
+                lan_server._ENV_LLM_API_KEY = "environment-only-test-key"
+                lan_server._ENV_LLM_MODEL = "environment-test-model"
+                lan_server.LLM_API_KEY = lan_server._ENV_LLM_API_KEY
+                lan_server.LLM_MODEL = lan_server._ENV_LLM_MODEL
+                lan_server._initialize_llm_config(config_path)
+                assert lan_server.LLM_API_KEY == "environment-only-test-key"
+                assert lan_server.LLM_MODEL == "environment-test-model"
+                assert lan_server.LLM_API_URL == "https://other.example.net/v1"
+                assert lan_server._LLM_CONFIG_SOURCE == "environment"
+                if os.name != "nt":
+                    assert not config_path.exists()
+                passed += 1
+                print("  [OK] 显式环境变量配置可用于跨平台网关且无需新增密钥文件")
         finally:
             lan_server.LLM_API_URL = original_api_url
             lan_server.LLM_API_KEY = original_api_key
