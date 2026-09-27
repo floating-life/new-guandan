@@ -82,7 +82,7 @@ async function main() {
     assert.throws(() => parseReplayEndpoint('http://127.0.0.1:20801/api/replay/events?x=1'), /查询参数/);
     assertSafeStoragePath(path.join(temporary, 'safe.json'));
     assert.throws(() => assertSafeStoragePath(process.cwd()), /项目目录/);
-    assert.throws(() => assertSafeStoragePath('D:\\WPSDrive\\Guandan\\annotation.ndjson'), /WPSDrive/);
+    assert.throws(() => assertSafeStoragePath(path.join(temporary, 'WPSDrive', 'Guandan', 'annotation.ndjson')), /WPSDrive/);
     const symlinkPath = path.join(temporary, 'linked-storage');
     try {
       fs.symlinkSync(temporary, symlinkPath, 'junction');
